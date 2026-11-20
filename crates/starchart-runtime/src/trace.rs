@@ -145,6 +145,9 @@ pub struct TraceRecord {
     pub t_ms: u64,
     /// Machine id.
     pub machine: String,
+    /// Optional instance id when running inside a multi-instance host (`starchart serve`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     #[serde(flatten)]
     pub event: TraceEvent,
 }
@@ -169,6 +172,7 @@ struct HubInner {
 /// Fan-out point for one machine run's [`TraceRecord`]s.
 pub struct TraceHub {
     machine_id: String,
+    instance_id: Option<String>,
     started: Instant,
     action_labels: HashMap<String, String>,
     final_outputs: HashMap<String, Value>,
@@ -179,6 +183,7 @@ impl std::fmt::Debug for TraceHub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TraceHub")
             .field("machine_id", &self.machine_id)
+            .field("instance_id", &self.instance_id)
             .finish_non_exhaustive()
     }
 }
@@ -206,13 +211,33 @@ impl TraceHub {
         final_outputs: HashMap<String, Value>,
         history_cap: usize,
     ) -> Arc<Self> {
+        Self::with_instance_context(
+            machine_id,
+            None,
+            0,
+            action_labels,
+            final_outputs,
+            history_cap,
+        )
+    }
+
+    /// Creates a hub optionally scoped to a specific `instance_id` and starting sequence offset.
+    pub fn with_instance_context(
+        machine_id: impl Into<String>,
+        instance_id: Option<String>,
+        base_seq: u64,
+        action_labels: HashMap<String, String>,
+        final_outputs: HashMap<String, Value>,
+        history_cap: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             machine_id: machine_id.into(),
+            instance_id,
             started: Instant::now(),
             action_labels,
             final_outputs,
             inner: Mutex::new(HubInner {
-                seq: 0,
+                seq: base_seq,
                 history: VecDeque::new(),
                 history_cap,
                 subscribers: Vec::new(),
@@ -224,6 +249,11 @@ impl TraceHub {
     /// Machine id this hub traces.
     pub fn machine_id(&self) -> &str {
         &self.machine_id
+    }
+
+    /// Optional instance id this hub traces.
+    pub fn instance_id(&self) -> Option<&str> {
+        self.instance_id.as_deref()
     }
 
     fn lock(&self) -> MutexGuard<'_, HubInner> {
@@ -241,6 +271,7 @@ impl TraceHub {
             seq: inner.seq,
             t_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             machine: self.machine_id.clone(),
+            instance_id: self.instance_id.clone(),
             event,
         };
         inner

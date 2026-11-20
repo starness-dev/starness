@@ -1654,6 +1654,78 @@ fn new_trace_hub(chart: &CompiledChart) -> Arc<TraceHub> {
     )
 }
 
+fn new_instance_trace_hub(
+    chart: &CompiledChart,
+    instance_id: String,
+    base_seq: u64,
+    history_cap: usize,
+) -> Arc<TraceHub> {
+    TraceHub::with_instance_context(
+        chart.ir.id.clone(),
+        Some(instance_id),
+        base_seq,
+        trace_action_labels(chart),
+        collect_top_level_final_outputs(&chart.ir),
+        history_cap,
+    )
+}
+
+/// Returns `true` if the root statechart declares at least one top-level `final_state`.
+/// Machines without a top-level `final_state` are long-lived actors that never reach `Status::Done`.
+pub fn machine_is_completable(ir: &MachineDef) -> bool {
+    ir.states
+        .values()
+        .any(|node| matches!(node.kind, StateKind::Final))
+}
+
+fn actions_have_delayed_send(actions: &[ActionDef]) -> bool {
+    actions.iter().any(|a| {
+        matches!(
+            a,
+            ActionDef::Raise {
+                delay: Some(_),
+                ..
+            } | ActionDef::SendTo {
+                delay: Some(_),
+                ..
+            }
+        )
+    })
+}
+
+/// Returns `true` if any currently active state (or its active ancestor superstates) owns an
+/// in-flight `invoke`, an `after` timer, or a delayed `raise_event` / `send_to`.
+pub fn active_states_have_autonomous_work(ir: &MachineDef, active_paths: &[String]) -> bool {
+    for raw_path in active_paths {
+        let trimmed = raw_path
+            .strip_prefix(&format!("{}.", ir.id))
+            .unwrap_or(raw_path.as_str());
+        let mut current_map = &ir.states;
+        for seg in trimmed.split('.') {
+            let Some(node) = current_map.get(&StateId::from(seg)) else {
+                break;
+            };
+            if !node.invoke.is_empty()
+                || !node.after.is_empty()
+                || actions_have_delayed_send(&node.entry)
+                || node
+                    .on
+                    .iter()
+                    .any(|tr| actions_have_delayed_send(&tr.actions))
+            {
+                return true;
+            }
+            match &node.kind {
+                StateKind::Compound { states, .. } | StateKind::Parallel { states } => {
+                    current_map = states;
+                }
+                StateKind::Atomic | StateKind::Final | StateKind::History { .. } => break,
+            }
+        }
+    }
+    false
+}
+
 fn collect_top_level_final_outputs(ir: &MachineDef) -> HashMap<String, Value> {
     let mut map = HashMap::new();
     for (sid, node) in &ir.states {
@@ -1861,8 +1933,28 @@ impl StarchartActor {
         chart: &CompiledChart,
         callbacks: HostCallbacks,
     ) -> Result<Self, ChartRuntimeError> {
-        let machine = compile_ir_to_machine(&chart.ir)?;
         let hub = new_trace_hub(chart);
+        Self::spawn_with_hub(chart, callbacks, hub)
+    }
+
+    /// Spawns a multi-instance actor carrying `instance_id` on every [`TraceRecord`] and starting
+    /// its trace sequence counter after `base_seq`.
+    pub fn spawn_instance(
+        chart: &CompiledChart,
+        callbacks: HostCallbacks,
+        instance_id: impl Into<String>,
+        base_seq: u64,
+    ) -> Result<Self, ChartRuntimeError> {
+        let hub = new_instance_trace_hub(chart, instance_id.into(), base_seq, 256);
+        Self::spawn_with_hub(chart, callbacks, hub)
+    }
+
+    fn spawn_with_hub(
+        chart: &CompiledChart,
+        callbacks: HostCallbacks,
+        hub: Arc<TraceHub>,
+    ) -> Result<Self, ChartRuntimeError> {
+        let machine = compile_ir_to_machine(&chart.ir)?;
         let logic = build_machine_logic_traced(chart, &callbacks, Some(Arc::clone(&hub)));
         let observer: Arc<dyn xstate_statemachine::core::Observer<DynContext>> =
             trace::TraceObserver::new(Arc::clone(&hub));
