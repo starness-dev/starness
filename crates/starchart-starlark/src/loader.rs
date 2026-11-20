@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use starchart_ir::{AssignRef, GuardRef, MachineDef};
+use starchart_ir::{AssignRef, DelayRef, GuardRef, MachineDef};
 use dupe::{Dupe, OptionDupedExt};
 use starlark::environment::{FrozenModule, Module};
 use starlark::eval::{Evaluator, FileLoader};
@@ -21,6 +21,7 @@ pub struct CompiledChart {
     pub ir: MachineDef,
     pub guards: HashMap<String, OwnedFrozenValue>,
     pub reducers: HashMap<String, OwnedFrozenValue>,
+    pub delays: HashMap<String, OwnedFrozenValue>,
     /// Optional frozen `RecordType` constructor if `machine(context = ...)` used a Starlark `record(...)`.
     pub context_record_type: Option<OwnedFrozenValue>,
 }
@@ -369,6 +370,14 @@ fn extract_compiled_chart(
         reducers.insert(name, owned);
     }
 
+    let mut delays = HashMap::with_capacity(machine.delay_slots.len());
+    for (slot, frozen_fn) in machine.delay_slots.iter().copied().enumerate() {
+        let name = DelayRef::starlark_slot_name(slot);
+        // SAFETY: `frozen_fn` was frozen into `frozen_module`'s heap during `module.freeze()`.
+        let owned = unsafe { OwnedFrozenValue::new(heap.dupe(), frozen_fn) };
+        delays.insert(name, owned);
+    }
+
     let context_record_type = machine
         .initial_record_context
         .and_then(|initial_rec| find_matching_record_type(initial_rec, loaded_modules));
@@ -377,6 +386,7 @@ fn extract_compiled_chart(
         ir: machine.ir.0.clone(),
         guards,
         reducers,
+        delays,
         context_record_type,
     })
 }

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use starchart_ir::{StateId, StateKind, StateNodeDef};
+use starchart_ir::{ActionDef, StateId, StateKind, StateNodeDef};
 use starchart_runtime::{ChartSyncRunner, HostCallbacks, render_mermaid};
 use starchart_starlark::{chart_dialect, chart_globals, compile_starlark_file};
 use clap::{Parser, Subcommand};
@@ -138,9 +138,10 @@ fn run_execute(file: &Path, export: &str, raw_events: &[String]) -> ExitCode {
         }
     };
 
-    // Register trace logging on every declared action so CLI users see side-effect invocations.
+    // Register trace logging on every declared action and sync mock services so CLI runs work out-of-the-box.
     let mut action_names = HashSet::new();
-    collect_actions(&compiled.ir.states, &mut action_names);
+    let mut service_names = HashSet::new();
+    collect_actions_and_services(&compiled.ir.states, &mut action_names, &mut service_names);
     let mut callbacks = HostCallbacks::new();
     let mut sorted_actions: Vec<String> = action_names.into_iter().collect();
     sorted_actions.sort();
@@ -149,6 +150,15 @@ fn run_execute(file: &Path, export: &str, raw_events: &[String]) -> ExitCode {
         callbacks = callbacks.on_action(action_name, move |_ctx, ev| {
             println!("  -> action `{label}` invoked (on `{}`)", ev.event_type);
             Ok(())
+        });
+    }
+    let mut sorted_services: Vec<String> = service_names.into_iter().collect();
+    sorted_services.sort();
+    for service_name in sorted_services {
+        let label = service_name.clone();
+        callbacks = callbacks.on_sync_service(service_name, move |_ctx, input| {
+            println!("  -> service `{label}` invoked (input={input})");
+            Ok(serde_json::json!({}))
         });
     }
 
@@ -168,6 +178,28 @@ fn run_execute(file: &Path, export: &str, raw_events: &[String]) -> ExitCode {
     );
 
     for (idx, raw) in raw_events.iter().enumerate() {
+        if let Some(ms_str) = raw.trim().strip_prefix("after:") {
+            let ms: f64 = match ms_str.trim().parse() {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!("ERROR parsing timer advance `after:{ms_str}`: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+            if let Err(err) = runner.advance_ms(ms) {
+                eprintln!("ERROR advancing clock by {ms}ms: {err}");
+                return ExitCode::from(1);
+            }
+            println!(
+                "[step {}] clock=+{ms}ms active={:?} done={} context={}",
+                idx + 1,
+                runner.active_states(),
+                runner.is_done(),
+                runner.context()
+            );
+            continue;
+        }
+
         let (event_type, payload) = match parse_cli_event(raw) {
             Ok(pair) => pair,
             Err(err) => {
@@ -188,29 +220,64 @@ fn run_execute(file: &Path, export: &str, raw_events: &[String]) -> ExitCode {
         }
 
         println!(
-            "[step {}] event=`{}` active={:?} done={} context={}",
+            "[step {}] event=`{}` active={:?} tags={:?} done={} output={} context={}",
             idx + 1,
             event_type,
             runner.active_states(),
+            runner.active_tags(),
             runner.is_done(),
+            runner.output(),
             runner.context()
         );
+        for emitted in runner.take_emitted() {
+            println!("  -> emitted {emitted}");
+        }
     }
 
     ExitCode::SUCCESS
 }
 
-fn collect_actions(states: &IndexMap<StateId, StateNodeDef>, out: &mut HashSet<String>) {
+fn push_named(actions: &[ActionDef], out: &mut HashSet<String>) {
+    for act in actions {
+        if let ActionDef::Named(name) = act {
+            out.insert(name.clone());
+        }
+    }
+}
+
+fn collect_actions_and_services(
+    states: &IndexMap<StateId, StateNodeDef>,
+    actions: &mut HashSet<String>,
+    services: &mut HashSet<String>,
+) {
     for node in states.values() {
-        out.extend(node.entry.iter().cloned());
-        out.extend(node.exit.iter().cloned());
+        push_named(&node.entry, actions);
+        push_named(&node.exit, actions);
         for tr in &node.on {
-            out.extend(tr.actions.iter().cloned());
+            push_named(&tr.actions, actions);
+        }
+        for outcome in node.always.iter().chain(node.on_done.iter()) {
+            push_named(&outcome.actions, actions);
+        }
+        for after_def in &node.after {
+            for outcome in &after_def.outcomes {
+                push_named(&outcome.actions, actions);
+            }
+        }
+        for inv in &node.invoke {
+            services.insert(inv.src.clone());
+            for outcome in inv.on_done.iter().chain(inv.on_error.iter()) {
+                push_named(&outcome.actions, actions);
+            }
         }
         match &node.kind {
-            StateKind::Compound { states: children, .. }
-            | StateKind::Parallel { states: children } => collect_actions(children, out),
-            StateKind::Atomic | StateKind::Final => {}
+            StateKind::Compound {
+                states: children, ..
+            }
+            | StateKind::Parallel { states: children } => {
+                collect_actions_and_services(children, actions, services);
+            }
+            StateKind::Atomic | StateKind::Final | StateKind::History { .. } => {}
         }
     }
 }

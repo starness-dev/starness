@@ -5,7 +5,7 @@ Typed Starlark Harel statechart engine in Rust, backed by `xstate-statemachine` 
 ## Workspace Layout
 
 - `crates/starchart-ir` — Pure Rust statechart intermediate representation and graph verifier (`MachineDef::validate`).
-- `crates/starchart-starlark` — Strongly typed Starlark 0.14 DSL (`state_id`, `state_space`, `record`, `transition`, `internal_transition`, `all_of` / `any_of` / `not_` / `named_guard`, `state`, `compound_state`, `parallel_state`, `final_state`, `machine`), ahead-of-time static typechecker, and multi-file `load()` compiler.
+- `crates/starchart-starlark` — Complete strongly typed Starlark 0.14 Harel / XState v5 DSL (`state_id`, `state_space`, `record`, `transition`, `internal_transition`, `forbid`, `always`, `after`, `invoke`, `outcome`, `on_done`, `shallow_history`, `deep_history`, `state_in` / `all_of` / `any_of` / `not_` / `named_guard`, `raise_event` / `cancel_send` / `emit_event` / `send_to` / `send_parent` / `log_action`, `tags` / `meta` / `output` / `description`, `state`, `compound_state`, `parallel_state`, `final_state`, `machine`), ahead-of-time static typechecker, and multi-file `load()` compiler.
 - `crates/starchart-runtime` — Compiles `CompiledChart` into `xstate_core::Machine` and bridges frozen Starlark guards & `assign` reducers with Rust `HostCallbacks` (`ChartSyncRunner` + Tokio `ChartActor` + Harel Mermaid exporter).
 - `bins/starchart-cli` (`starchart`) — CLI (`check`, `diagram`, `run`, `lsp`).
 

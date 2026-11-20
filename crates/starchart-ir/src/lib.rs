@@ -50,6 +50,8 @@ pub enum GuardRef {
     Named(String),
     /// Index into the compiled Starlark module's frozen guard callable table.
     StarlarkSlot(usize),
+    /// Built-in Harel `In(state)` predicate checking whether another state is currently active.
+    StateIn(StateId),
     /// Logical AND over child guards (short-circuiting).
     AllOf(Vec<GuardRef>),
     /// Logical OR over child guards (short-circuiting).
@@ -69,6 +71,7 @@ impl GuardRef {
         match self {
             Self::Named(name) => name.clone(),
             Self::StarlarkSlot(slot) => Self::starlark_slot_name(*slot),
+            Self::StateIn(state_id) => format!("stateIn(#{state_id})"),
             Self::AllOf(children) => {
                 let inner: Vec<String> = children.iter().map(Self::runtime_name).collect();
                 format!("__guard_all_of({})", inner.join(","))
@@ -103,15 +106,140 @@ impl AssignRef {
     }
 }
 
-/// Transition definition attached to a state node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Reference to a transition timer delay (`after` or delayed `raise` / `sendTo`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DelayRef {
+    /// Fixed duration in milliseconds.
+    FixedMs(u64),
+    /// Named host-configured delay.
+    Named(String),
+    /// Index into the compiled Starlark module's frozen delay callable table `(ctx, event) -> ms`.
+    StarlarkSlot(usize),
+}
+
+impl DelayRef {
+    /// Deterministic generated name for a Starlark delay callable slot.
+    pub fn starlark_slot_name(slot: usize) -> String {
+        format!("__starlark_delay_{slot}")
+    }
+}
+
+/// Pure IR representation of an action: either a named host callback or an XState built-in action.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ActionDef {
+    /// Host-registered named action (e.g. `"CHARGE_CARD"`).
+    Named(String),
+    /// Queues an internal event onto the machine's internal queue (optionally delayed / cancellable).
+    Raise {
+        event: String,
+        payload: serde_json::Value,
+        delay: Option<DelayRef>,
+        id: Option<String>,
+    },
+    /// Cancels a pending delayed `raise_event` or `send_to` by its `id`.
+    Cancel { send_id: String },
+    /// Emits an external event to observers / `take_emitted()`.
+    Emit {
+        event: String,
+        payload: serde_json::Value,
+    },
+    /// Sends an event to another actor (`"parent"`, `"self"`, child id, or system id).
+    SendTo {
+        to: String,
+        event: String,
+        payload: serde_json::Value,
+        delay: Option<DelayRef>,
+        id: Option<String>,
+    },
+    /// Sends an event to the parent actor when running as an invoked child machine.
+    SendParent {
+        event: String,
+        payload: serde_json::Value,
+    },
+    /// Appends a static JSON value to the interpreter's log buffer (`take_logs()`).
+    Log { expr: serde_json::Value },
+}
+
+impl ActionDef {
+    /// Short label for diagrams.
+    pub fn diagram_label(&self) -> String {
+        match self {
+            Self::Named(name) => name.clone(),
+            Self::Raise { event, .. } => format!("raise {event}"),
+            Self::Cancel { send_id } => format!("cancel {send_id}"),
+            Self::Emit { event, .. } => format!("emit {event}"),
+            Self::SendTo { to, event, .. } => format!("sendTo {to} {event}"),
+            Self::SendParent { event, .. } => format!("sendParent {event}"),
+            Self::Log { .. } => "log".to_owned(),
+        }
+    }
+}
+
+impl From<&str> for ActionDef {
+    fn from(value: &str) -> Self {
+        Self::Named(value.to_owned())
+    }
+}
+
+impl From<String> for ActionDef {
+    fn from(value: String) -> Self {
+        Self::Named(value)
+    }
+}
+
+/// Transition definition attached to a state node (`on`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TransitionDef {
     pub event: String,
     /// `None` indicates an internal self-transition without exiting/re-entering the state.
     pub target: Option<StateId>,
     pub guard: Option<GuardRef>,
-    pub actions: Vec<String>,
+    pub actions: Vec<ActionDef>,
     pub assign: Option<AssignRef>,
+    /// When `true`, forces exiting and re-entering the source state on self/descendant transitions.
+    #[serde(default)]
+    pub reenter: bool,
+    /// When `true`, consumes `event` and blocks ancestor handlers (`forbid(event = ...)`).
+    #[serde(default)]
+    pub forbidden: bool,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Transition branch used by `always`, `after`, `on_done`, and `invoke` (`on_done` / `on_error`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutcomeDef {
+    /// `None` executes actions/reducers without exiting the state.
+    pub target: Option<StateId>,
+    pub guard: Option<GuardRef>,
+    pub actions: Vec<ActionDef>,
+    pub assign: Option<AssignRef>,
+    #[serde(default)]
+    pub reenter: bool,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Delayed (`after`) timer transition attached to a state node.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AfterDef {
+    pub delay: DelayRef,
+    pub outcomes: Vec<OutcomeDef>,
+}
+
+/// Service or child actor invoked on entry to a state and cancelled on exit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InvokeDef {
+    /// Optional invocation identifier (defaults to `src` / owning state id).
+    pub id: Option<String>,
+    /// Registered host service name.
+    pub src: String,
+    /// Static JSON input passed to the service (`Null` when omitted).
+    pub input: serde_json::Value,
+    /// Candidate transitions evaluated when the service resolves (`event["output"]`).
+    pub on_done: Vec<OutcomeDef>,
+    /// Candidate transitions evaluated when the service fails (`event["error"]`).
+    pub on_error: Vec<OutcomeDef>,
 }
 
 /// Structural classification of a state node.
@@ -126,15 +254,40 @@ pub enum StateKind {
         states: IndexMap<StateId, StateNodeDef>,
     },
     Final,
+    History {
+        deep: bool,
+        default_target: Option<StateId>,
+    },
 }
 
 /// Definition of a single state node in the hierarchy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StateNodeDef {
     pub kind: StateKind,
-    pub entry: Vec<String>,
-    pub exit: Vec<String>,
+    pub entry: Vec<ActionDef>,
+    pub exit: Vec<ActionDef>,
     pub on: Vec<TransitionDef>,
+    #[serde(default)]
+    pub always: Vec<OutcomeDef>,
+    #[serde(default)]
+    pub after: Vec<AfterDef>,
+    #[serde(default)]
+    pub invoke: Vec<InvokeDef>,
+    /// Completion transitions for `Compound` (child reached `Final`) or `Parallel` (all regions reached `Final`).
+    #[serde(default)]
+    pub on_done: Vec<OutcomeDef>,
+    /// Output payload produced when a `Final` state is entered.
+    #[serde(default)]
+    pub output: Option<serde_json::Value>,
+    /// State tags (e.g. `["loading", "modal"]`) queryable at runtime.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Free-form metadata JSON object.
+    #[serde(default)]
+    pub meta: Option<serde_json::Value>,
+    /// Human-readable description.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 impl StateNodeDef {
@@ -144,6 +297,14 @@ impl StateNodeDef {
             entry: Vec::new(),
             exit: Vec::new(),
             on: Vec::new(),
+            always: Vec::new(),
+            after: Vec::new(),
+            invoke: Vec::new(),
+            on_done: Vec::new(),
+            output: None,
+            tags: Vec::new(),
+            meta: None,
+            description: None,
         }
     }
 
@@ -153,6 +314,14 @@ impl StateNodeDef {
             entry: Vec::new(),
             exit: Vec::new(),
             on: Vec::new(),
+            always: Vec::new(),
+            after: Vec::new(),
+            invoke: Vec::new(),
+            on_done: Vec::new(),
+            output: None,
+            tags: Vec::new(),
+            meta: None,
+            description: None,
         }
     }
 }
@@ -164,6 +333,10 @@ pub struct MachineDef {
     pub initial: StateId,
     pub context: serde_json::Value,
     pub states: IndexMap<StateId, StateNodeDef>,
+    #[serde(default)]
+    pub output: Option<serde_json::Value>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// Graph and structural integrity errors reported by [`MachineDef::validate`].
@@ -172,7 +345,7 @@ pub enum IrValidationError {
     #[error("duplicate state id `{state}` declared in machine `{machine}`")]
     DuplicateStateId { machine: String, state: StateId },
 
-    #[error("compound state `{state}` must declare at least one child state")]
+    #[error("compound state `{state}` must declare at least one non-history child state")]
     EmptyCompoundState { state: StateId },
 
     #[error("parallel state `{state}` must declare at least one region state")]
@@ -184,15 +357,30 @@ pub enum IrValidationError {
         initial: StateId,
     },
 
-    #[error("final state `{state}` cannot declare outgoing `on` transitions")]
+    #[error("final state `{state}` cannot declare outgoing transitions")]
     FinalStateHasTransitions { state: StateId },
 
-    #[error("transition on event `{event}` from state `{from}` targets undeclared state `{target}`")]
+    #[error("final state `{state}` cannot declare `invoke` services")]
+    FinalStateHasInvocations { state: StateId },
+
+    #[error("history pseudo-state `{state}` must be nested inside a compound state")]
+    InvalidHistoryPlacement { state: StateId },
+
+    #[error("history pseudo-state `{state}` cannot declare entry/exit actions, transitions, or invocations")]
+    HistoryStateHasBehavior { state: StateId },
+
+    #[error("state `{state}` declares `on_done` but is neither a compound nor parallel state")]
+    InvalidOnDoneState { state: StateId },
+
+    #[error("transition on `{event}` from state `{from}` targets undeclared state `{target}`")]
     UnknownTargetState {
         from: StateId,
         event: String,
         target: StateId,
     },
+
+    #[error("`state_in({target})` guard in state `{from}` references undeclared state `{target}`")]
+    UnknownStateInGuard { from: StateId, target: StateId },
 
     #[error("state `{state}` is unreachable from initial state `{initial}`")]
     UnreachableState { state: StateId, initial: StateId },
@@ -200,7 +388,9 @@ pub enum IrValidationError {
 
 fn format_missing_initial(parent: Option<&StateId>, initial: &StateId) -> String {
     match parent {
-        Some(p) => format!("compound state `{p}` initial state `{initial}` does not exist in its immediate `states`"),
+        Some(p) => format!(
+            "compound state `{p}` initial state `{initial}` does not exist in its immediate `states`"
+        ),
         None => format!("machine root initial state `{initial}` does not exist in root `states`"),
     }
 }
@@ -215,9 +405,12 @@ impl MachineDef {
     /// - Unique `StateId`s across the entire state hierarchy
     /// - Valid root and compound `initial` state references
     /// - Non-empty compound and parallel child state maps
-    /// - No outgoing `on` transitions on `Final` states
-    /// - All transition targets resolve to declared `StateId`s
-    /// - Full reachability from root `initial`
+    /// - Constraints on `Final` and `History` states + `on_done` placement
+    /// - All transition, `always`, `after`, `invoke`, `on_done`, `History.default_target`,
+    ///   and `GuardRef::StateIn` references resolve to declared `StateId`s
+    /// - Full reachability from root `initial` (excluding passive `History` pseudo-states
+    ///   only when never targeted? No—if a `History` pseudo-state is declared in a machine
+    ///   and NO transition ever targets it, reporting `UnreachableState` catches unused dead history nodes too!)
     pub fn validate(&self) -> Result<(), Vec<IrValidationError>> {
         let mut errors = Vec::new();
         let mut registry: IndexMap<StateId, NodeRecord<'_>> = IndexMap::new();
@@ -240,11 +433,14 @@ impl MachineDef {
             });
         }
 
-        // Validate node-local constraints and transition targets in declaration order.
+        // Validate node-local constraints, targets, and `state_in` guards in declaration order.
         for (state_id, record) in &registry {
             match &record.node.kind {
                 StateKind::Compound { initial, states } => {
-                    if states.is_empty() {
+                    let has_non_history = states
+                        .values()
+                        .any(|child| !matches!(child.kind, StateKind::History { .. }));
+                    if !has_non_history {
                         errors.push(IrValidationError::EmptyCompoundState {
                             state: state_id.clone(),
                         });
@@ -262,15 +458,66 @@ impl MachineDef {
                             state: state_id.clone(),
                         });
                     }
+                    if !record.node.on_done.is_empty() {
+                        // Valid on Parallel.
+                    }
                 }
                 StateKind::Final => {
-                    if !record.node.on.is_empty() {
+                    if !record.node.on.is_empty()
+                        || !record.node.always.is_empty()
+                        || !record.node.after.is_empty()
+                        || !record.node.on_done.is_empty()
+                    {
                         errors.push(IrValidationError::FinalStateHasTransitions {
                             state: state_id.clone(),
                         });
                     }
+                    if !record.node.invoke.is_empty() {
+                        errors.push(IrValidationError::FinalStateHasInvocations {
+                            state: state_id.clone(),
+                        });
+                    }
                 }
-                StateKind::Atomic => {}
+                StateKind::History { default_target, .. } => {
+                    let valid_parent = record
+                        .parent
+                        .as_ref()
+                        .and_then(|p| registry.get(p))
+                        .is_some_and(|prec| matches!(prec.node.kind, StateKind::Compound { .. }));
+                    if !valid_parent {
+                        errors.push(IrValidationError::InvalidHistoryPlacement {
+                            state: state_id.clone(),
+                        });
+                    }
+                    if !record.node.entry.is_empty()
+                        || !record.node.exit.is_empty()
+                        || !record.node.on.is_empty()
+                        || !record.node.always.is_empty()
+                        || !record.node.after.is_empty()
+                        || !record.node.invoke.is_empty()
+                        || !record.node.on_done.is_empty()
+                    {
+                        errors.push(IrValidationError::HistoryStateHasBehavior {
+                            state: state_id.clone(),
+                        });
+                    }
+                    if let Some(target) = default_target
+                        && !registry.contains_key(target)
+                    {
+                        errors.push(IrValidationError::UnknownTargetState {
+                            from: state_id.clone(),
+                            event: "history.target".to_owned(),
+                            target: target.clone(),
+                        });
+                    }
+                }
+                StateKind::Atomic => {
+                    if !record.node.on_done.is_empty() {
+                        errors.push(IrValidationError::InvalidOnDoneState {
+                            state: state_id.clone(),
+                        });
+                    }
+                }
             }
 
             for transition in &record.node.on {
@@ -283,10 +530,71 @@ impl MachineDef {
                         target: target.clone(),
                     });
                 }
+                if let Some(g) = &transition.guard {
+                    Self::validate_guard_refs(state_id, g, &registry, &mut errors);
+                }
+            }
+
+            for (label, outcomes) in [
+                ("always", record.node.always.as_slice()),
+                ("on_done", record.node.on_done.as_slice()),
+            ] {
+                for outcome in outcomes {
+                    if let Some(target) = &outcome.target
+                        && !registry.contains_key(target)
+                    {
+                        errors.push(IrValidationError::UnknownTargetState {
+                            from: state_id.clone(),
+                            event: label.to_owned(),
+                            target: target.clone(),
+                        });
+                    }
+                    if let Some(g) = &outcome.guard {
+                        Self::validate_guard_refs(state_id, g, &registry, &mut errors);
+                    }
+                }
+            }
+
+            for after_def in &record.node.after {
+                for outcome in &after_def.outcomes {
+                    if let Some(target) = &outcome.target
+                        && !registry.contains_key(target)
+                    {
+                        errors.push(IrValidationError::UnknownTargetState {
+                            from: state_id.clone(),
+                            event: "after".to_owned(),
+                            target: target.clone(),
+                        });
+                    }
+                    if let Some(g) = &outcome.guard {
+                        Self::validate_guard_refs(state_id, g, &registry, &mut errors);
+                    }
+                }
+            }
+
+            for inv in &record.node.invoke {
+                for (suffix, outcomes) in [
+                    ("on_done", inv.on_done.as_slice()),
+                    ("on_error", inv.on_error.as_slice()),
+                ] {
+                    for outcome in outcomes {
+                        if let Some(target) = &outcome.target
+                            && !registry.contains_key(target)
+                        {
+                            errors.push(IrValidationError::UnknownTargetState {
+                                from: state_id.clone(),
+                                event: format!("invoke({}).{suffix}", inv.src),
+                                target: target.clone(),
+                            });
+                        }
+                        if let Some(g) = &outcome.guard {
+                            Self::validate_guard_refs(state_id, g, &registry, &mut errors);
+                        }
+                    }
+                }
             }
         }
 
-        // Reachability analysis from root initial when unambiguous and root initial exists.
         if root_initial_valid && !has_duplicates {
             let reachable = self.compute_reachable_states(&registry);
             for state_id in registry.keys() {
@@ -303,6 +611,31 @@ impl MachineDef {
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+
+    fn validate_guard_refs(
+        from: &StateId,
+        guard: &GuardRef,
+        registry: &IndexMap<StateId, NodeRecord<'_>>,
+        errors: &mut Vec<IrValidationError>,
+    ) {
+        match guard {
+            GuardRef::StateIn(target) => {
+                if !registry.contains_key(target) {
+                    errors.push(IrValidationError::UnknownStateInGuard {
+                        from: from.clone(),
+                        target: target.clone(),
+                    });
+                }
+            }
+            GuardRef::AllOf(items) | GuardRef::AnyOf(items) => {
+                for item in items {
+                    Self::validate_guard_refs(from, item, registry, errors);
+                }
+            }
+            GuardRef::Not(inner) => Self::validate_guard_refs(from, inner, registry, errors),
+            GuardRef::Named(_) | GuardRef::StarlarkSlot(_) => {}
         }
     }
 
@@ -332,7 +665,9 @@ impl MachineDef {
             }
 
             match &node.kind {
-                StateKind::Compound { states: children, .. }
+                StateKind::Compound {
+                    states: children, ..
+                }
                 | StateKind::Parallel { states: children } => {
                     Self::collect_states(
                         machine_id,
@@ -343,7 +678,7 @@ impl MachineDef {
                         has_duplicates,
                     );
                 }
-                StateKind::Atomic | StateKind::Final => {}
+                StateKind::Atomic | StateKind::Final | StateKind::History { .. } => {}
             }
         }
     }
@@ -352,8 +687,6 @@ impl MachineDef {
         &self,
         registry: &IndexMap<StateId, NodeRecord<'_>>,
     ) -> HashSet<StateId> {
-        // `active` tracks states that can become active at runtime.
-        // `default_entered` tracks states targeted directly (so their default child entries fire).
         let mut active: HashSet<StateId> = HashSet::new();
         let mut default_entered: HashSet<StateId> = HashSet::new();
 
@@ -366,11 +699,18 @@ impl MachineDef {
         let mut queue: VecDeque<WorkItem> = VecDeque::new();
         queue.push_back(WorkItem::EnterDefault(self.initial.clone()));
 
-        // Map each parallel state to its immediate children for ancestor activation.
         let mut parallel_regions: HashMap<&StateId, Vec<&StateId>> = HashMap::new();
         for (id, rec) in registry {
             if let StateKind::Parallel { states } = &rec.node.kind {
-                parallel_regions.insert(id, states.keys().collect());
+                parallel_regions.insert(
+                    id,
+                    states
+                        .iter()
+                        .filter_map(|(cid, cnode)| {
+                            (!matches!(cnode.kind, StateKind::History { .. })).then_some(cid)
+                        })
+                        .collect(),
+                );
             }
         }
 
@@ -389,8 +729,24 @@ impl MachineDef {
                                 }
                             }
                             StateKind::Parallel { states } => {
-                                for region_id in states.keys() {
-                                    queue.push_back(WorkItem::EnterDefault(region_id.clone()));
+                                for (region_id, region_node) in states {
+                                    if !matches!(region_node.kind, StateKind::History { .. }) {
+                                        queue.push_back(WorkItem::EnterDefault(region_id.clone()));
+                                    }
+                                }
+                            }
+                            StateKind::History { default_target, .. } => {
+                                if let Some(target) = default_target
+                                    && registry.contains_key(target)
+                                {
+                                    queue.push_back(WorkItem::EnterDefault(target.clone()));
+                                } else if let Some(parent_id) = &rec.parent
+                                    && let Some(parent_rec) = registry.get(parent_id)
+                                    && let StateKind::Compound { initial, states } =
+                                        &parent_rec.node.kind
+                                    && states.contains_key(initial)
+                                {
+                                    queue.push_back(WorkItem::EnterDefault(initial.clone()));
                                 }
                             }
                             StateKind::Atomic | StateKind::Final => {}
@@ -402,10 +758,8 @@ impl MachineDef {
                         continue;
                     };
                     if active.insert(state_id.clone()) {
-                        // Activating a child also activates its ancestors.
                         if let Some(parent_id) = &rec.parent {
                             queue.push_back(WorkItem::Activate(parent_id.clone()));
-                            // Entering inside a parallel state enters all orthogonal sibling regions.
                             if let Some(regions) = parallel_regions.get(parent_id) {
                                 for &region_id in regions {
                                     if region_id != &state_id {
@@ -415,12 +769,40 @@ impl MachineDef {
                             }
                         }
 
-                        // Outgoing transitions from any active state can fire.
                         for tr in &rec.node.on {
-                            if let Some(target) = &tr.target
+                            if !tr.forbidden
+                                && let Some(target) = &tr.target
                                 && registry.contains_key(target)
                             {
                                 queue.push_back(WorkItem::EnterDefault(target.clone()));
+                            }
+                        }
+
+                        for outcome in rec.node.always.iter().chain(rec.node.on_done.iter()) {
+                            if let Some(target) = &outcome.target
+                                && registry.contains_key(target)
+                            {
+                                queue.push_back(WorkItem::EnterDefault(target.clone()));
+                            }
+                        }
+
+                        for after_def in &rec.node.after {
+                            for outcome in &after_def.outcomes {
+                                if let Some(target) = &outcome.target
+                                    && registry.contains_key(target)
+                                {
+                                    queue.push_back(WorkItem::EnterDefault(target.clone()));
+                                }
+                            }
+                        }
+
+                        for inv in &rec.node.invoke {
+                            for outcome in inv.on_done.iter().chain(inv.on_error.iter()) {
+                                if let Some(target) = &outcome.target
+                                    && registry.contains_key(target)
+                                {
+                                    queue.push_back(WorkItem::EnterDefault(target.clone()));
+                                }
                             }
                         }
                     }
@@ -438,6 +820,25 @@ mod tests {
 
     use super::*;
 
+    fn plain_tr(
+        event: &str,
+        target: Option<&str>,
+        guard: Option<GuardRef>,
+        actions: Vec<ActionDef>,
+        assign: Option<AssignRef>,
+    ) -> TransitionDef {
+        TransitionDef {
+            event: event.to_owned(),
+            target: target.map(StateId::from),
+            guard,
+            actions,
+            assign,
+            reenter: false,
+            forbidden: false,
+            description: None,
+        }
+    }
+
     fn sample_order_workflow() -> MachineDef {
         let mut processing_children = IndexMap::new();
         processing_children.insert(
@@ -447,21 +848,16 @@ mod tests {
                 entry: vec!["CHARGE_CARD".into()],
                 exit: vec![],
                 on: vec![
-                    TransitionDef {
-                        event: "CHARGE_OK".into(),
-                        target: Some(StateId::from("fulfilled")),
-                        guard: None,
-                        actions: vec![],
-                        assign: None,
-                    },
-                    TransitionDef {
-                        event: "CHARGE_ERR".into(),
-                        target: Some(StateId::from("failed")),
-                        guard: None,
-                        actions: vec![],
-                        assign: Some(AssignRef::StarlarkSlot(0)),
-                    },
+                    plain_tr("CHARGE_OK", Some("fulfilled"), None, vec![], None),
+                    plain_tr(
+                        "CHARGE_ERR",
+                        Some("failed"),
+                        None,
+                        vec![],
+                        Some(AssignRef::StarlarkSlot(0)),
+                    ),
                 ],
+                ..StateNodeDef::atomic()
             },
         );
 
@@ -470,24 +866,23 @@ mod tests {
             StateId::from("validating"),
             StateNodeDef {
                 kind: StateKind::Atomic,
-                entry: vec![],
-                exit: vec![],
                 on: vec![
-                    TransitionDef {
-                        event: "APPROVED".into(),
-                        target: Some(StateId::from("processing")),
-                        guard: Some(GuardRef::StarlarkSlot(0)),
-                        actions: vec![],
-                        assign: None,
-                    },
-                    TransitionDef {
-                        event: "REJECTED".into(),
-                        target: Some(StateId::from("rejected")),
-                        guard: None,
-                        actions: vec!["LOG_REJECTION".into()],
-                        assign: None,
-                    },
+                    plain_tr(
+                        "APPROVED",
+                        Some("processing"),
+                        Some(GuardRef::StarlarkSlot(0)),
+                        vec![],
+                        None,
+                    ),
+                    plain_tr(
+                        "REJECTED",
+                        Some("rejected"),
+                        None,
+                        vec!["LOG_REJECTION".into()],
+                        None,
+                    ),
                 ],
+                ..StateNodeDef::atomic()
             },
         );
         states.insert(
@@ -497,15 +892,8 @@ mod tests {
                     initial: StateId::from("charging"),
                     states: processing_children,
                 },
-                entry: vec![],
-                exit: vec![],
-                on: vec![TransitionDef {
-                    event: "CANCEL".into(),
-                    target: Some(StateId::from("rejected")),
-                    guard: None,
-                    actions: vec![],
-                    assign: None,
-                }],
+                on: vec![plain_tr("CANCEL", Some("rejected"), None, vec![], None)],
+                ..StateNodeDef::atomic()
             },
         );
         states.insert(
@@ -513,8 +901,7 @@ mod tests {
             StateNodeDef {
                 kind: StateKind::Final,
                 entry: vec!["NOTIFY_USER".into()],
-                exit: vec![],
-                on: vec![],
+                ..StateNodeDef::final_state()
             },
         );
         states.insert(StateId::from("rejected"), StateNodeDef::final_state());
@@ -525,6 +912,8 @@ mod tests {
             initial: StateId::from("validating"),
             context: json!({"limit": 1000, "attempts": 0}),
             states,
+            output: None,
+            description: None,
         }
     }
 
@@ -570,13 +959,7 @@ mod tests {
             .get_mut(&StateId::from("validating"))
             .unwrap()
             .on
-            .push(TransitionDef {
-                event: "GHOST".into(),
-                target: Some(StateId::from("phantom")),
-                guard: None,
-                actions: vec![],
-                assign: None,
-            });
+            .push(plain_tr("GHOST", Some("phantom"), None, vec![], None));
 
         let err = machine.validate().expect_err("expected validation failure");
         assert!(err.contains(&IrValidationError::UnknownTargetState {
@@ -594,13 +977,7 @@ mod tests {
             .get_mut(&StateId::from("fulfilled"))
             .unwrap()
             .on
-            .push(TransitionDef {
-                event: "RETRY".into(),
-                target: Some(StateId::from("validating")),
-                guard: None,
-                actions: vec![],
-                assign: None,
-            });
+            .push(plain_tr("RETRY", Some("validating"), None, vec![], None));
 
         let err = machine.validate().expect_err("expected validation failure");
         assert!(err.contains(&IrValidationError::FinalStateHasTransitions {
@@ -657,9 +1034,7 @@ mod tests {
                     initial: StateId::from("a_init"),
                     states: region_a_children,
                 },
-                entry: vec![],
-                exit: vec![],
-                on: vec![],
+                ..StateNodeDef::atomic()
             },
         );
         parallel_regions.insert(
@@ -669,9 +1044,7 @@ mod tests {
                     initial: StateId::from("b_init"),
                     states: region_b_children,
                 },
-                entry: vec![],
-                exit: vec![],
-                on: vec![],
+                ..StateNodeDef::atomic()
             },
         );
 
@@ -682,9 +1055,7 @@ mod tests {
                 kind: StateKind::Parallel {
                     states: parallel_regions,
                 },
-                entry: vec![],
-                exit: vec![],
-                on: vec![],
+                ..StateNodeDef::atomic()
             },
         );
 
@@ -693,8 +1064,156 @@ mod tests {
             initial: StateId::from("active_parallel"),
             context: json!({}),
             states: root_states,
+            output: None,
+            description: None,
         };
 
         assert_eq!(machine.validate(), Ok(()));
+    }
+
+    #[test]
+    fn invoke_outcomes_participate_in_reachability_and_target_validation() {
+        let mut states = IndexMap::new();
+        states.insert(
+            StateId::from("fetching"),
+            StateNodeDef {
+                kind: StateKind::Atomic,
+                invoke: vec![InvokeDef {
+                    id: Some("fetch_user".into()),
+                    src: "FETCH_USER".into(),
+                    input: json!({"id": 42}),
+                    on_done: vec![OutcomeDef {
+                        target: Some(StateId::from("ready")),
+                        guard: None,
+                        actions: vec![],
+                        assign: None,
+                        reenter: false,
+                        description: None,
+                    }],
+                    on_error: vec![OutcomeDef {
+                        target: Some(StateId::from("errored")),
+                        guard: None,
+                        actions: vec![],
+                        assign: None,
+                        reenter: false,
+                        description: None,
+                    }],
+                }],
+                ..StateNodeDef::atomic()
+            },
+        );
+        states.insert(StateId::from("ready"), StateNodeDef::final_state());
+        states.insert(StateId::from("errored"), StateNodeDef::final_state());
+
+        let mut machine = MachineDef {
+            id: "invoke_demo".into(),
+            initial: StateId::from("fetching"),
+            context: json!({}),
+            states,
+            output: None,
+            description: None,
+        };
+        assert_eq!(machine.validate(), Ok(()));
+
+        machine
+            .states
+            .get_mut(&StateId::from("fetching"))
+            .unwrap()
+            .invoke[0]
+            .on_done[0]
+            .target = Some(StateId::from("missing_state"));
+
+        let err = machine.validate().expect_err("expected unknown target");
+        assert!(err.contains(&IrValidationError::UnknownTargetState {
+            from: StateId::from("fetching"),
+            event: "invoke(FETCH_USER).on_done".into(),
+            target: StateId::from("missing_state"),
+        }));
+    }
+
+    #[test]
+    fn state_in_guard_and_history_pseudo_states_validate_cleanly() {
+        let mut compound_children = IndexMap::new();
+        compound_children.insert(
+            StateId::from("hist"),
+            StateNodeDef {
+                kind: StateKind::History {
+                    deep: false,
+                    default_target: Some(StateId::from("step_a")),
+                },
+                ..StateNodeDef::atomic()
+            },
+        );
+        compound_children.insert(
+            StateId::from("step_a"),
+            StateNodeDef {
+                kind: StateKind::Atomic,
+                on: vec![plain_tr("NEXT", Some("step_b"), None, vec![], None)],
+                ..StateNodeDef::atomic()
+            },
+        );
+        compound_children.insert(StateId::from("step_b"), StateNodeDef::final_state());
+
+        let mut root_states = IndexMap::new();
+        root_states.insert(
+            StateId::from("wizard"),
+            StateNodeDef {
+                kind: StateKind::Compound {
+                    initial: StateId::from("step_a"),
+                    states: compound_children,
+                },
+                on: vec![plain_tr("PAUSE", Some("paused"), None, vec![], None)],
+                on_done: vec![OutcomeDef {
+                    target: Some(StateId::from("done")),
+                    guard: None,
+                    actions: vec![],
+                    assign: None,
+                    reenter: false,
+                    description: None,
+                }],
+                ..StateNodeDef::atomic()
+            },
+        );
+        root_states.insert(
+            StateId::from("paused"),
+            StateNodeDef {
+                kind: StateKind::Atomic,
+                on: vec![plain_tr(
+                    "RESUME",
+                    Some("hist"),
+                    Some(GuardRef::Not(Box::new(GuardRef::StateIn(StateId::from(
+                        "done",
+                    ))))),
+                    vec![],
+                    None,
+                )],
+                ..StateNodeDef::atomic()
+            },
+        );
+        root_states.insert(StateId::from("done"), StateNodeDef::final_state());
+
+        let mut machine = MachineDef {
+            id: "wizard_hist".into(),
+            initial: StateId::from("wizard"),
+            context: json!({}),
+            states: root_states,
+            output: None,
+            description: None,
+        };
+        assert_eq!(machine.validate(), Ok(()));
+
+        // Corrupt `state_in` target -> should report `UnknownStateInGuard`.
+        machine
+            .states
+            .get_mut(&StateId::from("paused"))
+            .unwrap()
+            .on[0]
+            .guard = Some(GuardRef::StateIn(StateId::from("ghost_state")));
+
+        let err = machine.validate().expect_err("expected UnknownStateInGuard");
+        assert!(err.contains(&IrValidationError::UnknownStateInGuard {
+            from: StateId::from("paused"),
+            target: StateId::from("ghost_state"),
+        }));
     }
 }

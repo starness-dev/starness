@@ -10,8 +10,9 @@ pub use loader::{
     compile_starlark_file, compile_starlark_str, compile_with_resolver,
 };
 pub use types::{
-    FrozenStarlarkMachine, StarlarkGuard, StarlarkMachine, StarlarkStateId, StarlarkStateNode,
-    StarlarkStateSpace, StarlarkTransition, SymbolOrEnum,
+    FrozenStarlarkMachine, StarlarkAction, StarlarkAfter, StarlarkGuard, StarlarkInvoke,
+    StarlarkMachine, StarlarkOutcome, StarlarkStateId, StarlarkStateNode, StarlarkStateSpace,
+    StarlarkTransition, SymbolOrEnum,
 };
 
 #[cfg(test)]

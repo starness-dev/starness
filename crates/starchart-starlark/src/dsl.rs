@@ -1,6 +1,8 @@
+#![allow(clippy::too_many_arguments)]
+
 use anyhow::bail;
-use starchart_ir::StateId;
 use indexmap::IndexSet;
+use starchart_ir::StateId;
 use starlark::environment::{Globals, GlobalsBuilder, LibraryExtension};
 use starlark::starlark_module;
 use starlark::syntax::{Dialect, DialectTypes};
@@ -11,18 +13,44 @@ use starlark::values::record::Record;
 use starlark::values::tuple::UnpackTuple;
 
 use crate::types::{
-    AssignCallable, GuardExprGen, GuardInput, NodeKindDataGen, StarlarkGuard, StarlarkMachine,
-    StarlarkStateId, StarlarkStateNode, StarlarkStateSpace, StarlarkTransition, StateNodeDataGen,
-    SymbolOrEnum, TransitionDataGen, build_and_validate_machine, clone_node_to_value,
-    clone_transition_to_value,
+    ActionDataGen, ActionInput, AfterDataGen, AssignCallable, DelayInput, GuardExprGen, GuardInput,
+    InvokeDataGen, InvokeOutcomesInput, JsonHolder, NodeKindDataGen, OneOrManyAfter,
+    OneOrManyInvoke, OutcomeDataGen, StarlarkAction, StarlarkAfter, StarlarkGuard, StarlarkInvoke,
+    StarlarkMachine, StarlarkOutcome, StarlarkStateId, StarlarkStateNode, StarlarkStateSpace,
+    StarlarkTransition, StateNodeDataGen, SymbolOrEnum, TransitionDataGen,
+    build_and_validate_machine, clone_node_to_value, clone_transition_to_value,
 };
+
+fn unpack_optional_json(val: Option<Value<'_>>) -> anyhow::Result<Option<JsonHolder>> {
+    match val {
+        Some(v) if !v.is_none() => Ok(Some(JsonHolder(v.to_json_value()?))),
+        _ => Ok(None),
+    }
+}
+
+fn unpack_optional_meta(val: Option<Value<'_>>) -> anyhow::Result<Option<JsonHolder>> {
+    match val {
+        Some(v) if !v.is_none() => {
+            let json = v.to_json_value()?;
+            if !json.is_object() {
+                bail!("`meta` must be a dict or record, got `{}`", v.get_type());
+            }
+            Ok(Some(JsonHolder(json)))
+        }
+        _ => Ok(None),
+    }
+}
 
 #[starlark_module]
 #[starlark_types(
     StarlarkStateId as StateId,
     StarlarkStateSpace as StateSpace,
     StarlarkGuard as Guard,
+    StarlarkAction as ActionSpec,
     StarlarkTransition as Transition,
+    StarlarkOutcome as Outcome,
+    StarlarkAfter as After,
+    StarlarkInvoke as Invoke,
     StarlarkStateNode as StateNode,
     StarlarkMachine as StateMachine
 )]
@@ -36,7 +64,9 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
     }
 
     /// Declares a typed namespace of `StateId` handles without repeating names.
-    fn state_space(#[starlark(args)] names: UnpackTuple<String>) -> anyhow::Result<StarlarkStateSpace> {
+    fn state_space(
+        #[starlark(args)] names: UnpackTuple<String>,
+    ) -> anyhow::Result<StarlarkStateSpace> {
         if names.items.is_empty() {
             bail!("state_space(...) requires at least one state name");
         }
@@ -59,7 +89,14 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
         })
     }
 
-    /// Logical AND combinator over two or more guards.
+    /// Harel `In(state)` guard: evaluates to `True` while `state` is active (e.g. in a sibling parallel region).
+    fn state_in<'v>(state: &StarlarkStateId) -> anyhow::Result<StarlarkGuard<'v>> {
+        Ok(StarlarkGuard {
+            expr: GuardExprGen::StateIn(state.0.0.clone()),
+        })
+    }
+
+    /// Logical AND combinator over one or more guards.
     fn all_of<'v>(
         #[starlark(args)] guards: UnpackTuple<GuardInput<'v>>,
     ) -> anyhow::Result<StarlarkGuard<'v>> {
@@ -71,7 +108,7 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
         })
     }
 
-    /// Logical OR combinator over two or more guards.
+    /// Logical OR combinator over one or more guards.
     fn any_of<'v>(
         #[starlark(args)] guards: UnpackTuple<GuardInput<'v>>,
     ) -> anyhow::Result<StarlarkGuard<'v>> {
@@ -90,15 +127,116 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
         })
     }
 
+    /// Built-in action that queues an internal event to this machine (optionally delayed and cancellable via `id`).
+    fn raise_event<'v>(
+        #[starlark(require = named)] event: SymbolOrEnum,
+        #[starlark(require = named)] payload: Option<Value<'v>>,
+        #[starlark(require = named)] delay: Option<DelayInput<'v>>,
+        #[starlark(require = named)] id: Option<&str>,
+    ) -> anyhow::Result<StarlarkAction<'v>> {
+        let payload_json = match payload {
+            Some(v) if !v.is_none() => v.to_json_value()?,
+            _ => serde_json::Value::Null,
+        };
+        Ok(StarlarkAction {
+            data: ActionDataGen::Raise {
+                event: event.0,
+                payload: JsonHolder(payload_json),
+                delay: delay.map(|d| d.0),
+                id: id.map(str::to_owned),
+            },
+        })
+    }
+
+    /// Built-in action that cancels a pending delayed `raise_event` or `send_to` by its `id`.
+    fn cancel_send<'v>(#[starlark(require = named)] id: &str) -> anyhow::Result<StarlarkAction<'v>> {
+        if id.trim().is_empty() {
+            bail!("cancel_send `id` must not be empty");
+        }
+        Ok(StarlarkAction {
+            data: ActionDataGen::Cancel {
+                send_id: id.to_owned(),
+            },
+        })
+    }
+
+    /// Built-in action that emits an external event to observers / `runner.take_emitted()`.
+    fn emit_event<'v>(
+        #[starlark(require = named)] event: SymbolOrEnum,
+        #[starlark(require = named)] payload: Option<Value<'v>>,
+    ) -> anyhow::Result<StarlarkAction<'v>> {
+        let payload_json = match payload {
+            Some(v) if !v.is_none() => v.to_json_value()?,
+            _ => serde_json::Value::Null,
+        };
+        Ok(StarlarkAction {
+            data: ActionDataGen::Emit {
+                event: event.0,
+                payload: JsonHolder(payload_json),
+            },
+        })
+    }
+
+    /// Built-in action that sends an event to another actor (`"parent"`, `"self"`, child id, or system id).
+    fn send_to<'v>(
+        #[starlark(require = named)] to: &str,
+        #[starlark(require = named)] event: SymbolOrEnum,
+        #[starlark(require = named)] payload: Option<Value<'v>>,
+        #[starlark(require = named)] delay: Option<DelayInput<'v>>,
+        #[starlark(require = named)] id: Option<&str>,
+    ) -> anyhow::Result<StarlarkAction<'v>> {
+        let payload_json = match payload {
+            Some(v) if !v.is_none() => v.to_json_value()?,
+            _ => serde_json::Value::Null,
+        };
+        Ok(StarlarkAction {
+            data: ActionDataGen::SendTo {
+                to: to.to_owned(),
+                event: event.0,
+                payload: JsonHolder(payload_json),
+                delay: delay.map(|d| d.0),
+                id: id.map(str::to_owned),
+            },
+        })
+    }
+
+    /// Built-in action that sends an event to the parent machine when invoked as a child actor.
+    fn send_parent<'v>(
+        #[starlark(require = named)] event: SymbolOrEnum,
+        #[starlark(require = named)] payload: Option<Value<'v>>,
+    ) -> anyhow::Result<StarlarkAction<'v>> {
+        let payload_json = match payload {
+            Some(v) if !v.is_none() => v.to_json_value()?,
+            _ => serde_json::Value::Null,
+        };
+        Ok(StarlarkAction {
+            data: ActionDataGen::SendParent {
+                event: event.0,
+                payload: JsonHolder(payload_json),
+            },
+        })
+    }
+
+    /// Built-in action that appends a static value to the interpreter's log buffer (`runner.take_logs()`).
+    fn log_action<'v>(expr: Value<'v>) -> anyhow::Result<StarlarkAction<'v>> {
+        Ok(StarlarkAction {
+            data: ActionDataGen::Log {
+                expr: JsonHolder(expr.to_json_value()?),
+            },
+        })
+    }
+
     /// Declares a typed state transition.
     fn transition<'v>(
         #[starlark(require = named)] event: SymbolOrEnum,
         #[starlark(require = named)] target: Option<&StarlarkStateId>,
         #[starlark(require = named)] guard: Option<GuardInput<'v>>,
         #[starlark(require = named, default = UnpackList::default())] actions: UnpackList<
-            SymbolOrEnum,
+            ActionInput<'v>,
         >,
         #[starlark(require = named)] assign: Option<AssignCallable<'v>>,
+        #[starlark(require = named, default = false)] reenter: bool,
+        #[starlark(require = named)] description: Option<&str>,
     ) -> anyhow::Result<StarlarkTransition<'v>> {
         Ok(StarlarkTransition {
             data: TransitionDataGen {
@@ -107,6 +245,9 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
                 guard: guard.map(|g| g.0),
                 actions: actions.items.into_iter().map(|a| a.0).collect(),
                 assign: assign.map(|c| c.0),
+                reenter,
+                forbidden: false,
+                description: description.map(str::to_owned),
             },
         })
     }
@@ -116,9 +257,10 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
         #[starlark(require = named)] event: SymbolOrEnum,
         #[starlark(require = named)] guard: Option<GuardInput<'v>>,
         #[starlark(require = named, default = UnpackList::default())] actions: UnpackList<
-            SymbolOrEnum,
+            ActionInput<'v>,
         >,
         #[starlark(require = named)] assign: Option<AssignCallable<'v>>,
+        #[starlark(require = named)] description: Option<&str>,
     ) -> anyhow::Result<StarlarkTransition<'v>> {
         Ok(StarlarkTransition {
             data: TransitionDataGen {
@@ -127,6 +269,133 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
                 guard: guard.map(|g| g.0),
                 actions: actions.items.into_iter().map(|a| a.0).collect(),
                 assign: assign.map(|c| c.0),
+                reenter: false,
+                forbidden: false,
+                description: description.map(str::to_owned),
+            },
+        })
+    }
+
+    /// Explicitly forbids `event` in a state, consuming it so ancestor superstates do not handle it.
+    fn forbid<'v>(
+        #[starlark(require = named)] event: SymbolOrEnum,
+        #[starlark(require = named)] description: Option<&str>,
+    ) -> anyhow::Result<StarlarkTransition<'v>> {
+        Ok(StarlarkTransition {
+            data: TransitionDataGen {
+                event: event.0,
+                target: None,
+                guard: None,
+                actions: Vec::new(),
+                assign: None,
+                reenter: false,
+                forbidden: true,
+                description: description.map(str::to_owned),
+            },
+        })
+    }
+
+    /// Declares a transition outcome branch used by `always`, `after`, `on_done`, and `invoke`.
+    fn outcome<'v>(
+        #[starlark(require = named)] target: Option<&StarlarkStateId>,
+        #[starlark(require = named)] guard: Option<GuardInput<'v>>,
+        #[starlark(require = named, default = UnpackList::default())] actions: UnpackList<
+            ActionInput<'v>,
+        >,
+        #[starlark(require = named)] assign: Option<AssignCallable<'v>>,
+        #[starlark(require = named, default = false)] reenter: bool,
+        #[starlark(require = named)] description: Option<&str>,
+    ) -> anyhow::Result<StarlarkOutcome<'v>> {
+        Ok(StarlarkOutcome {
+            data: OutcomeDataGen {
+                target: target.map(|t| t.0.0.clone()),
+                guard: guard.map(|g| g.0),
+                actions: actions.items.into_iter().map(|a| a.0).collect(),
+                assign: assign.map(|c| c.0),
+                reenter,
+                description: description.map(str::to_owned),
+            },
+        })
+    }
+
+    /// Declares a delayed (`after`) timer transition fired after `delay`.
+    fn after<'v>(
+        #[starlark(require = named)] delay: DelayInput<'v>,
+        #[starlark(require = named)] target: Option<&StarlarkStateId>,
+        #[starlark(require = named)] guard: Option<GuardInput<'v>>,
+        #[starlark(require = named, default = UnpackList::default())] actions: UnpackList<
+            ActionInput<'v>,
+        >,
+        #[starlark(require = named)] assign: Option<AssignCallable<'v>>,
+        #[starlark(require = named, default = false)] reenter: bool,
+        #[starlark(require = named)] description: Option<&str>,
+        #[starlark(require = named)] outcomes: Option<InvokeOutcomesInput<'v>>,
+    ) -> anyhow::Result<StarlarkAfter<'v>> {
+        let has_inline = target.is_some()
+            || guard.is_some()
+            || !actions.items.is_empty()
+            || assign.is_some()
+            || reenter
+            || description.is_some();
+        let resolved_outcomes = match (outcomes, has_inline) {
+            (Some(_), true) => {
+                bail!(
+                    "after(...) accepts either inline `target`/`guard`/`actions`/`assign` OR `outcomes = [...]`, not both"
+                );
+            }
+            (Some(branches), false) => {
+                if branches.0.is_empty() {
+                    bail!("after(..., outcomes = [...]) must not be empty");
+                }
+                branches.0
+            }
+            (None, _) => vec![OutcomeDataGen {
+                target: target.map(|t| t.0.0.clone()),
+                guard: guard.map(|g| g.0),
+                actions: actions.items.into_iter().map(|a| a.0).collect(),
+                assign: assign.map(|c| c.0),
+                reenter,
+                description: description.map(str::to_owned),
+            }],
+        };
+
+        Ok(StarlarkAfter {
+            data: AfterDataGen {
+                delay: delay.0,
+                outcomes: resolved_outcomes,
+            },
+        })
+    }
+
+    /// Declares an invoked host service or child statechart started on state entry and cancelled on exit.
+    fn invoke<'v>(
+        #[starlark(require = named)] src: SymbolOrEnum,
+        #[starlark(require = named)] id: Option<&str>,
+        #[starlark(require = named)] input: Option<Value<'v>>,
+        #[starlark(require = named)] on_done: Option<InvokeOutcomesInput<'v>>,
+        #[starlark(require = named)] on_error: Option<InvokeOutcomesInput<'v>>,
+    ) -> anyhow::Result<StarlarkInvoke<'v>> {
+        if src.0.trim().is_empty() {
+            bail!("invoke `src` must not be empty");
+        }
+        if let Some(explicit_id) = id
+            && explicit_id.trim().is_empty()
+        {
+            bail!("invoke `id` must not be empty");
+        }
+
+        let input_json = match input {
+            Some(val) if !val.is_none() => val.to_json_value()?,
+            _ => serde_json::Value::Null,
+        };
+
+        Ok(StarlarkInvoke {
+            data: InvokeDataGen {
+                id: id.map(str::to_owned),
+                src: src.0,
+                input: JsonHolder(input_json),
+                on_done: on_done.map(|o| o.0).unwrap_or_default(),
+                on_error: on_error.map(|o| o.0).unwrap_or_default(),
             },
         })
     }
@@ -136,12 +405,24 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = UnpackList::default())] on: UnpackList<
             &StarlarkTransition<'v>,
         >,
+        #[starlark(require = named, default = InvokeOutcomesInput::default())]
+        always: InvokeOutcomesInput<'v>,
+        #[starlark(require = named, default = OneOrManyAfter::default())] after: OneOrManyAfter<
+            'v,
+        >,
+        #[starlark(require = named, default = OneOrManyInvoke::default())]
+        invoke: OneOrManyInvoke<'v>,
         #[starlark(require = named, default = UnpackList::default())] entry: UnpackList<
-            SymbolOrEnum,
+            ActionInput<'v>,
         >,
         #[starlark(require = named, default = UnpackList::default())] exit: UnpackList<
+            ActionInput<'v>,
+        >,
+        #[starlark(require = named, default = UnpackList::default())] tags: UnpackList<
             SymbolOrEnum,
         >,
+        #[starlark(require = named)] meta: Option<Value<'v>>,
+        #[starlark(require = named)] description: Option<&str>,
     ) -> anyhow::Result<StarlarkStateNode<'v>> {
         Ok(StarlarkStateNode {
             data: StateNodeDataGen {
@@ -153,6 +434,14 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
                     .into_iter()
                     .map(|t| clone_transition_to_value(&t.data))
                     .collect(),
+                always: always.0,
+                after: after.0,
+                invoke: invoke.0,
+                on_done: Vec::new(),
+                output: None,
+                tags: tags.items.into_iter().map(|t| t.0).collect(),
+                meta: unpack_optional_meta(meta)?,
+                description: description.map(str::to_owned),
             },
         })
     }
@@ -167,12 +456,26 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = UnpackList::default())] on: UnpackList<
             &StarlarkTransition<'v>,
         >,
+        #[starlark(require = named, default = InvokeOutcomesInput::default())]
+        always: InvokeOutcomesInput<'v>,
+        #[starlark(require = named, default = OneOrManyAfter::default())] after: OneOrManyAfter<
+            'v,
+        >,
+        #[starlark(require = named, default = OneOrManyInvoke::default())]
+        invoke: OneOrManyInvoke<'v>,
+        #[starlark(require = named, default = InvokeOutcomesInput::default())]
+        on_done: InvokeOutcomesInput<'v>,
         #[starlark(require = named, default = UnpackList::default())] entry: UnpackList<
-            SymbolOrEnum,
+            ActionInput<'v>,
         >,
         #[starlark(require = named, default = UnpackList::default())] exit: UnpackList<
+            ActionInput<'v>,
+        >,
+        #[starlark(require = named, default = UnpackList::default())] tags: UnpackList<
             SymbolOrEnum,
         >,
+        #[starlark(require = named)] meta: Option<Value<'v>>,
+        #[starlark(require = named)] description: Option<&str>,
     ) -> anyhow::Result<StarlarkStateNode<'v>> {
         let children = states
             .entries
@@ -193,11 +496,20 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
                     .into_iter()
                     .map(|t| clone_transition_to_value(&t.data))
                     .collect(),
+                always: always.0,
+                after: after.0,
+                invoke: invoke.0,
+                on_done: on_done.0,
+                output: None,
+                tags: tags.items.into_iter().map(|t| t.0).collect(),
+                meta: unpack_optional_meta(meta)?,
+                description: description.map(str::to_owned),
             },
         })
     }
 
     /// Declares an orthogonal parallel state where all child regions are active simultaneously.
+    /// `on_done` fires automatically once every child region reaches a `final_state`.
     fn parallel_state<'v>(
         #[starlark(require = named)] states: UnpackDictEntries<
             &'v StarlarkStateId,
@@ -206,12 +518,26 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = UnpackList::default())] on: UnpackList<
             &StarlarkTransition<'v>,
         >,
+        #[starlark(require = named, default = InvokeOutcomesInput::default())]
+        always: InvokeOutcomesInput<'v>,
+        #[starlark(require = named, default = OneOrManyAfter::default())] after: OneOrManyAfter<
+            'v,
+        >,
+        #[starlark(require = named, default = OneOrManyInvoke::default())]
+        invoke: OneOrManyInvoke<'v>,
+        #[starlark(require = named, default = InvokeOutcomesInput::default())]
+        on_done: InvokeOutcomesInput<'v>,
         #[starlark(require = named, default = UnpackList::default())] entry: UnpackList<
-            SymbolOrEnum,
+            ActionInput<'v>,
         >,
         #[starlark(require = named, default = UnpackList::default())] exit: UnpackList<
+            ActionInput<'v>,
+        >,
+        #[starlark(require = named, default = UnpackList::default())] tags: UnpackList<
             SymbolOrEnum,
         >,
+        #[starlark(require = named)] meta: Option<Value<'v>>,
+        #[starlark(require = named)] description: Option<&str>,
     ) -> anyhow::Result<StarlarkStateNode<'v>> {
         let children = states
             .entries
@@ -229,18 +555,32 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
                     .into_iter()
                     .map(|t| clone_transition_to_value(&t.data))
                     .collect(),
+                always: always.0,
+                after: after.0,
+                invoke: invoke.0,
+                on_done: on_done.0,
+                output: None,
+                tags: tags.items.into_iter().map(|t| t.0).collect(),
+                meta: unpack_optional_meta(meta)?,
+                description: description.map(str::to_owned),
             },
         })
     }
 
-    /// Declares a terminal final state node.
+    /// Declares a terminal final state node (with optional structured `output`).
     fn final_state<'v>(
         #[starlark(require = named, default = UnpackList::default())] entry: UnpackList<
-            SymbolOrEnum,
+            ActionInput<'v>,
         >,
         #[starlark(require = named, default = UnpackList::default())] exit: UnpackList<
+            ActionInput<'v>,
+        >,
+        #[starlark(require = named)] output: Option<Value<'v>>,
+        #[starlark(require = named, default = UnpackList::default())] tags: UnpackList<
             SymbolOrEnum,
         >,
+        #[starlark(require = named)] meta: Option<Value<'v>>,
+        #[starlark(require = named)] description: Option<&str>,
     ) -> anyhow::Result<StarlarkStateNode<'v>> {
         Ok(StarlarkStateNode {
             data: StateNodeDataGen {
@@ -248,6 +588,66 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
                 entry: entry.items.into_iter().map(|a| a.0).collect(),
                 exit: exit.items.into_iter().map(|a| a.0).collect(),
                 on: Vec::new(),
+                always: Vec::new(),
+                after: Vec::new(),
+                invoke: Vec::new(),
+                on_done: Vec::new(),
+                output: unpack_optional_json(output)?,
+                tags: tags.items.into_iter().map(|t| t.0).collect(),
+                meta: unpack_optional_meta(meta)?,
+                description: description.map(str::to_owned),
+            },
+        })
+    }
+
+    /// Declares a Harel shallow history (`H`) pseudo-state inside a `compound_state`.
+    fn shallow_history<'v>(
+        #[starlark(require = named)] target: Option<&StarlarkStateId>,
+        #[starlark(require = named)] description: Option<&str>,
+    ) -> anyhow::Result<StarlarkStateNode<'v>> {
+        Ok(StarlarkStateNode {
+            data: StateNodeDataGen {
+                kind: NodeKindDataGen::History {
+                    deep: false,
+                    default_target: target.map(|t| t.0.0.clone()),
+                },
+                entry: Vec::new(),
+                exit: Vec::new(),
+                on: Vec::new(),
+                always: Vec::new(),
+                after: Vec::new(),
+                invoke: Vec::new(),
+                on_done: Vec::new(),
+                output: None,
+                tags: Vec::new(),
+                meta: None,
+                description: description.map(str::to_owned),
+            },
+        })
+    }
+
+    /// Declares a Harel deep history (`H*`) pseudo-state inside a `compound_state`.
+    fn deep_history<'v>(
+        #[starlark(require = named)] target: Option<&StarlarkStateId>,
+        #[starlark(require = named)] description: Option<&str>,
+    ) -> anyhow::Result<StarlarkStateNode<'v>> {
+        Ok(StarlarkStateNode {
+            data: StateNodeDataGen {
+                kind: NodeKindDataGen::History {
+                    deep: true,
+                    default_target: target.map(|t| t.0.0.clone()),
+                },
+                entry: Vec::new(),
+                exit: Vec::new(),
+                on: Vec::new(),
+                always: Vec::new(),
+                after: Vec::new(),
+                invoke: Vec::new(),
+                on_done: Vec::new(),
+                output: None,
+                tags: Vec::new(),
+                meta: None,
+                description: description.map(str::to_owned),
             },
         })
     }
@@ -261,13 +661,18 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
             &'v StarlarkStateNode<'v>,
         >,
         #[starlark(require = named)] context: Option<Value<'v>>,
+        #[starlark(require = named)] output: Option<Value<'v>>,
+        #[starlark(require = named)] description: Option<&str>,
     ) -> anyhow::Result<StarlarkMachine<'v>> {
         let (context_json, initial_record_context) = match context {
             Some(val) if !val.is_none() => {
                 let is_record = Record::from_value(val).is_some();
                 let json = val.to_json_value()?;
                 if !json.is_object() {
-                    bail!("machine `context` must be a dict or record, got `{}`", val.get_type());
+                    bail!(
+                        "machine `context` must be a dict or record, got `{}`",
+                        val.get_type()
+                    );
                 }
                 (json, is_record.then_some(val))
             }
@@ -285,6 +690,8 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
             initial.0.clone(),
             context_json,
             initial_record_context,
+            unpack_optional_json(output)?.map(|j| j.0),
+            description.map(str::to_owned),
             entries,
         ) {
             Ok(machine) => Ok(machine),
