@@ -22,18 +22,12 @@ Typed Starlark Harel statechart engine in Rust, backed by `xstate-statemachine` 
 cargo run -p starchart-cli -- check examples/*.star
 
 # Render a Harel Mermaid stateDiagram-v2 graph
-cargo run -p starchart-cli -- diagram examples/checkout_http.star
+cargo run -p starchart-cli -- diagram examples/deployment_pipeline.star
 
-# Execute a statechart with events or built-in async drivers
-cargo run -p starchart-cli -- run examples/order_workflow.star \
-  --event '{"type":"APPROVED","amount":250}' \
-  --event CHARGE_OK
-
-# Stream lossless JSONL execution & service-progress traces (use `-` for stdout or a file path)
-cargo run -p starchart-cli -- run examples/order_workflow.star \
-  --trace - \
-  --event '{"type":"APPROVED","amount":250}' \
-  --event CHARGE_OK
+# Execute a multi-agent workflow and stream lossless JSONL traces (`-` for stdout or a file path)
+cargo run -p starchart-cli -- run examples/multi_agent_acp.star \
+  --trace trace.jsonl \
+  --context '{"task":"Add retry jitter to @starchart/http"}'
 
 # Expose any .star workflow as an ACP v1 Agent over stdio (for Zed, Neovim, JetBrains, etc.)
 cargo run -p starchart-cli -- acp examples/multi_agent_acp.star

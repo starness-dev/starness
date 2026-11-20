@@ -15,7 +15,7 @@ fn workspace_file(rel: &str) -> PathBuf {
 fn check_order_workflow_exits_zero() {
     let output = Command::new(bin_path())
         .arg("check")
-        .arg(workspace_file("examples/order_workflow.star"))
+        .arg(workspace_file("tests/fixtures/order_workflow.star"))
         .output()
         .expect("run starchart check");
 
@@ -69,7 +69,7 @@ chart = machine(
 fn diagram_outputs_mermaid_state_diagram_v2() {
     let output = Command::new(bin_path())
         .arg("diagram")
-        .arg(workspace_file("examples/order_workflow.star"))
+        .arg(workspace_file("tests/fixtures/order_workflow.star"))
         .output()
         .expect("run starchart diagram");
 
@@ -91,7 +91,7 @@ fn diagram_outputs_mermaid_state_diagram_v2() {
 fn run_executes_order_workflow_events_end_to_end() {
     let output = Command::new(bin_path())
         .arg("run")
-        .arg(workspace_file("examples/order_workflow.star"))
+        .arg(workspace_file("tests/fixtures/order_workflow.star"))
         .arg("--event")
         .arg(r#"{"type":"APPROVED","amount":250}"#)
         .arg("--event")
@@ -115,9 +115,11 @@ fn check_builtin_http_and_acp_examples_exits_zero() {
     let output = Command::new(bin_path())
         .arg("check")
         .arg(workspace_file("examples/checkout_http.star"))
+        .arg(workspace_file("examples/ci_autofix_acp.star"))
+        .arg(workspace_file("examples/deployment_pipeline.star"))
         .arg(workspace_file("examples/multi_agent_acp.star"))
         .output()
-        .expect("run starchart check on http & acp examples");
+        .expect("run starchart check on zero-compile examples");
 
     assert!(
         output.status.success(),
@@ -247,7 +249,7 @@ fn parse_jsonl(text: &str) -> Vec<serde_json::Value> {
 fn run_trace_to_stdout_emits_only_jsonl_and_moves_human_output_to_stderr() {
     let output = Command::new(bin_path())
         .arg("run")
-        .arg(workspace_file("examples/order_workflow.star"))
+        .arg(workspace_file("tests/fixtures/order_workflow.star"))
         .arg("--trace")
         .arg("-")
         .arg("--event")

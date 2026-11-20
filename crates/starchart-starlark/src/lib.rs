@@ -43,7 +43,7 @@ mod tests {
 
     #[test]
     fn order_workflow_example_typechecks_evaluates_and_freezes() {
-        let path = workspace_example("examples/order_workflow.star");
+        let path = workspace_example("tests/fixtures/order_workflow.star");
         let compiled = compile_starlark_file(&path, None).expect("order_workflow.star should compile");
 
         assert_eq!(compiled.ir.id, "order_workflow");

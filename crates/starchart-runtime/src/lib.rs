@@ -1986,7 +1986,7 @@ mod tests {
 
     fn load_order_workflow() -> CompiledChart {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/order_workflow.star");
+            .join("../../tests/fixtures/order_workflow.star");
         compile_starlark_file(path, None).expect("order_workflow.star must compile")
     }
 

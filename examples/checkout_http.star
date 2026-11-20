@@ -1,20 +1,33 @@
-# Standalone HTTP workflow using `@starchart/http` (no Rust code required):
+# Zero-compile HTTP checkout workflow using `@starchart/http`:
 # - Dynamically builds POST requests from typed `CheckoutCtx`
-# - Retries `429`/`5xx` responses up to `max_attempts` (`reenter = True`)
+# - Retries `429`/`5xx` and transient network failures via `S.retry_backoff`
+#   using a dynamic Starlark `after(delay = backoff_ms)` exponential timer
+# - Supports `CANCEL` while in-flight or waiting in backoff
 # - Branches on `200` + `paid == True` to fire a follow-up webhook POST
 
 load("@starchart/http", "HttpMethod", "HttpRequest", "http_request", "invoke_http")
 
+CheckoutEvent = enum("CANCEL")
+
 CheckoutCtx = record(
     order_id = str,
-    amount_cents = int,
-    api_base = str,
-    charge_id = str,
-    attempts = int,
-    max_attempts = int,
+    amount_cents = field(int, 4900),
+    api_base = field(str, "http://127.0.0.1:8080"),
+    charge_id = field(str, ""),
+    attempts = field(int, 0),
+    max_attempts = field(int, 3),
+    base_backoff_ms = field(int, 25),
 )
 
-S = state_space("charging", "notifying", "completed", "declined", "failed")
+S = state_space(
+    "charging",
+    "retry_backoff",
+    "notifying",
+    "completed",
+    "declined",
+    "cancelled",
+    "failed",
+)
 
 def build_charge_request(ctx: CheckoutCtx) -> HttpRequest:
     return http_request(
@@ -42,68 +55,53 @@ def is_2xx_paid(ctx: CheckoutCtx, event: dict) -> bool:
     body = res.get("body", {})
     return res.get("status") == 200 and type(body) == "dict" and body.get("paid", False) == True
 
-def can_retry_http(ctx: CheckoutCtx, event: dict) -> bool:
+def is_retryable_status(ctx: CheckoutCtx, event: dict) -> bool:
     status = event.get("output", {}).get("status", 503)
     return status in [429, 502, 503, 504] and ctx.attempts < ctx.max_attempts
 
-def can_retry_network_err(ctx: CheckoutCtx, event: dict) -> bool:
-    return ctx.attempts < ctx.max_attempts
-
-def save_charge_id(ctx: CheckoutCtx, event: dict) -> CheckoutCtx:
-    return CheckoutCtx(
-        order_id = ctx.order_id,
-        amount_cents = ctx.amount_cents,
-        api_base = ctx.api_base,
-        charge_id = str(event["output"]["body"].get("charge_id", "")),
-        attempts = ctx.attempts,
-        max_attempts = ctx.max_attempts,
-    )
-
-def bump_attempts(ctx: CheckoutCtx, event: dict) -> CheckoutCtx:
-    return CheckoutCtx(
-        order_id = ctx.order_id,
-        amount_cents = ctx.amount_cents,
-        api_base = ctx.api_base,
-        charge_id = ctx.charge_id,
-        attempts = ctx.attempts + 1,
-        max_attempts = ctx.max_attempts,
-    )
+def backoff_ms(ctx: CheckoutCtx, event: dict) -> int:
+    shift = ctx.attempts - 1 if ctx.attempts > 0 else 0
+    return ctx.base_backoff_ms * (1 << shift)
 
 chart: StateMachine = machine(
     id = "checkout_http",
+    description = "Idempotent HTTP charge + exponential backoff retry + order-paid webhook",
     initial = S.charging,
-    context = CheckoutCtx(
-        order_id = "ord_1042",
-        amount_cents = 4900,
-        api_base = "http://127.0.0.1:8080",
-        charge_id = "",
-        attempts = 0,
-        max_attempts = 3,
-    ),
+    context = CheckoutCtx(order_id = "ord_1042"),
     states = {
         S.charging: state(
             invoke = invoke_http(
                 request = build_charge_request,
                 on_done = [
-                    outcome(target = S.notifying, guard = is_2xx_paid, assign = save_charge_id),
                     outcome(
-                        target = S.charging,
-                        guard = can_retry_http,
-                        assign = bump_attempts,
-                        reenter = True,
+                        target = S.notifying,
+                        guard = is_2xx_paid,
+                        assign = lambda ctx, ev: update(
+                            ctx,
+                            charge_id = str(ev["output"]["body"].get("charge_id", "")),
+                        ),
+                    ),
+                    outcome(
+                        target = S.retry_backoff,
+                        guard = is_retryable_status,
+                        assign = lambda ctx, _ev: update(ctx, attempts = ctx.attempts + 1),
                     ),
                     outcome(target = S.declined),
                 ],
                 on_error = [
                     outcome(
-                        target = S.charging,
-                        guard = can_retry_network_err,
-                        assign = bump_attempts,
-                        reenter = True,
+                        target = S.retry_backoff,
+                        guard = lambda ctx, _ev: ctx.attempts < ctx.max_attempts,
+                        assign = lambda ctx, _ev: update(ctx, attempts = ctx.attempts + 1),
                     ),
                     outcome(target = S.failed),
                 ],
             ),
+            on = [transition(event = CheckoutEvent.CANCEL, target = S.cancelled)],
+        ),
+        S.retry_backoff: state(
+            after = after(delay = backoff_ms, target = S.charging),
+            on = [transition(event = CheckoutEvent.CANCEL, target = S.cancelled)],
         ),
         S.notifying: state(
             invoke = invoke_http(
@@ -114,6 +112,7 @@ chart: StateMachine = machine(
         ),
         S.completed: final_state(output = {"status": "paid_and_notified"}),
         S.declined: final_state(output = {"status": "declined"}),
+        S.cancelled: final_state(output = {"status": "cancelled"}),
         S.failed: final_state(output = {"status": "failed"}),
     },
 )
