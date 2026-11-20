@@ -1,13 +1,17 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Parser, Subcommand};
 use indexmap::IndexMap;
 use serde_json::Value;
 use starchart_ir::{ActionDef, StateId, StateKind, StateNodeDef};
 use starchart_runtime::builtins::acp::serve_chart_as_acp_agent;
-use starchart_runtime::{HostCallbacks, StarchartActor, StarchartSyncRunner, render_mermaid};
+use starchart_runtime::{
+    HostCallbacks, StarchartActor, StarchartSyncRunner, TraceReceiver, render_mermaid,
+};
 use starchart_starlark::{
     CompiledChart, chart_dialect, chart_globals, compile_starlark_file, is_builtin_service,
     resolve_builtin_module,
@@ -77,6 +81,12 @@ enum Commands {
         /// Events to dispatch in order (`EVENT_NAME`, `after:<ms>`, or JSON `'{"type":"APPROVED","amount":250}'`).
         #[arg(short, long = "event")]
         events: Vec<String>,
+
+        /// Write the full execution trace as JSON Lines to PATH (`-` for stdout; human-readable
+        /// progress then moves to stderr). One record per line: `started`, `transition`,
+        /// `service_started`, `service_progress`, `service_finished`, `error`, `stopped`, ...
+        #[arg(long, value_name = "PATH")]
+        trace: Option<String>,
     },
 
     /// Expose a `.star` statechart workflow over `stdio` as an Agent Client Protocol (ACP v1) agent.
@@ -104,7 +114,15 @@ fn main() -> ExitCode {
             context,
             force_async,
             events,
-        } => run_execute(&file, &export, context.as_deref(), force_async, &events),
+            trace,
+        } => run_execute(
+            &file,
+            &export,
+            context.as_deref(),
+            force_async,
+            &events,
+            trace.as_deref(),
+        ),
         Commands::Acp { file, export } => run_acp_server(&file, &export),
         Commands::Lsp => run_lsp(),
     }
@@ -162,7 +180,15 @@ fn run_execute(
     context_override: Option<&str>,
     force_async: bool,
     raw_events: &[String],
+    trace_target: Option<&str>,
 ) -> ExitCode {
+    let trace_out = match trace_target.map(open_trace_sink).transpose() {
+        Ok(sink) => sink,
+        Err(err) => {
+            eprintln!("ERROR opening `--trace` output: {err}");
+            return ExitCode::from(1);
+        }
+    };
     let mut compiled = match compile_starlark_file(file, Some(export)) {
         Ok(c) => c,
         Err(err) => {
@@ -201,10 +227,61 @@ fn run_execute(
         .any(|e| e.trim().starts_with("after:"));
 
     if (force_async || uses_builtin_async) && !uses_simulated_clock {
-        return run_execute_async(compiled, action_names, service_names, raw_events);
+        return run_execute_async(compiled, action_names, service_names, raw_events, trace_out);
     }
 
-    run_execute_sync(compiled, action_names, service_names, raw_events)
+    run_execute_sync(compiled, action_names, service_names, raw_events, trace_out)
+}
+
+/// When set, human-readable `run` output goes to stderr (stdout carries the JSONL trace).
+static HUMAN_TO_STDERR: AtomicBool = AtomicBool::new(false);
+
+/// Prints human-readable `run` output to stdout, or stderr while `--trace -` owns stdout.
+macro_rules! say {
+    ($($arg:tt)*) => {
+        if HUMAN_TO_STDERR.load(Ordering::Relaxed) {
+            eprintln!($($arg)*);
+        } else {
+            println!($($arg)*);
+        }
+    };
+}
+use say;
+
+type TraceSink = Box<dyn Write + Send>;
+
+fn open_trace_sink(target: &str) -> std::io::Result<TraceSink> {
+    if target == "-" {
+        HUMAN_TO_STDERR.store(true, Ordering::Relaxed);
+        Ok(Box::new(std::io::stdout()))
+    } else {
+        Ok(Box::new(std::io::BufWriter::new(std::fs::File::create(target)?)))
+    }
+}
+
+/// Drains `rx` on a dedicated thread, writing one JSON line per record (flushed per line so
+/// `tail -f` / piping into another tool sees records live). Ends when the hub is closed.
+fn spawn_trace_writer(
+    mut rx: TraceReceiver,
+    mut sink: TraceSink,
+) -> std::thread::JoinHandle<std::io::Result<()>> {
+    std::thread::spawn(move || {
+        while let Some(record) = rx.blocking_recv() {
+            writeln!(sink, "{}", record.to_json_line())?;
+            sink.flush()?;
+        }
+        sink.flush()
+    })
+}
+
+fn finish_trace_writer(writer: Option<std::thread::JoinHandle<std::io::Result<()>>>) {
+    if let Some(handle) = writer {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => eprintln!("ERROR writing trace: {err}"),
+            Err(_) => eprintln!("ERROR trace writer thread panicked"),
+        }
+    }
 }
 
 fn build_cli_callbacks(
@@ -223,7 +300,7 @@ fn build_cli_callbacks(
     for action_name in sorted_actions {
         let label = action_name.clone();
         callbacks = callbacks.on_action(action_name, move |_ctx, ev| {
-            println!("  -> action `{label}` invoked (on `{}`)", ev.event_type);
+            say!("  -> action `{label}` invoked (on `{}`)", ev.event_type);
             Ok(())
         });
     }
@@ -236,7 +313,7 @@ fn build_cli_callbacks(
         }
         let label = service_name.clone();
         callbacks = callbacks.on_sync_service(service_name, move |_ctx, input| {
-            println!("  -> service `{label}` invoked (input={input})");
+            say!("  -> service `{label}` invoked (input={input})");
             Ok(serde_json::json!({}))
         });
     }
@@ -249,6 +326,7 @@ fn run_execute_async(
     action_names: HashSet<String>,
     service_names: HashSet<String>,
     raw_events: &[String],
+    trace_out: Option<TraceSink>,
 ) -> ExitCode {
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -270,9 +348,25 @@ fn run_execute_async(
                 return ExitCode::from(1);
             }
         };
+        let trace_writer = trace_out.map(|sink| spawn_trace_writer(actor.subscribe_traces(), sink));
+        let code = drive_async(&compiled, &actor, raw_events).await;
+        actor.stop().await;
+        actor.trace_hub().close();
+        tokio::task::spawn_blocking(move || finish_trace_writer(trace_writer))
+            .await
+            .ok();
+        code
+    })
+}
 
+async fn drive_async(
+    compiled: &CompiledChart,
+    actor: &StarchartActor,
+    raw_events: &[String],
+) -> ExitCode {
+    {
         let init_ctx = actor.context().await.unwrap_or(Value::Null);
-        println!(
+        say!(
             "[init] machine=`{}` active={:?} context={}",
             compiled.ir.id,
             actor.active_states(),
@@ -299,7 +393,7 @@ fn run_execute_async(
             }
 
             let ctx = actor.context().await.unwrap_or(Value::Null);
-            println!(
+            say!(
                 "[step {}] event=`{}` active={:?} done={} output={} context={}",
                 idx + 1,
                 event_type,
@@ -318,7 +412,7 @@ fn run_execute_async(
                 let view = rx.borrow_and_update().clone();
                 let current_states = actor.active_states();
                 if current_states != prev_states {
-                    println!(
+                    say!(
                         "[transition] machine=`{}` active={:?}",
                         compiled.ir.id, current_states
                     );
@@ -338,7 +432,7 @@ fn run_execute_async(
         }
 
         let final_ctx = actor.context().await.unwrap_or(Value::Null);
-        println!(
+        say!(
             "[done] machine=`{}` active={:?} done={} output={} context={}",
             compiled.ir.id,
             actor.active_states(),
@@ -346,9 +440,8 @@ fn run_execute_async(
             actor.output(),
             final_ctx
         );
-        actor.stop().await;
         ExitCode::SUCCESS
-    })
+    }
 }
 
 fn run_execute_sync(
@@ -356,6 +449,7 @@ fn run_execute_sync(
     action_names: HashSet<String>,
     service_names: HashSet<String>,
     raw_events: &[String],
+    trace_out: Option<TraceSink>,
 ) -> ExitCode {
     let callbacks = build_cli_callbacks(action_names, service_names, false);
 
@@ -366,8 +460,21 @@ fn run_execute_sync(
             return ExitCode::from(1);
         }
     };
+    let trace_writer = trace_out.map(|sink| spawn_trace_writer(runner.subscribe_traces(), sink));
+    let code = drive_sync(&compiled, &mut runner, raw_events);
+    runner.trace_hub().close();
+    drop(runner);
+    finish_trace_writer(trace_writer);
+    code
+}
 
-    println!(
+fn drive_sync(
+    compiled: &CompiledChart,
+    runner: &mut StarchartSyncRunner,
+    raw_events: &[String],
+) -> ExitCode {
+
+    say!(
         "[init] machine=`{}` active={:?} context={}",
         compiled.ir.id,
         runner.active_states(),
@@ -387,7 +494,7 @@ fn run_execute_sync(
                 eprintln!("ERROR advancing clock by {ms}ms: {err}");
                 return ExitCode::from(1);
             }
-            println!(
+            say!(
                 "[step {}] clock=+{ms}ms active={:?} done={} context={}",
                 idx + 1,
                 runner.active_states(),
@@ -416,7 +523,7 @@ fn run_execute_sync(
             return ExitCode::from(1);
         }
 
-        println!(
+        say!(
             "[step {}] event=`{}` active={:?} tags={:?} done={} output={} context={}",
             idx + 1,
             event_type,
@@ -427,7 +534,7 @@ fn run_execute_sync(
             runner.context()
         );
         for emitted in runner.take_emitted() {
-            println!("  -> emitted {emitted}");
+            say!("  -> emitted {emitted}");
         }
     }
 

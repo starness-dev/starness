@@ -235,3 +235,121 @@ chart = machine(
     assert!(stdout.contains(r#"active=["completed"]"#));
 }
 
+
+fn parse_jsonl(text: &str) -> Vec<serde_json::Value> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid JSONL line {l:?}: {e}")))
+        .collect()
+}
+
+#[test]
+fn run_trace_to_stdout_emits_only_jsonl_and_moves_human_output_to_stderr() {
+    let output = Command::new(bin_path())
+        .arg("run")
+        .arg(workspace_file("examples/order_workflow.star"))
+        .arg("--trace")
+        .arg("-")
+        .arg("--event")
+        .arg(r#"{"type":"APPROVED","amount":250}"#)
+        .arg("--event")
+        .arg("CHARGE_OK")
+        .output()
+        .expect("run starchart run --trace -");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr:\n{stderr}");
+
+    let records = parse_jsonl(&stdout);
+    let kinds: Vec<&str> = records.iter().map(|r| r["kind"].as_str().unwrap_or("")).collect();
+    assert_eq!(kinds, vec!["started", "transition", "transition"], "{stdout}");
+    for (i, r) in records.iter().enumerate() {
+        assert_eq!(r["seq"], serde_json::json!(i + 1));
+        assert_eq!(r["machine"], serde_json::json!("order_workflow"));
+    }
+    assert_eq!(records[2]["to"], serde_json::json!(["fulfilled"]));
+
+    // Human-readable progress is still available, on stderr.
+    assert!(stderr.contains("[init] machine=`order_workflow`"), "{stderr}");
+    assert!(stderr.contains("action `NOTIFY_USER` invoked"), "{stderr}");
+}
+
+#[test]
+fn run_trace_to_file_captures_service_progress_from_async_builtins() {
+    let dir = std::env::temp_dir().join(format!(
+        "starchart_trace_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let chart_path = dir.join("build.star");
+    let trace_path = dir.join("trace.jsonl");
+    std::fs::write(
+        &chart_path,
+        r#"
+load("@starchart/exec", "invoke_cmd")
+
+S = state_space("building", "ok", "failed")
+
+chart = machine(
+    id = "build",
+    initial = S.building,
+    states = {
+        S.building: state(
+            invoke = invoke_cmd(
+                id = "compile",
+                cmd = ["sh", "-c", "echo compiling; echo warning: unused >&2; echo finished"],
+                on_done = S.ok,
+                on_error = S.failed,
+            ),
+        ),
+        S.ok: final_state(),
+        S.failed: final_state(),
+    },
+)
+"#,
+    )
+    .expect("write chart");
+
+    let output = Command::new(bin_path())
+        .arg("run")
+        .arg(&chart_path)
+        .arg("--trace")
+        .arg(&trace_path)
+        .output()
+        .expect("run starchart run --trace <file>");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("[done] machine=`build`"), "human output stays on stdout: {stdout}");
+
+    let trace = std::fs::read_to_string(&trace_path).expect("trace file");
+    let _ = std::fs::remove_dir_all(&dir);
+    let records = parse_jsonl(&trace);
+
+    let progress: Vec<(String, String)> = records
+        .iter()
+        .filter(|r| r["kind"] == "service_progress")
+        .map(|r| {
+            assert_eq!(r["invoke_id"], "compile");
+            assert_eq!(r["state"], "building");
+            (
+                r["stream"].as_str().unwrap_or("").to_owned(),
+                r["chunk"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    assert!(progress.contains(&("stdout".into(), "compiling".into())), "{trace}");
+    assert!(progress.contains(&("stdout".into(), "finished".into())), "{trace}");
+    assert!(progress.contains(&("stderr".into(), "warning: unused".into())), "{trace}");
+
+    let kinds: Vec<&str> = records.iter().map(|r| r["kind"].as_str().unwrap_or("")).collect();
+    assert_eq!(kinds.first(), Some(&"started"));
+    assert!(kinds.contains(&"service_started"));
+    assert!(kinds.contains(&"service_finished"));
+    assert_eq!(kinds.last(), Some(&"stopped"), "{trace}");
+}
