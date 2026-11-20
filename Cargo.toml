@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/starchart-ir",
+    "crates/starchart-starlark",
+    "crates/starchart-runtime",
+    "bins/starchart-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+starchart-ir = { path = "crates/starchart-ir" }
+starchart-starlark = { path = "crates/starchart-starlark" }
+starchart-runtime = { path = "crates/starchart-runtime" }
+
+starlark = "0.14.2"
+starlark_map = "0.14.2"
+starlark_syntax = "0.14.2"
+starlark_lsp = "0.14.2"
+allocative = "0.3"
+dupe = "0.9"
+xstate-statemachine = { version = "0.1.1", features = ["tokio", "macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+anyhow = "1.0"
+indexmap = { version = "2.6", features = ["serde"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time"] }
+clap = { version = "4.5", features = ["derive"] }
