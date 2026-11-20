@@ -16,8 +16,9 @@ pub use schema::{
     parse_type_expr, with_active_type_registry,
 };
 pub use stdlib::{
-    ACP_MODULE_ID, BUILTIN_ACP_SERVICE, BUILTIN_EXEC_SERVICE, BUILTIN_HTTP_SERVICE, EXEC_MODULE_ID,
-    HTTP_MODULE_ID, is_builtin_service, resolve_builtin_module,
+    ACP_MODULE_ID, BUILTIN_ACP_SERVICE, BUILTIN_EXEC_SERVICE, BUILTIN_HTTP_SERVICE,
+    BUILTIN_MCP_SERVICE, EXEC_MODULE_ID, HTTP_MODULE_ID, MCP_MODULE_ID, is_builtin_service,
+    resolve_builtin_module,
 };
 pub use types::{
     ArtifactMode, FrozenStarlarkMachine, INVOKE_INPUT_SLOT_KEY, INVOKE_TOOL_SLOT_KEY,
@@ -404,6 +405,61 @@ chart = machine(
         assert!(
             err.to_string().contains("duplicate MCP tool name `submit_plan`"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn builtin_mcp_client_module_typechecks_and_compiles_stdio_and_http_servers() {
+        let src = r#"
+load("@starchart/mcp", "McpServer", "invoke_mcp", "mcp_http_server", "mcp_stdio_server")
+
+Ctx = record(repo = str, pr_url = field(str, ""))
+gh = mcp_stdio_server(id = "github", command = "npx", args = ["-y", "@modelcontextprotocol/server-github"])
+linear = mcp_http_server(id = "linear", url = "http://127.0.0.1:9000/mcp")
+
+S = state_space("opening_pr", "updating_ticket", "done", "failed")
+
+chart = machine(
+    id = "mcp_client_check",
+    initial = S.opening_pr,
+    context = Ctx(repo = "floodfx/starchart"),
+    states = {
+        S.opening_pr: state(
+            invoke = invoke_mcp(
+                server = gh,
+                tool = "create_pull_request",
+                arguments = lambda ctx: {"repo": ctx.repo, "title": "Release"},
+                on_done = outcome(
+                    target = S.updating_ticket,
+                    assign = lambda ctx, ev: update(ctx, pr_url = str(ev["output"]["data"].get("url", ""))),
+                ),
+                on_error = S.failed,
+            ),
+        ),
+        S.updating_ticket: state(
+            invoke = invoke_mcp(
+                server = linear,
+                tool = "add_comment",
+                arguments = lambda ctx: {"body": ctx.pr_url},
+                on_done = S.done,
+                on_error = S.failed,
+            ),
+        ),
+        S.done: final_state(),
+        S.failed: final_state(),
+    },
+)
+"#;
+        let compiled = compile_starlark_str("mcp_client_check.star", src, None)
+            .expect("@starchart/mcp should typecheck and compile");
+        assert_eq!(compiled.inputs.len(), 2);
+        assert_eq!(
+            compiled.ir.states[&starchart_ir::StateId::from("opening_pr")].invoke[0].src,
+            BUILTIN_MCP_SERVICE
+        );
+        assert_eq!(
+            compiled.ir.states[&starchart_ir::StateId::from("opening_pr")].invoke[0].id.as_deref(),
+            Some("github_create_pull_request")
         );
     }
 }

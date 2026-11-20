@@ -9,6 +9,9 @@ pub const BUILTIN_EXEC_SERVICE: &str = "__starchart_builtin_exec__";
 /// Built-in runtime service identifier for `@starchart/acp`.
 pub const BUILTIN_ACP_SERVICE: &str = "__starchart_builtin_acp__";
 
+/// Built-in runtime service identifier for `@starchart/mcp` (client).
+pub const BUILTIN_MCP_SERVICE: &str = "__starchart_builtin_mcp__";
+
 /// Virtual Starlark module source for `@starchart/http`.
 pub const HTTP_MODULE_ID: &str = "@starchart/http.star";
 pub const HTTP_MODULE_SOURCE: &str = r#"
@@ -313,6 +316,124 @@ def invoke_agent(
     )
 "#;
 
+/// Virtual Starlark module source for `@starchart/mcp` (deterministic MCP client invocations).
+pub const MCP_MODULE_ID: &str = "@starchart/mcp.star";
+pub const MCP_MODULE_SOURCE: &str = r#"
+McpTransport = enum("STDIO", "HTTP")
+
+McpServer = record(
+    id = str,
+    transport = field(str, "STDIO"),
+    command = field(str, ""),
+    args = field(list[str], []),
+    cwd = field(str | None, None),
+    env = field(dict[str, str], {}),
+    url = field(str, ""),
+    headers = field(dict[str, str], {}),
+    timeout_ms = field(int, 30000),
+)
+
+def mcp_stdio_server(
+    *,
+    id: str,
+    command: str,
+    args: list[str] = [],
+    cwd: str | None = None,
+    env: dict[str, str] = {},
+    timeout_ms: int = 30000,
+) -> McpServer:
+    if id == "":
+        fail("mcp_stdio_server `id` must not be empty")
+    if command == "":
+        fail("mcp_stdio_server `command` must not be empty")
+    if timeout_ms <= 0:
+        fail("mcp_stdio_server `timeout_ms` must be > 0")
+    return McpServer(
+        id = id,
+        transport = "STDIO",
+        command = command,
+        args = args,
+        cwd = cwd,
+        env = env,
+        timeout_ms = timeout_ms,
+    )
+
+def mcp_http_server(
+    *,
+    id: str,
+    url: str,
+    headers: dict[str, str] = {},
+    timeout_ms: int = 30000,
+) -> McpServer:
+    if id == "":
+        fail("mcp_http_server `id` must not be empty")
+    if url == "":
+        fail("mcp_http_server `url` must not be empty")
+    if timeout_ms <= 0:
+        fail("mcp_http_server `timeout_ms` must be > 0")
+    return McpServer(
+        id = id,
+        transport = "HTTP",
+        url = url,
+        headers = headers,
+        timeout_ms = timeout_ms,
+    )
+
+def mcp_server(
+    *,
+    id: str,
+    command: str = "",
+    args: list[str] = [],
+    cwd: str | None = None,
+    env: dict[str, str] = {},
+    url: str = "",
+    headers: dict[str, str] = {},
+    timeout_ms: int = 30000,
+) -> McpServer:
+    if command != "" and url != "":
+        fail("mcp_server accepts either `command` (stdio) or `url` (http), not both")
+    if url != "":
+        return mcp_http_server(id = id, url = url, headers = headers, timeout_ms = timeout_ms)
+    if command != "":
+        return mcp_stdio_server(
+            id = id,
+            command = command,
+            args = args,
+            cwd = cwd,
+            env = env,
+            timeout_ms = timeout_ms,
+        )
+    fail("mcp_server requires either `command` (stdio) or `url` (http)")
+
+def invoke_mcp(
+    *,
+    server: McpServer | typing.Callable,
+    tool: str | typing.Callable,
+    arguments = {},
+    check_tool_error: bool = True,
+    id: str | None = None,
+    on_done = None,
+    on_error = None,
+) -> Invoke:
+    if type(tool) == "string" and tool == "":
+        fail("invoke_mcp `tool` must not be empty")
+    resolved_id = id
+    if resolved_id == None and type(server) == "record" and type(tool) == "string":
+        resolved_id = server.id + "_" + tool
+    return invoke(
+        src = "__starchart_builtin_mcp__",
+        id = resolved_id,
+        input = {
+            "server": server,
+            "tool": tool,
+            "arguments": arguments,
+            "check_tool_error": check_tool_error,
+        },
+        on_done = on_done,
+        on_error = on_error,
+    )
+"#;
+
 /// Resolves a `@starchart/*` virtual module path to `(canonical_module_id, source_code)`.
 pub fn resolve_builtin_module(load_path: &str) -> Option<(&'static str, &'static str)> {
     match load_path {
@@ -328,6 +449,9 @@ pub fn resolve_builtin_module(load_path: &str) -> Option<(&'static str, &'static
         | "@starchart/agents"
         | "@starchart/agents.star"
         | "/@starchart/agents.star" => Some((ACP_MODULE_ID, ACP_MODULE_SOURCE)),
+        "@starchart/mcp" | "@starchart/mcp.star" | "/@starchart/mcp.star" => {
+            Some((MCP_MODULE_ID, MCP_MODULE_SOURCE))
+        }
         _ => None,
     }
 }
@@ -336,6 +460,6 @@ pub fn resolve_builtin_module(load_path: &str) -> Option<(&'static str, &'static
 pub fn is_builtin_service(service_name: &str) -> bool {
     matches!(
         service_name,
-        BUILTIN_HTTP_SERVICE | BUILTIN_EXEC_SERVICE | BUILTIN_ACP_SERVICE
+        BUILTIN_HTTP_SERVICE | BUILTIN_EXEC_SERVICE | BUILTIN_ACP_SERVICE | BUILTIN_MCP_SERVICE
     )
 }

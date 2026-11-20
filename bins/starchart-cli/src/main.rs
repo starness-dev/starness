@@ -994,6 +994,8 @@ fn build_builtin_lsp_interfaces(
         "@starchart/acp.star",
         "@starchart/agents",
         "@starchart/agents.star",
+        "@starchart/mcp",
+        "@starchart/mcp.star",
     ] {
         if let Some((canon_id, src)) = resolve_builtin_module(alias)
             && let Ok(ast) = AstModule::parse(canon_id, src.to_owned(), &dialect)

@@ -26,8 +26,8 @@ use starchart_ir::{
     StateNodeDef, TransitionDef,
 };
 use starchart_starlark::{
-    BUILTIN_ACP_SERVICE, BUILTIN_EXEC_SERVICE, BUILTIN_HTTP_SERVICE, CompiledChart,
-    INVOKE_INPUT_SLOT_KEY,
+    BUILTIN_ACP_SERVICE, BUILTIN_EXEC_SERVICE, BUILTIN_HTTP_SERVICE, BUILTIN_MCP_SERVICE,
+    CompiledChart, INVOKE_INPUT_SLOT_KEY,
 };
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
@@ -679,6 +679,7 @@ fn format_invoke_id_label(inv: &InvokeDef) -> &str {
         BUILTIN_HTTP_SERVICE => "http",
         BUILTIN_EXEC_SERVICE => "exec",
         BUILTIN_ACP_SERVICE => "acp",
+        BUILTIN_MCP_SERVICE => "mcp",
         other => other,
     }
 }
@@ -714,6 +715,20 @@ fn format_invoke_src_label(inv: &InvokeDef) -> String {
                 return format!("acp {id} ({cmd})").trim().to_owned();
             }
             "acp".to_owned()
+        }
+        BUILTIN_MCP_SERVICE => {
+            let sid = inv
+                .input
+                .get("server")
+                .and_then(|s| s.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("mcp");
+            let tool = inv
+                .input
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or("call");
+            format!("mcp {sid}.{tool}")
         }
         other => other.to_owned(),
     }
@@ -3605,6 +3620,195 @@ chart = machine(
             json!("Verified from pushed context")
         );
         assert_eq!(final_ctx["findings"][0]["severity"], json!("LOW"));
+        actor.stop().await;
+    }
+
+    #[tokio::test]
+    async fn builtin_mcp_client_driver_calls_stdio_and_streamable_http_servers_and_handles_is_error() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        // 1. Mock Streamable HTTP MCP server returning `Mcp-Session-Id` on `initialize`
+        //    and an SSE (`text/event-stream`) `tools/call` response!
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind http mcp");
+        let http_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (rh, mut wh) = stream.into_split();
+                    let mut reader = BufReader::new(rh);
+                    let mut content_len = 0usize;
+                    let mut session_hdr = String::new();
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let t = line.trim();
+                        if t.is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = t.split_once(':') {
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                content_len = v.trim().parse().unwrap_or(0);
+                            } else if k.trim().eq_ignore_ascii_case("mcp-session-id") {
+                                session_hdr = v.trim().to_owned();
+                            }
+                        }
+                    }
+                    let mut body = vec![0_u8; content_len];
+                    if content_len > 0 {
+                        let _ = reader.read_exact(&mut body).await;
+                    }
+                    let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+                    if method == "initialize" {
+                        let b = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"mock-http-mcp","version":"1.0"}}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sess-http-42\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+                            b.len()
+                        );
+                        let _ = wh.write_all(resp.as_bytes()).await;
+                    } else if method == "notifications/initialized" {
+                        let _ = wh
+                            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                    } else if method == "tools/call" {
+                        assert_eq!(session_hdr, "sess-http-42", "expected Mcp-Session-Id propagated");
+                        let pr_url = req["params"]["arguments"]["pr_url"].as_str().unwrap_or("");
+                        let rpc = json!({
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "result": {
+                                "content": [{"type": "text", "text": json!({"ticket": "LIN-99", "linked": pr_url}).to_string()}],
+                                "isError": false
+                            }
+                        });
+                        let sse = format!("event: message\ndata: {rpc}\n\n");
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                            sse.len()
+                        );
+                        let _ = wh.write_all(resp.as_bytes()).await;
+                    }
+                });
+            }
+        });
+
+        // 2. Mock STDIO MCP server in Python (`create_pr` succeeds with JSON text; `bad_tool` returns `isError: true`)
+        let stdio_mcp_py = r#"
+import json, sys
+for raw in sys.stdin:
+    msg = json.loads(raw)
+    m, rid = msg.get("method"), msg.get("id")
+    if m == "initialize":
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "mock-gh", "version": "1.0"}}}) + "\n")
+        sys.stdout.flush()
+    elif m == "tools/call":
+        name = msg["params"]["name"]
+        args = msg["params"].get("arguments", {})
+        if name == "create_pr":
+            payload = {"url": "https://github.com/" + args["repo"] + "/pull/7"}
+            res = {"content": [{"type": "text", "text": json.dumps(payload)}], "isError": False}
+        else:
+            res = {"content": [{"type": "text", "text": "rate limit exceeded"}], "isError": True}
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": rid, "result": res}) + "\n")
+        sys.stdout.flush()
+"#;
+
+        let src = format!(
+            r#"
+load("@starchart/mcp", "invoke_mcp", "mcp_http_server", "mcp_stdio_server")
+
+Ctx = record(
+    repo = str,
+    pr_url = field(str, ""),
+    ticket = field(str, ""),
+    err_msg = field(str, ""),
+)
+
+gh = mcp_stdio_server(
+    id = "gh",
+    command = "python3",
+    args = ["-u", "-c", {py_script}],
+)
+
+linear = mcp_http_server(
+    id = "linear",
+    url = "http://127.0.0.1:{http_port}/mcp",
+)
+
+S = state_space("failing_call", "creating_pr", "linking_ticket", "done", "failed")
+
+chart = machine(
+    id = "mcp_e2e",
+    initial = S.failing_call,
+    context = Ctx(repo = "floodfx/starchart"),
+    states = {{
+        S.failing_call: state(
+            invoke = invoke_mcp(
+                server = gh,
+                tool = "bad_tool",
+                on_done = S.failed,
+                on_error = outcome(
+                    target = S.creating_pr,
+                    assign = lambda ctx, ev: update(ctx, err_msg = str(ev.get("error", ""))),
+                ),
+            ),
+        ),
+        S.creating_pr: state(
+            invoke = invoke_mcp(
+                server = gh,
+                tool = "create_pr",
+                arguments = lambda ctx: {{"repo": ctx.repo}},
+                on_done = outcome(
+                    target = S.linking_ticket,
+                    assign = lambda ctx, ev: update(ctx, pr_url = str(ev["output"]["data"]["url"])),
+                ),
+                on_error = S.failed,
+            ),
+        ),
+        S.linking_ticket: state(
+            invoke = invoke_mcp(
+                server = linear,
+                tool = "link_pr",
+                arguments = lambda ctx: {{"pr_url": ctx.pr_url}},
+                on_done = outcome(
+                    target = S.done,
+                    assign = lambda ctx, ev: update(ctx, ticket = str(ev["output"]["data"]["ticket"])),
+                ),
+                on_error = S.failed,
+            ),
+        ),
+        S.done: final_state(),
+        S.failed: final_state(),
+    }},
+)
+"#,
+            py_script = serde_json::to_string(stdio_mcp_py).unwrap(),
+        );
+
+        let chart = compile_starlark_str("mcp_e2e.star", &src, None).expect("compile");
+        let mermaid = render_mermaid(&chart).expect("mermaid");
+        assert!(mermaid.contains("mcp gh.create_pr"), "{mermaid}");
+
+        let actor = StarchartActor::spawn_with_builtins(&chart).expect("spawn");
+        actor.wait_done().await.expect("wait_done");
+        assert!(actor.is_in("done"));
+        let final_ctx = actor.context().await.expect("context");
+        assert!(
+            final_ctx["err_msg"]
+                .as_str()
+                .unwrap_or("")
+                .contains("rate limit exceeded"),
+            "ctx={final_ctx}"
+        );
+        assert_eq!(
+            final_ctx["pr_url"],
+            json!("https://github.com/floodfx/starchart/pull/7")
+        );
+        assert_eq!(final_ctx["ticket"], json!("LIN-99"));
         actor.stop().await;
     }
 }
