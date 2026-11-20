@@ -20,3 +20,5 @@ serde_json.workspace = true
 starlark.workspace = true
 starlark_lsp.workspace = true
 starlark_syntax.workspace = true
+tokio.workspace = true
+xstate-statemachine.workspace = true

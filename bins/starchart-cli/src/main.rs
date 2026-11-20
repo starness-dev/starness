@@ -2,16 +2,22 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use starchart_ir::{ActionDef, StateId, StateKind, StateNodeDef};
-use starchart_runtime::{ChartSyncRunner, HostCallbacks, render_mermaid};
-use starchart_starlark::{chart_dialect, chart_globals, compile_starlark_file};
 use clap::{Parser, Subcommand};
 use indexmap::IndexMap;
 use serde_json::Value;
+use starchart_ir::{ActionDef, StateId, StateKind, StateNodeDef};
+use starchart_runtime::builtins::acp::serve_chart_as_acp_agent;
+use starchart_runtime::{HostCallbacks, StarchartActor, StarchartSyncRunner, render_mermaid};
+use starchart_starlark::{
+    CompiledChart, chart_dialect, chart_globals, compile_starlark_file, is_builtin_service,
+    resolve_builtin_module,
+};
 use starlark::analysis::EvalMessage;
 use starlark::docs::DocModule;
+use starlark::environment::Module;
+use starlark::eval::Evaluator;
 use starlark::syntax::AstModule;
-use starlark::typing::{AstModuleTypecheck, Interface};
+use starlark::typing::{AstModuleTypecheck, Interface, Ty};
 use starlark_lsp::error::eval_message_to_lsp_diagnostic;
 use starlark_lsp::server::{
     LspContext, LspEvalResult, LspUri, StringLiteralResult, stdio_server,
@@ -51,7 +57,7 @@ enum Commands {
         export: String,
     },
 
-    /// Execute a `.star` statechart interactively against a sequence of events.
+    /// Execute a `.star` statechart with built-in HTTP, command, and ACP drivers.
     Run {
         /// Path to the `.star` statechart file.
         file: PathBuf,
@@ -60,9 +66,27 @@ enum Commands {
         #[arg(long, default_value = "chart")]
         export: String,
 
-        /// Events to dispatch in order (either `EVENT_NAME` or JSON `'{"type":"APPROVED","amount":250}'`).
+        /// Optional JSON object merged into the machine's initial `context`.
+        #[arg(long)]
+        context: Option<String>,
+
+        /// Force asynchronous Tokio execution via `StarchartActor`.
+        #[arg(long = "async")]
+        force_async: bool,
+
+        /// Events to dispatch in order (`EVENT_NAME`, `after:<ms>`, or JSON `'{"type":"APPROVED","amount":250}'`).
         #[arg(short, long = "event")]
         events: Vec<String>,
+    },
+
+    /// Expose a `.star` statechart workflow over `stdio` as an Agent Client Protocol (ACP v1) agent.
+    Acp {
+        /// Path to the `.star` statechart file.
+        file: PathBuf,
+
+        /// Exported variable name holding the `StateMachine` (defaults to `chart`).
+        #[arg(long, default_value = "chart")]
+        export: String,
     },
 
     /// Start the Starlark Language Server Protocol (LSP) server over stdio.
@@ -77,8 +101,11 @@ fn main() -> ExitCode {
         Commands::Run {
             file,
             export,
+            context,
+            force_async,
             events,
-        } => run_execute(&file, &export, &events),
+        } => run_execute(&file, &export, context.as_deref(), force_async, &events),
+        Commands::Acp { file, export } => run_acp_server(&file, &export),
         Commands::Lsp => run_lsp(),
     }
 }
@@ -129,8 +156,14 @@ fn run_diagram(file: &Path, export: &str) -> ExitCode {
     }
 }
 
-fn run_execute(file: &Path, export: &str, raw_events: &[String]) -> ExitCode {
-    let compiled = match compile_starlark_file(file, Some(export)) {
+fn run_execute(
+    file: &Path,
+    export: &str,
+    context_override: Option<&str>,
+    force_async: bool,
+    raw_events: &[String],
+) -> ExitCode {
+    let mut compiled = match compile_starlark_file(file, Some(export)) {
         Ok(c) => c,
         Err(err) => {
             eprintln!("ERROR {}:\n{err}", file.display());
@@ -138,11 +171,53 @@ fn run_execute(file: &Path, export: &str, raw_events: &[String]) -> ExitCode {
         }
     };
 
-    // Register trace logging on every declared action and sync mock services so CLI runs work out-of-the-box.
+    if let Some(patch_str) = context_override {
+        match serde_json::from_str::<Value>(patch_str) {
+            Ok(Value::Object(patch_map)) => {
+                if let Value::Object(ctx_map) = &mut compiled.ir.context {
+                    for (k, v) in patch_map {
+                        ctx_map.insert(k, v);
+                    }
+                }
+            }
+            Ok(_) => {
+                eprintln!("ERROR `--context` must be a JSON object");
+                return ExitCode::from(1);
+            }
+            Err(err) => {
+                eprintln!("ERROR invalid `--context` JSON: {err}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
     let mut action_names = HashSet::new();
     let mut service_names = HashSet::new();
     collect_actions_and_services(&compiled.ir.states, &mut action_names, &mut service_names);
-    let mut callbacks = HostCallbacks::new();
+
+    let uses_builtin_async = service_names.iter().any(|s| is_builtin_service(s));
+    let uses_simulated_clock = raw_events
+        .iter()
+        .any(|e| e.trim().starts_with("after:"));
+
+    if (force_async || uses_builtin_async) && !uses_simulated_clock {
+        return run_execute_async(compiled, action_names, service_names, raw_events);
+    }
+
+    run_execute_sync(compiled, action_names, service_names, raw_events)
+}
+
+fn build_cli_callbacks(
+    action_names: HashSet<String>,
+    service_names: HashSet<String>,
+    include_builtins: bool,
+) -> HostCallbacks {
+    let mut callbacks = if include_builtins {
+        HostCallbacks::with_builtins()
+    } else {
+        HostCallbacks::new()
+    };
+
     let mut sorted_actions: Vec<String> = action_names.into_iter().collect();
     sorted_actions.sort();
     for action_name in sorted_actions {
@@ -152,9 +227,13 @@ fn run_execute(file: &Path, export: &str, raw_events: &[String]) -> ExitCode {
             Ok(())
         });
     }
+
     let mut sorted_services: Vec<String> = service_names.into_iter().collect();
     sorted_services.sort();
     for service_name in sorted_services {
+        if include_builtins && is_builtin_service(&service_name) {
+            continue;
+        }
         let label = service_name.clone();
         callbacks = callbacks.on_sync_service(service_name, move |_ctx, input| {
             println!("  -> service `{label}` invoked (input={input})");
@@ -162,7 +241,125 @@ fn run_execute(file: &Path, export: &str, raw_events: &[String]) -> ExitCode {
         });
     }
 
-    let mut runner = match ChartSyncRunner::start(&compiled, callbacks) {
+    callbacks
+}
+
+fn run_execute_async(
+    compiled: CompiledChart,
+    action_names: HashSet<String>,
+    service_names: HashSet<String>,
+    raw_events: &[String],
+) -> ExitCode {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("ERROR building Tokio runtime: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    rt.block_on(async move {
+        let callbacks = build_cli_callbacks(action_names, service_names, true);
+        let actor = match StarchartActor::spawn(&compiled, callbacks) {
+            Ok(a) => a,
+            Err(err) => {
+                eprintln!("ERROR starting `{}`: {err}", compiled.ir.id);
+                return ExitCode::from(1);
+            }
+        };
+
+        let init_ctx = actor.context().await.unwrap_or(Value::Null);
+        println!(
+            "[init] machine=`{}` active={:?} context={}",
+            compiled.ir.id,
+            actor.active_states(),
+            init_ctx
+        );
+
+        for (idx, raw) in raw_events.iter().enumerate() {
+            let (event_type, payload) = match parse_cli_event(raw) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    eprintln!("ERROR parsing event #{}: {err}", idx + 1);
+                    return ExitCode::from(1);
+                }
+            };
+
+            let res = if payload.is_null() {
+                actor.send(&event_type).await
+            } else {
+                actor.send_with_payload(&event_type, payload).await
+            };
+            if let Err(err) = res {
+                eprintln!("ERROR dispatching `{event_type}`: {err}");
+                return ExitCode::from(1);
+            }
+
+            let ctx = actor.context().await.unwrap_or(Value::Null);
+            println!(
+                "[step {}] event=`{}` active={:?} done={} output={} context={}",
+                idx + 1,
+                event_type,
+                actor.active_states(),
+                actor.is_done(),
+                actor.output(),
+                ctx
+            );
+        }
+
+        // Stream live state transitions while autonomous async `invoke` pipelines run.
+        if !actor.is_done() {
+            let mut rx = actor.subscribe();
+            let mut prev_states = actor.active_states();
+            loop {
+                let view = rx.borrow_and_update().clone();
+                let current_states = actor.active_states();
+                if current_states != prev_states {
+                    println!(
+                        "[transition] machine=`{}` active={:?}",
+                        compiled.ir.id, current_states
+                    );
+                    prev_states = current_states;
+                }
+                if let Some(err) = view.error {
+                    eprintln!("ERROR executing `{}`: {err}", compiled.ir.id);
+                    return ExitCode::from(1);
+                }
+                if view.status != xstate_statemachine::core::Status::Running {
+                    break;
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+
+        let final_ctx = actor.context().await.unwrap_or(Value::Null);
+        println!(
+            "[done] machine=`{}` active={:?} done={} output={} context={}",
+            compiled.ir.id,
+            actor.active_states(),
+            actor.is_done(),
+            actor.output(),
+            final_ctx
+        );
+        actor.stop().await;
+        ExitCode::SUCCESS
+    })
+}
+
+fn run_execute_sync(
+    compiled: CompiledChart,
+    action_names: HashSet<String>,
+    service_names: HashSet<String>,
+    raw_events: &[String],
+) -> ExitCode {
+    let callbacks = build_cli_callbacks(action_names, service_names, false);
+
+    let mut runner = match StarchartSyncRunner::start(&compiled, callbacks) {
         Ok(r) => r,
         Err(err) => {
             eprintln!("ERROR starting `{}`: {err}", compiled.ir.id);
@@ -237,6 +434,39 @@ fn run_execute(file: &Path, export: &str, raw_events: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn run_acp_server(file: &Path, export: &str) -> ExitCode {
+    let compiled = match compile_starlark_file(file, Some(export)) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("ERROR {}:\n{err}", file.display());
+            return ExitCode::from(1);
+        }
+    };
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("ERROR building Tokio runtime: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    match rt.block_on(serve_chart_as_acp_agent(
+        compiled,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+    )) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("ACP server error: {err:#}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn push_named(actions: &[ActionDef], out: &mut HashSet<String>) {
     for act in actions {
         if let ActionDef::Named(name) = act {
@@ -307,17 +537,57 @@ fn parse_cli_event(raw: &str) -> anyhow::Result<(String, Value)> {
 struct StarchartLspContext {
     globals: starlark::environment::Globals,
     doc_module: DocModule,
+    builtin_interfaces: HashMap<String, Interface>,
 }
 
 impl StarchartLspContext {
     fn new() -> Self {
         let globals = chart_globals();
         let doc_module = globals.documentation();
+        let builtin_interfaces = build_builtin_lsp_interfaces(&globals);
         Self {
             globals,
             doc_module,
+            builtin_interfaces,
         }
     }
+}
+
+fn build_builtin_lsp_interfaces(
+    globals: &starlark::environment::Globals,
+) -> HashMap<String, Interface> {
+    let dialect = chart_dialect();
+    let mut map = HashMap::new();
+    for alias in [
+        "@starchart/http",
+        "@starchart/http.star",
+        "@starchart/exec",
+        "@starchart/exec.star",
+        "@starchart/acp",
+        "@starchart/acp.star",
+        "@starchart/agents",
+        "@starchart/agents.star",
+    ] {
+        if let Some((canon_id, src)) = resolve_builtin_module(alias)
+            && let Ok(ast) = AstModule::parse(canon_id, src.to_owned(), &dialect)
+            && let Ok(frozen) = Module::with_temp_heap(|m| {
+                {
+                    let mut eval = Evaluator::new(&m);
+                    let _ = eval.eval_module(ast, globals);
+                }
+                m.freeze()
+            })
+        {
+            let mut bindings = HashMap::new();
+            for name in frozen.names() {
+                if let Ok(Some(owned)) = frozen.get_option(name.as_str()) {
+                    bindings.insert(name.as_str().to_owned(), Ty::of_value(owned.value()));
+                }
+            }
+            map.insert(alias.to_owned(), Interface::new(bindings));
+        }
+    }
+    map
 }
 
 impl LspContext for StarchartLspContext {
@@ -327,11 +597,18 @@ impl LspContext for StarchartLspContext {
 
         match AstModule::parse(&filename, content, &dialect) {
             Ok(ast) => {
-                let (type_errors, _, _, _) =
-                    ast.clone().typecheck(&self.globals, &HashMap::<String, Interface>::new());
+                let mut loads = HashMap::<String, Interface>::new();
+                for load in ast.loads() {
+                    if let Some(intf) = self.builtin_interfaces.get(load.module_id) {
+                        loads.insert(load.module_id.to_owned(), intf.clone());
+                    }
+                }
+                let (type_errors, _, _, _) = ast.clone().typecheck(&self.globals, &loads);
                 let diagnostics = type_errors
                     .into_iter()
-                    .map(|err| eval_message_to_lsp_diagnostic(EvalMessage::from_error(uri.path(), &err)))
+                    .map(|err| {
+                        eval_message_to_lsp_diagnostic(EvalMessage::from_error(uri.path(), &err))
+                    })
                     .collect();
                 LspEvalResult {
                     diagnostics,
@@ -354,6 +631,9 @@ impl LspContext for StarchartLspContext {
         current_file: &LspUri,
         workspace_root: Option<&Path>,
     ) -> Result<LspUri, String> {
+        if let Some((canon_id, _)) = resolve_builtin_module(path) {
+            return Ok(LspUri::Starlark(PathBuf::from(format!("/{canon_id}"))));
+        }
         let base = current_file
             .path()
             .parent()
@@ -369,6 +649,9 @@ impl LspContext for StarchartLspContext {
         current_file: &LspUri,
         _workspace_root: Option<&Path>,
     ) -> Result<String, String> {
+        if let LspUri::Starlark(p) = target {
+            return Ok(p.to_string_lossy().trim_start_matches('/').to_owned());
+        }
         if let Some(base) = current_file.path().parent()
             && let Ok(rel) = target.path().strip_prefix(base)
         {
@@ -388,6 +671,10 @@ impl LspContext for StarchartLspContext {
 
     fn get_load_contents(&self, uri: &LspUri) -> Result<Option<String>, String> {
         match uri {
+            LspUri::Starlark(path) => {
+                let key = path.to_string_lossy();
+                Ok(resolve_builtin_module(key.as_ref()).map(|(_, src)| src.to_owned()))
+            }
             LspUri::File(path) => match std::fs::read_to_string(path) {
                 Ok(contents) => Ok(Some(contents)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
