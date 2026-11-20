@@ -535,6 +535,51 @@ fn spawn_mock_deploy_control_api() -> (u16, std::sync::Arc<std::sync::atomic::At
 }
 
 #[test]
+fn run_events_stdin_drives_deployment_pipeline_standalone_without_control_api() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(bin_path())
+        .arg("run")
+        .arg(workspace_file("examples/deployment_pipeline.star"))
+        .arg("--events-stdin")
+        .arg("--trace")
+        .arg("-")
+        .arg("--context")
+        .arg(r#"{"bake_interval_ms": 20}"#)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn standalone deployment_pipeline");
+
+    {
+        let mut stdin = child.stdin.take().expect("stdin");
+        writeln!(stdin, r#"{{"type":"APPROVE","by":"alice"}}"#).unwrap();
+        writeln!(stdin, r#"{{"type":"APPROVE","by":"joe"}}"#).unwrap();
+        writeln!(stdin, "START_ROLLOUT").unwrap();
+    }
+
+    let output = child.wait_with_output().expect("wait standalone deployment_pipeline");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let records = parse_jsonl(&stdout);
+    let final_transition = records
+        .iter()
+        .rfind(|r| r["kind"] == "transition")
+        .expect("final transition");
+    assert_eq!(final_transition["to"], serde_json::json!(["live"]), "trace:\n{stdout}");
+    assert_eq!(final_transition["output"], serde_json::json!({"status": "live"}));
+    assert_eq!(final_transition["context"]["bake_checks"], 2);
+    assert_eq!(
+        final_transition["context"]["approved_by"],
+        serde_json::json!(["alice", "joe"])
+    );
+}
+
+#[test]
 fn run_events_stdin_drives_deployment_pipeline_with_pause_resume_to_live() {
     use std::io::Write;
     use std::process::Stdio;

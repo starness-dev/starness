@@ -1,12 +1,14 @@
-# Zero-compile progressive deployment workflow using `@starchart/exec` + `@starchart/http`:
+# Zero-compile progressive deployment workflow using `@starchart/exec` + optional `@starchart/http`:
+# - Runs standalone out of the box (`control_api = ""`), or connects to a live deploy control plane
+#   when `control_api` is set via `--context '{"control_api": "http://127.0.0.1:9090"}'`
 # - `awaiting_approval`: collects live `APPROVE` events until quorum, then starts on `START_ROLLOUT`
-# - `preflight`: queries a deploy-window HTTP endpoint to ensure no active change freeze
+# - `preflight`: queries a deploy-window HTTP endpoint when `control_api != ""` to check change freezes
 # - `rolling_out`: compound superstate with:
 #     * `shallow_history` (`S.rollout_hist`) so `PAUSE` -> `RESUME` returns to the exact active stage
 #     * superstate `ROLLBACK` handler that cancels any in-flight deploy/check and triggers rollback
-#     * canary rollout (`invoke_cmd`) -> timed bake loop (`after` + `invoke_http` metrics check)
+#     * canary rollout (`invoke_cmd`) -> timed bake loop (`after`, plus `invoke_http` when configured)
 #     * parallel `smoke_tests` + `security_scan` (`parallel_state` + `invoke_cmd`) -> `promoting`
-# - `rolling_back`: executes rollback command and posts an incident alert webhook (`invoke_http`)
+# - `rolling_back`: executes rollback command and optionally posts an incident alert webhook
 
 load("@starchart/exec", "invoke_cmd")
 load("@starchart/http", "HttpMethod", "HttpRequest", "http_request", "invoke_http")
@@ -22,7 +24,7 @@ DeployEvent = enum(
 DeployCtx = record(
     service = field(str, "payments-api"),
     version = field(str, "2026.11.20"),
-    control_api = field(str, "http://127.0.0.1:9090"),
+    control_api = field(str, ""),
     approvals = field(int, 0),
     required_approvals = field(int, 2),
     approved_by = field(list[str], []),
@@ -112,6 +114,11 @@ chart: StateMachine = machine(
                 transition(
                     event = DeployEvent.START_ROLLOUT,
                     target = S.preflight,
+                    guard = lambda ctx, _ev: ctx.approvals >= ctx.required_approvals and ctx.control_api != "",
+                ),
+                transition(
+                    event = DeployEvent.START_ROLLOUT,
+                    target = S.rolling_out,
                     guard = lambda ctx, _ev: ctx.approvals >= ctx.required_approvals,
                 ),
             ],
@@ -159,7 +166,22 @@ chart: StateMachine = machine(
                 S.bake_wait: state(
                     after = after(
                         delay = lambda ctx, _ev: ctx.bake_interval_ms,
-                        target = S.checking_canary,
+                        outcomes = [
+                            outcome(
+                                target = S.checking_canary,
+                                guard = lambda ctx, _ev: ctx.control_api != "",
+                            ),
+                            outcome(
+                                target = S.verifying,
+                                guard = bake_complete,
+                                assign = lambda ctx, _ev: update(ctx, bake_checks = ctx.bake_checks + 1),
+                            ),
+                            outcome(
+                                target = S.bake_wait,
+                                reenter = True,
+                                assign = lambda ctx, _ev: update(ctx, bake_checks = ctx.bake_checks + 1),
+                            ),
+                        ],
                     ),
                 ),
                 S.checking_canary: state(
@@ -254,8 +276,20 @@ chart: StateMachine = machine(
             invoke = invoke_cmd(
                 id = "revert_traffic",
                 cmd = lambda ctx: ctx.rollback_cmd,
-                on_done = S.alerting_oncall,
-                on_error = S.alerting_oncall,
+                on_done = [
+                    outcome(
+                        target = S.alerting_oncall,
+                        guard = lambda ctx, _ev: ctx.control_api != "",
+                    ),
+                    outcome(target = S.rolled_back),
+                ],
+                on_error = [
+                    outcome(
+                        target = S.alerting_oncall,
+                        guard = lambda ctx, _ev: ctx.control_api != "",
+                    ),
+                    outcome(target = S.rolled_back),
+                ],
             ),
         ),
         S.alerting_oncall: state(
