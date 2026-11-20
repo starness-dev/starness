@@ -1,6 +1,8 @@
 //! Compiles [`CompiledChart`] into `xstate-statemachine` (`xstate-core` + `xstate-tokio`),
 //! bridging pure frozen Starlark guards, delays & reducers with effectful Rust host callbacks.
 
+pub mod builtins;
+
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -12,7 +14,10 @@ use starchart_ir::{
     ActionDef, DelayRef, GuardRef, InvokeDef, MachineDef, OutcomeDef, StateId, StateKind,
     StateNodeDef, TransitionDef,
 };
-use starchart_starlark::CompiledChart;
+use starchart_starlark::{
+    BUILTIN_ACP_SERVICE, BUILTIN_EXEC_SERVICE, BUILTIN_HTTP_SERVICE, CompiledChart,
+    INVOKE_INPUT_SLOT_KEY,
+};
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
 use starlark::values::dict::AllocDict;
@@ -124,6 +129,19 @@ impl std::fmt::Debug for HostCallbacks {
 impl HostCallbacks {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a `HostCallbacks` preloaded with all built-in `@starchart/*` runtime drivers
+    /// (`@starchart/http`, `@starchart/exec`, `@starchart/acp`).
+    #[must_use]
+    pub fn with_builtins() -> Self {
+        builtins::register_builtin_drivers(Self::default())
+    }
+
+    /// Registers all built-in `@starchart/*` runtime drivers onto an existing `HostCallbacks`.
+    #[must_use]
+    pub fn register_builtins(self) -> Self {
+        builtins::register_builtin_drivers(self)
     }
 
     /// Require every action declared in the Starlark statechart to have an explicit Rust handler.
@@ -536,8 +554,9 @@ fn emit_mermaid_node(
     }
 
     for inv in &node.invoke {
-        let inv_name = inv.id.as_deref().unwrap_or(inv.src.as_str());
-        lines.push(format!("{pad}{mid} : invoke / {}", inv.src));
+        let inv_name = format_invoke_id_label(inv);
+        let inv_display = format_invoke_src_label(inv);
+        lines.push(format!("{pad}{mid} : invoke / {inv_display}"));
 
         for outcome in &inv.on_done {
             emit_outcome_mermaid(
@@ -636,6 +655,54 @@ fn emit_mermaid_node(
 
     if matches!(node.kind, StateKind::Final) {
         edges.push(format!("    {mid} --> [*]"));
+    }
+}
+
+fn format_invoke_id_label(inv: &InvokeDef) -> &str {
+    if let Some(id) = &inv.id {
+        return id.as_str();
+    }
+    match inv.src.as_str() {
+        BUILTIN_HTTP_SERVICE => "http",
+        BUILTIN_EXEC_SERVICE => "exec",
+        BUILTIN_ACP_SERVICE => "acp",
+        other => other,
+    }
+}
+
+fn format_invoke_src_label(inv: &InvokeDef) -> String {
+    match inv.src.as_str() {
+        BUILTIN_HTTP_SERVICE => {
+            if let Some(obj) = inv.input.as_object()
+                && !obj.contains_key(INVOKE_INPUT_SLOT_KEY)
+            {
+                let m = obj.get("method").and_then(Value::as_str).unwrap_or("GET");
+                let u = obj.get("url").and_then(Value::as_str).unwrap_or("");
+                return format!("http {m} {u}").trim().to_owned();
+            }
+            "http".to_owned()
+        }
+        BUILTIN_EXEC_SERVICE => {
+            if let Some(cmd) = inv
+                .input
+                .get("cmd")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(Value::as_str)
+            {
+                return format!("exec {cmd}");
+            }
+            "exec".to_owned()
+        }
+        BUILTIN_ACP_SERVICE => {
+            if let Some(agent) = inv.input.get("agent").and_then(Value::as_object) {
+                let id = agent.get("id").and_then(Value::as_str).unwrap_or("agent");
+                let cmd = agent.get("command").and_then(Value::as_str).unwrap_or("");
+                return format!("acp {id} ({cmd})").trim().to_owned();
+            }
+            "acp".to_owned()
+        }
+        other => other.to_owned(),
     }
 }
 
@@ -1085,11 +1152,17 @@ pub fn build_machine_logic(
         });
     }
 
+    let input_slots = Arc::new(chart.inputs.clone());
+
     for (service_name, service_fn) in &callbacks.sync_services {
         let service_fn = Arc::clone(service_fn);
         let sname = service_name.clone();
-        logic = logic.service(service_name.clone(), move |ctx, input| {
-            service_fn(ctx, input)
+        let input_slots = Arc::clone(&input_slots);
+        let rec_ctor = record_ctor.clone();
+        logic = logic.service(service_name.clone(), move |ctx, raw_input| {
+            let resolved_input =
+                resolve_dynamic_service_input(&sname, raw_input, &input_slots, rec_ctor.as_ref(), ctx)?;
+            service_fn(ctx, &resolved_input)
                 .map_err(|e| XStateError::Logic(format!("service `{sname}`: {e:#}")))
         });
     }
@@ -1097,11 +1170,17 @@ pub fn build_machine_logic(
     for (service_name, service_fn) in &callbacks.async_services {
         let service_fn = Arc::clone(service_fn);
         let sname = service_name.clone();
-        logic = logic.async_service(service_name.clone(), move |ctx, input| {
-            let fut = service_fn(ctx, input);
+        let input_slots = Arc::clone(&input_slots);
+        let rec_ctor = record_ctor.clone();
+        logic = logic.async_service(service_name.clone(), move |ctx, raw_input| {
+            let resolved =
+                resolve_dynamic_service_input(&sname, &raw_input, &input_slots, rec_ctor.as_ref(), &ctx);
+            let service_fn = Arc::clone(&service_fn);
             let sname = sname.clone();
             Box::pin(async move {
-                fut.await
+                let resolved_input = resolved?;
+                service_fn(ctx, resolved_input)
+                    .await
                     .map_err(|e| XStateError::Logic(format!("service `{sname}`: {e:#}")))
             })
         });
@@ -1265,6 +1344,76 @@ fn eval_starlark_delay(
     })
 }
 
+fn resolve_dynamic_service_input(
+    service_name: &str,
+    raw_input: &Value,
+    input_slots: &HashMap<String, OwnedFrozenValue>,
+    record_ctor: Option<&OwnedFrozenValue>,
+    ctx: &Value,
+) -> Result<Value, XStateError> {
+    match raw_input {
+        Value::Object(map) => {
+            if map.len() == 1
+                && let Some(slot_name) = map.get(INVOKE_INPUT_SLOT_KEY).and_then(Value::as_str)
+            {
+                let slot_fn = input_slots.get(slot_name).ok_or_else(|| {
+                    XStateError::Logic(format!(
+                        "service `{service_name}` missing input slot `{slot_name}`"
+                    ))
+                })?;
+                return eval_starlark_input_fn(service_name, slot_fn, record_ctor, ctx);
+            }
+            let mut resolved_map = Map::with_capacity(map.len());
+            for (k, v) in map {
+                resolved_map.insert(
+                    k.clone(),
+                    resolve_dynamic_service_input(service_name, v, input_slots, record_ctor, ctx)?,
+                );
+            }
+            Ok(Value::Object(resolved_map))
+        }
+        Value::Array(items) => {
+            let mut resolved_arr = Vec::with_capacity(items.len());
+            for item in items {
+                resolved_arr.push(resolve_dynamic_service_input(
+                    service_name,
+                    item,
+                    input_slots,
+                    record_ctor,
+                    ctx,
+                )?);
+            }
+            Ok(Value::Array(resolved_arr))
+        }
+        other => Ok(other.clone()),
+    }
+}
+
+fn eval_starlark_input_fn(
+    service_name: &str,
+    input_fn: &OwnedFrozenValue,
+    record_ctor: Option<&OwnedFrozenValue>,
+    ctx: &Value,
+) -> Result<Value, XStateError> {
+    Module::with_temp_heap(|module| {
+        let ctx_val = alloc_context_on_heap(&module, record_ctor, ctx)
+            .map_err(|e| XStateError::Logic(format!("service `{service_name}` input: {e}")))?;
+
+        // SAFETY: `module.frozen_heap()` retains a reference to `input_fn.owner()` for `'v`.
+        let callable_val =
+            unsafe { input_fn.owned_frozen_value(module.frozen_heap()) }.to_value();
+
+        let mut eval = Evaluator::new(&module);
+        let result = eval
+            .eval_function(callable_val, &[ctx_val], &[])
+            .map_err(|e| XStateError::Logic(format!("service `{service_name}` input: {e:#}")))?;
+
+        result
+            .to_json_value()
+            .map_err(|e| XStateError::Logic(format!("service `{service_name}` input: {e:#}")))
+    })
+}
+
 fn alloc_context_on_heap<'v>(
     module: &Module<'v>,
     record_ctor: Option<&OwnedFrozenValue>,
@@ -1334,14 +1483,30 @@ fn state_matches_query(machine_id: &str, active_ids: &[String], query: &str) -> 
     })
 }
 
+fn collect_top_level_final_outputs(ir: &MachineDef) -> HashMap<String, Value> {
+    let mut map = HashMap::new();
+    for (sid, node) in &ir.states {
+        if matches!(node.kind, StateKind::Final)
+            && let Some(out) = &node.output
+        {
+            map.insert(sid.as_str().to_owned(), out.clone());
+        }
+    }
+    map
+}
+
 /// Synchronous statechart runner backed by `xstate_statemachine::SyncInterpreter`.
-pub struct ChartSyncRunner {
+pub struct StarchartSyncRunner {
     machine_id: String,
+    final_outputs: HashMap<String, Value>,
     sim_clock: Option<SimulatedClock>,
     inner: SyncInterpreter<DynContext>,
 }
 
-impl ChartSyncRunner {
+/// Alias preserved for compatibility.
+pub type ChartSyncRunner = StarchartSyncRunner;
+
+impl StarchartSyncRunner {
     /// Compiles and starts a synchronous statechart interpreter with a deterministic simulated clock.
     pub fn start(
         chart: &CompiledChart,
@@ -1354,6 +1519,7 @@ impl ChartSyncRunner {
         inner.start()?;
         Ok(Self {
             machine_id: chart.ir.id.clone(),
+            final_outputs: collect_top_level_final_outputs(&chart.ir),
             sim_clock: Some(clock),
             inner,
         })
@@ -1370,6 +1536,7 @@ impl ChartSyncRunner {
         inner.start()?;
         Ok(Self {
             machine_id: chart.ir.id.clone(),
+            final_outputs: collect_top_level_final_outputs(&chart.ir),
             sim_clock: None,
             inner,
         })
@@ -1454,9 +1621,20 @@ impl ChartSyncRunner {
 
     /// Returns the machine's final `output` (`Value::Null` until `Done` or when unset).
     pub fn output(&self) -> &Value {
-        self.inner
-            .state()
-            .map_or(&Value::Null, |active| active.output())
+        if let Some(active) = self.inner.state() {
+            let root_out = active.output();
+            if !root_out.is_null() {
+                return root_out;
+            }
+            if self.is_done() {
+                for st in self.active_states() {
+                    if let Some(leaf_out) = self.final_outputs.get(&st) {
+                        return leaf_out;
+                    }
+                }
+            }
+        }
+        &Value::Null
     }
 
     /// Drains events emitted by `emit_event(...)` actions.
@@ -1482,12 +1660,16 @@ impl ChartSyncRunner {
 
 /// Asynchronous Tokio actor runner backed by `xstate_statemachine::tokio::spawn`.
 #[derive(Clone)]
-pub struct ChartActor {
+pub struct StarchartActor {
     machine_id: String,
+    final_outputs: Arc<HashMap<String, Value>>,
     inner: AsyncInterpreter<DynContext>,
 }
 
-impl ChartActor {
+/// Alias preserved for compatibility.
+pub type ChartActor = StarchartActor;
+
+impl StarchartActor {
     /// Spawns the compiled statechart onto the current Tokio runtime.
     pub fn spawn(
         chart: &CompiledChart,
@@ -1498,8 +1680,19 @@ impl ChartActor {
         let inner = spawn(machine, logic, ActorOptions::default())?;
         Ok(Self {
             machine_id: chart.ir.id.clone(),
+            final_outputs: Arc::new(collect_top_level_final_outputs(&chart.ir)),
             inner,
         })
+    }
+
+    /// Spawns the compiled statechart with all built-in `@starchart/*` runtime drivers enabled.
+    pub fn spawn_with_builtins(chart: &CompiledChart) -> Result<Self, ChartRuntimeError> {
+        Self::spawn(chart, HostCallbacks::with_builtins())
+    }
+
+    /// Subscribes to live state/status updates from the actor.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<xstate_statemachine::tokio::View> {
+        self.inner.subscribe()
     }
 
     /// Sends an event and waits until the macrostep completes.
@@ -1543,7 +1736,18 @@ impl ChartActor {
 
     /// Returns the actor's final `output` once completed.
     pub fn output(&self) -> Value {
-        self.inner.view().output
+        let root_out = self.inner.view().output;
+        if !root_out.is_null() {
+            return root_out;
+        }
+        if self.is_done() {
+            for st in self.active_states() {
+                if let Some(leaf_out) = self.final_outputs.get(&st) {
+                    return leaf_out.clone();
+                }
+            }
+        }
+        Value::Null
     }
 
     /// Fetches a snapshot of the actor's current extended state context.
@@ -2131,5 +2335,221 @@ chart = machine(
         assert!(runner.is_in("finished"));
         assert!(runner.is_done());
         assert_eq!(runner.output(), &json!({"status": "playback_complete"}));
+    }
+
+    #[tokio::test]
+    async fn builtin_http_driver_executes_checkout_http_with_retry_and_webhook() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock server");
+        let port = listener.local_addr().unwrap().port();
+        let charge_hits = Arc::new(AtomicUsize::new(0));
+        let webhook_hits = Arc::new(AtomicUsize::new(0));
+        let charge_hits_srv = Arc::clone(&charge_hits);
+        let webhook_hits_srv = Arc::clone(&webhook_hits);
+
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0_u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+
+                let (status_line, resp_body) = if req_str.starts_with("POST /v1/charges ") {
+                    let hit = charge_hits_srv.fetch_add(1, Ordering::SeqCst);
+                    if hit == 0 {
+                        // First attempt returns 503 Service Unavailable -> triggers Starlark retry!
+                        ("503 Service Unavailable", r#"{"error":"overloaded"}"#)
+                    } else {
+                        ("200 OK", r#"{"paid":true,"charge_id":"ch_live_99"}"#)
+                    }
+                } else {
+                    webhook_hits_srv.fetch_add(1, Ordering::SeqCst);
+                    ("200 OK", r#"{"received":true}"#)
+                };
+
+                let http_resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                    resp_body.len()
+                );
+                let _ = sock.write_all(http_resp.as_bytes()).await;
+            }
+        });
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/checkout_http.star");
+        let mut chart = compile_starlark_file(path, None).expect("checkout_http.star must compile");
+        chart.ir.context["api_base"] = json!(format!("http://127.0.0.1:{port}"));
+
+        let actor = StarchartActor::spawn_with_builtins(&chart).expect("spawn checkout_http");
+        actor.wait_done().await.expect("actor should finish");
+
+        assert!(actor.is_in("completed"));
+        assert_eq!(actor.output(), json!({"status": "paid_and_notified"}));
+        let final_ctx = actor.context().await.expect("final context");
+        assert_eq!(final_ctx["charge_id"], json!("ch_live_99"));
+        assert_eq!(final_ctx["attempts"], json!(1));
+        assert_eq!(charge_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(webhook_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn builtin_exec_driver_captures_stdout_and_handles_nonzero_exit() {
+        let src = r#"
+load("@starchart/exec", "invoke_cmd")
+
+Ctx = record(greeting = str, err_msg = str)
+S = state_space("step_fail", "step_ok", "done", "failed")
+
+def save_err(ctx: Ctx, event: dict) -> Ctx:
+    return Ctx(greeting = ctx.greeting, err_msg = str(event.get("error", "")))
+
+def save_out(ctx: Ctx, event: dict) -> Ctx:
+    return Ctx(greeting = event["output"]["stdout"].strip(), err_msg = ctx.err_msg)
+
+chart = machine(
+    id = "exec_demo",
+    initial = S.step_fail,
+    context = Ctx(greeting = "", err_msg = ""),
+    states = {
+        S.step_fail: state(
+            invoke = invoke_cmd(
+                cmd = ["sh", "-c", "echo boom >&2; exit 7"],
+                on_done = S.failed,
+                on_error = outcome(target = S.step_ok, assign = save_err),
+            ),
+        ),
+        S.step_ok: state(
+            invoke = invoke_cmd(
+                cmd = ["sh", "-c", "printf 'hello-starchart'"],
+                on_done = outcome(target = S.done, assign = save_out),
+                on_error = S.failed,
+            ),
+        ),
+        S.done: final_state(),
+        S.failed: final_state(),
+    },
+)
+"#;
+        let chart = compile_starlark_str("exec_demo.star", src, None).expect("compile exec_demo");
+        let actor = StarchartActor::spawn_with_builtins(&chart).expect("spawn exec_demo");
+        actor.wait_done().await.expect("wait done");
+
+        assert!(actor.is_in("done"));
+        let ctx = actor.context().await.expect("context");
+        assert_eq!(ctx["greeting"], json!("hello-starchart"));
+        assert!(
+            ctx["err_msg"].as_str().unwrap_or("").contains("code 7"),
+            "expected exit code 7 in err_msg: {ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_and_codex_cli_drivers_execute_in_parallel_state() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("starchart_cli_agents_{uniq}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let mock_claude = dir.join("mock_claude.sh");
+        std::fs::write(
+            &mock_claude,
+            "#!/bin/sh\nprompt=$(cat)\nprintf '{\"result\":\"claude_saw:%s\",\"session_id\":\"sess_c1\",\"is_error\":false}\\n' \"$prompt\"\n",
+        )
+        .expect("write mock claude");
+
+        let mock_codex = dir.join("mock_codex.sh");
+        std::fs::write(
+            &mock_codex,
+            "#!/bin/sh\nout_file=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then out_file=\"$2\"; shift 2; else shift; fi\ndone\nprompt=$(cat)\nprintf 'codex_saw:%s' \"$prompt\" > \"$out_file\"\n",
+        )
+        .expect("write mock codex");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perm = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&mock_claude, perm.clone()).unwrap();
+            std::fs::set_permissions(&mock_codex, perm).unwrap();
+        }
+
+        let src = format!(
+            r#"
+load("@starchart/agents", "claude_agent", "codex_agent", "invoke_agent")
+
+Ctx = record(claude_out = str, codex_out = str)
+S = state_space("reviewing", "c_branch", "c_run", "c_done", "x_branch", "x_run", "x_done", "done", "err")
+
+claude = claude_agent(id = "claude_rev", command = {claude_cmd:?}, permission_mode = "plan")
+codex = codex_agent(id = "codex_rev", command = {codex_cmd:?}, sandbox = "read-only")
+
+def save_claude(ctx: Ctx, event: dict) -> Ctx:
+    return Ctx(claude_out = event["output"]["text"], codex_out = ctx.codex_out)
+
+def save_codex(ctx: Ctx, event: dict) -> Ctx:
+    return Ctx(claude_out = ctx.claude_out, codex_out = event["output"]["text"])
+
+chart = machine(
+    id = "parallel_cli_agents",
+    initial = S.reviewing,
+    context = Ctx(claude_out = "", codex_out = ""),
+    states = {{
+        S.reviewing: parallel_state(
+            on_done = S.done,
+            states = {{
+                S.c_branch: compound_state(
+                    initial = S.c_run,
+                    states = {{
+                        S.c_run: state(
+                            invoke = invoke_agent(
+                                agent = claude,
+                                prompt = "check-ergonomics",
+                                on_done = outcome(target = S.c_done, assign = save_claude),
+                                on_error = S.err,
+                            ),
+                        ),
+                        S.c_done: final_state(),
+                    }},
+                ),
+                S.x_branch: compound_state(
+                    initial = S.x_run,
+                    states = {{
+                        S.x_run: state(
+                            invoke = invoke_agent(
+                                agent = codex,
+                                prompt = "check-edge-cases",
+                                on_done = outcome(target = S.x_done, assign = save_codex),
+                                on_error = S.err,
+                            ),
+                        ),
+                        S.x_done: final_state(),
+                    }},
+                ),
+            }},
+        ),
+        S.done: final_state(),
+        S.err: final_state(),
+    }},
+)
+"#,
+            claude_cmd = mock_claude.to_string_lossy(),
+            codex_cmd = mock_codex.to_string_lossy(),
+        );
+
+        let chart = compile_starlark_str("parallel_cli_agents.star", &src, None).expect("compile");
+        let actor = StarchartActor::spawn_with_builtins(&chart).expect("spawn");
+        actor.wait_done().await.expect("wait done");
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(actor.is_in("done"));
+        let ctx = actor.context().await.expect("context");
+        assert_eq!(ctx["claude_out"], json!("claude_saw:check-ergonomics"));
+        assert_eq!(ctx["codex_out"], json!("codex_saw:check-edge-cases"));
     }
 }

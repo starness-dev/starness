@@ -10,6 +10,7 @@ starchart-ir.workspace = true
 starchart-starlark.workspace = true
 dupe.workspace = true
 indexmap.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 starlark.workspace = true
