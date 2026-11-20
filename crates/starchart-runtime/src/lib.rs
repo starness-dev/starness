@@ -2,6 +2,12 @@
 //! bridging pure frozen Starlark guards, delays & reducers with effectful Rust host callbacks.
 
 pub mod builtins;
+pub mod trace;
+
+pub use trace::{
+    ProgressKind, TraceEvent, TraceEventInfo, TraceHub, TraceReceiver, TraceRecord,
+    progress_enabled, report_progress,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -34,7 +40,9 @@ use xstate_statemachine::core::{
     ActionScope, DynContext, Error as XStateError, Event, Machine, MachineLogic, RealClock,
     SimulatedClock, Status, SyncInterpreter,
 };
-use xstate_statemachine::tokio::{Interpreter as AsyncInterpreter, Options as ActorOptions, spawn};
+use xstate_statemachine::tokio::{
+    Interpreter as AsyncInterpreter, Options as ActorOptions, spawn_with_observers,
+};
 
 /// Errors produced during machine compilation or runtime execution.
 #[derive(Debug, Error)]
@@ -888,7 +896,7 @@ fn configure_state_node(
     }
 
     for inv in &node.invoke {
-        sb = sb.invoke(lower_invoke_to_builder(inv));
+        sb = sb.invoke(lower_invoke_to_builder(inv, state_id));
     }
 
     sb
@@ -963,14 +971,19 @@ fn lower_action_to_builder(action: &ActionDef) -> BuilderAction {
     }
 }
 
-fn lower_invoke_to_builder(inv: &InvokeDef) -> BuilderInvoke {
+fn lower_invoke_to_builder(inv: &InvokeDef, state_id: &StateId) -> BuilderInvoke {
     let mut bi = BuilderInvoke::new(&inv.src);
     if let Some(id) = &inv.id {
         bi = bi.id(id);
     }
-    if !inv.input.is_null() {
-        bi = bi.input(inv.input.clone());
-    }
+    // Wrap the input in a metadata envelope so service wrappers know which invoke
+    // (and owning state) they run for; `build_machine_logic` unwraps it before the
+    // service sees its input.
+    let trace_id = inv.id.clone().unwrap_or_else(|| state_id.as_str().to_owned());
+    bi = bi.input(serde_json::json!({
+        (trace::INVOKE_ENVELOPE_KEY): { "id": trace_id, "state": state_id.as_str() },
+        "input": inv.input,
+    }));
     if !inv.on_done.is_empty() {
         bi = bi.on_done(
             inv.on_done
@@ -1063,6 +1076,15 @@ fn lower_guard_to_builder(guard: &GuardRef) -> BuilderGuard {
 pub fn build_machine_logic(
     chart: &CompiledChart,
     callbacks: &HostCallbacks,
+) -> MachineLogic<DynContext> {
+    build_machine_logic_traced(chart, callbacks, None)
+}
+
+/// Like [`build_machine_logic`], additionally emitting `service_*` records into `trace`.
+pub fn build_machine_logic_traced(
+    chart: &CompiledChart,
+    callbacks: &HostCallbacks,
+    trace: Option<Arc<TraceHub>>,
 ) -> MachineLogic<DynContext> {
     let mut logic = MachineLogic::dynamic();
     let record_ctor = chart.context_record_type.clone();
@@ -1159,11 +1181,36 @@ pub fn build_machine_logic(
         let sname = service_name.clone();
         let input_slots = Arc::clone(&input_slots);
         let rec_ctor = record_ctor.clone();
+        let hub = trace.clone();
         logic = logic.service(service_name.clone(), move |ctx, raw_input| {
-            let resolved_input =
-                resolve_dynamic_service_input(&sname, raw_input, &input_slots, rec_ctor.as_ref(), ctx)?;
-            service_fn(ctx, &resolved_input)
-                .map_err(|e| XStateError::Logic(format!("service `{sname}`: {e:#}")))
+            let (meta, user_input) = trace::split_invoke_envelope(raw_input, &sname);
+            let scope = hub
+                .as_ref()
+                .zip(meta)
+                .map(|(hub, meta)| trace::ServiceScope { hub: Arc::clone(hub), meta });
+            let started = std::time::Instant::now();
+            let run = || -> Result<Value, XStateError> {
+                let resolved_input = resolve_dynamic_service_input(
+                    &sname,
+                    &user_input,
+                    &input_slots,
+                    rec_ctor.as_ref(),
+                    ctx,
+                )?;
+                if let Some(scope) = &scope {
+                    scope.started(&resolved_input);
+                }
+                service_fn(ctx, &resolved_input)
+                    .map_err(|e| XStateError::Logic(format!("service `{sname}`: {e:#}")))
+            };
+            match &scope {
+                Some(s) => {
+                    let result = trace::with_sync_scope(s.clone(), run);
+                    s.finished(result.as_ref().map_err(ToString::to_string), started);
+                    result
+                }
+                None => run(),
+            }
         });
     }
 
@@ -1172,16 +1219,33 @@ pub fn build_machine_logic(
         let sname = service_name.clone();
         let input_slots = Arc::clone(&input_slots);
         let rec_ctor = record_ctor.clone();
+        let hub = trace.clone();
         logic = logic.async_service(service_name.clone(), move |ctx, raw_input| {
+            let (meta, user_input) = trace::split_invoke_envelope(&raw_input, &sname);
             let resolved =
-                resolve_dynamic_service_input(&sname, &raw_input, &input_slots, rec_ctor.as_ref(), &ctx);
+                resolve_dynamic_service_input(&sname, &user_input, &input_slots, rec_ctor.as_ref(), &ctx);
+            let scope = hub
+                .as_ref()
+                .zip(meta)
+                .map(|(hub, meta)| trace::ServiceScope { hub: Arc::clone(hub), meta });
             let service_fn = Arc::clone(&service_fn);
             let sname = sname.clone();
             Box::pin(async move {
                 let resolved_input = resolved?;
-                service_fn(ctx, resolved_input)
-                    .await
-                    .map_err(|e| XStateError::Logic(format!("service `{sname}`: {e:#}")))
+                let started = std::time::Instant::now();
+                let fut = service_fn(ctx, resolved_input.clone());
+                let result = match &scope {
+                    Some(scope) => {
+                        scope.started(&resolved_input);
+                        trace::with_async_scope(scope.clone(), fut).await
+                    }
+                    None => fut.await,
+                }
+                .map_err(|e| XStateError::Logic(format!("service `{sname}`: {e:#}")));
+                if let Some(scope) = &scope {
+                    scope.finished(result.as_ref().map_err(ToString::to_string), started);
+                }
+                result
             })
         });
     }
@@ -1483,6 +1547,24 @@ fn state_matches_query(machine_id: &str, active_ids: &[String], query: &str) -> 
     })
 }
 
+/// Readable labels for internal action names (Starlark reducer slots -> `assign <fn>`).
+fn trace_action_labels(chart: &CompiledChart) -> HashMap<String, String> {
+    chart
+        .reducers
+        .iter()
+        .map(|(slot, val)| {
+            (
+                slot.clone(),
+                format!("assign {}", extract_starlark_fn_name(val, slot)),
+            )
+        })
+        .collect()
+}
+
+fn new_trace_hub(chart: &CompiledChart) -> Arc<TraceHub> {
+    TraceHub::new(chart.ir.id.clone(), trace_action_labels(chart))
+}
+
 fn collect_top_level_final_outputs(ir: &MachineDef) -> HashMap<String, Value> {
     let mut map = HashMap::new();
     for (sid, node) in &ir.states {
@@ -1500,6 +1582,7 @@ pub struct StarchartSyncRunner {
     machine_id: String,
     final_outputs: HashMap<String, Value>,
     sim_clock: Option<SimulatedClock>,
+    trace: Arc<TraceHub>,
     inner: SyncInterpreter<DynContext>,
 }
 
@@ -1512,17 +1595,8 @@ impl StarchartSyncRunner {
         chart: &CompiledChart,
         callbacks: HostCallbacks,
     ) -> Result<Self, ChartRuntimeError> {
-        let machine = compile_ir_to_machine(&chart.ir)?;
-        let logic = build_machine_logic(chart, &callbacks);
         let clock = SimulatedClock::new();
-        let mut inner = SyncInterpreter::with_clock(machine, logic, Arc::new(clock.clone()));
-        inner.start()?;
-        Ok(Self {
-            machine_id: chart.ir.id.clone(),
-            final_outputs: collect_top_level_final_outputs(&chart.ir),
-            sim_clock: Some(clock),
-            inner,
-        })
+        Self::start_with_clock(chart, callbacks, Arc::new(clock.clone()), Some(clock))
     }
 
     /// Compiles and starts a synchronous statechart interpreter backed by wall-clock [`RealClock`].
@@ -1530,16 +1604,38 @@ impl StarchartSyncRunner {
         chart: &CompiledChart,
         callbacks: HostCallbacks,
     ) -> Result<Self, ChartRuntimeError> {
+        Self::start_with_clock(chart, callbacks, Arc::new(RealClock::new()), None)
+    }
+
+    fn start_with_clock(
+        chart: &CompiledChart,
+        callbacks: HostCallbacks,
+        clock: Arc<dyn xstate_statemachine::core::Clock>,
+        sim_clock: Option<SimulatedClock>,
+    ) -> Result<Self, ChartRuntimeError> {
         let machine = compile_ir_to_machine(&chart.ir)?;
-        let logic = build_machine_logic(chart, &callbacks);
-        let mut inner = SyncInterpreter::with_clock(machine, logic, Arc::new(RealClock::new()));
+        let hub = new_trace_hub(chart);
+        let logic = build_machine_logic_traced(chart, &callbacks, Some(Arc::clone(&hub)));
+        let mut inner = SyncInterpreter::with_clock(machine, logic, clock);
+        inner.observe(trace::TraceObserver::new(Arc::clone(&hub)));
         inner.start()?;
         Ok(Self {
             machine_id: chart.ir.id.clone(),
             final_outputs: collect_top_level_final_outputs(&chart.ir),
-            sim_clock: None,
+            sim_clock,
+            trace: hub,
             inner,
         })
+    }
+
+    /// Subscribes to this run's lossless trace (history replayed first, then live records).
+    pub fn subscribe_traces(&self) -> TraceReceiver {
+        self.trace.subscribe()
+    }
+
+    /// Returns this run's [`TraceHub`] (e.g. to [`TraceHub::close`] it when done).
+    pub fn trace_hub(&self) -> Arc<TraceHub> {
+        Arc::clone(&self.trace)
     }
 
     /// Advances simulated time by `ms` milliseconds and fires any due `after(...)` or delayed `raise` timers.
@@ -1663,6 +1759,7 @@ impl StarchartSyncRunner {
 pub struct StarchartActor {
     machine_id: String,
     final_outputs: Arc<HashMap<String, Value>>,
+    trace: Arc<TraceHub>,
     inner: AsyncInterpreter<DynContext>,
 }
 
@@ -1676,13 +1773,28 @@ impl StarchartActor {
         callbacks: HostCallbacks,
     ) -> Result<Self, ChartRuntimeError> {
         let machine = compile_ir_to_machine(&chart.ir)?;
-        let logic = build_machine_logic(chart, &callbacks);
-        let inner = spawn(machine, logic, ActorOptions::default())?;
+        let hub = new_trace_hub(chart);
+        let logic = build_machine_logic_traced(chart, &callbacks, Some(Arc::clone(&hub)));
+        let observer: Arc<dyn xstate_statemachine::core::Observer<DynContext>> =
+            trace::TraceObserver::new(Arc::clone(&hub));
+        let inner = spawn_with_observers(machine, logic, ActorOptions::default(), vec![observer])?;
         Ok(Self {
             machine_id: chart.ir.id.clone(),
             final_outputs: Arc::new(collect_top_level_final_outputs(&chart.ir)),
+            trace: hub,
             inner,
         })
+    }
+
+    /// Subscribes to this run's lossless trace (history replayed first, then live records).
+    /// The receiver can be moved to any task or thread.
+    pub fn subscribe_traces(&self) -> TraceReceiver {
+        self.trace.subscribe()
+    }
+
+    /// Returns this run's [`TraceHub`] (e.g. to [`TraceHub::close`] it when done).
+    pub fn trace_hub(&self) -> Arc<TraceHub> {
+        Arc::clone(&self.trace)
     }
 
     /// Spawns the compiled statechart with all built-in `@starchart/*` runtime drivers enabled.
@@ -2551,5 +2663,303 @@ chart = machine(
         let ctx = actor.context().await.expect("context");
         assert_eq!(ctx["claude_out"], json!("claude_saw:check-ergonomics"));
         assert_eq!(ctx["codex_out"], json!("codex_saw:check-edge-cases"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Trace stream
+    // ---------------------------------------------------------------------------------------
+
+    fn assert_contiguous(records: &[TraceRecord]) {
+        for (i, r) in records.iter().enumerate() {
+            assert_eq!(r.seq, i as u64 + 1, "gap or reorder at index {i}: {records:#?}");
+        }
+    }
+
+    #[test]
+    fn sync_runner_trace_records_started_and_every_transition_in_order() {
+        let chart = load_order_workflow();
+        let mut runner = StarchartSyncRunner::start(&chart, HostCallbacks::new()).expect("start");
+        let mut rx = runner.subscribe_traces();
+
+        runner
+            .send_with_payload("APPROVED", json!({"amount": 250}))
+            .expect("APPROVED");
+        runner.send("CHARGE_ERR").expect("CHARGE_ERR");
+
+        let records = rx.drain();
+        assert_contiguous(&records);
+        assert_eq!(records.len(), 3, "{records:#?}");
+
+        match &records[0].event {
+            TraceEvent::Started { states, context, .. } => {
+                assert_eq!(states, &vec!["validating".to_owned()]);
+                assert_eq!(context["attempts"], json!(0));
+            }
+            other => panic!("expected Started, got {other:?}"),
+        }
+        match &records[1].event {
+            TraceEvent::Transition { event, from, to, actions, .. } => {
+                assert_eq!(event.event_type, "APPROVED");
+                assert_eq!(event.payload["amount"], json!(250));
+                assert_eq!(from, &vec!["validating".to_owned()]);
+                assert_eq!(to, &vec!["processing.charging".to_owned()]);
+                assert!(actions.contains(&"CHARGE_CARD".to_owned()), "{actions:?}");
+            }
+            other => panic!("expected Transition, got {other:?}"),
+        }
+        match &records[2].event {
+            TraceEvent::Transition { from, to, actions, context, status, .. } => {
+                assert_eq!(from, &vec!["processing.charging".to_owned()]);
+                assert_eq!(to, &vec!["failed".to_owned()]);
+                // Starlark reducer slot names are mapped back to their function names.
+                assert!(
+                    actions.contains(&"assign increment_attempts".to_owned()),
+                    "{actions:?}"
+                );
+                assert_eq!(context["attempts"], json!(1));
+                assert_eq!(status, "done");
+            }
+            other => panic!("expected Transition, got {other:?}"),
+        }
+
+        let line = records[2].to_json_line();
+        let parsed: Value = serde_json::from_str(&line).expect("valid JSON line");
+        assert_eq!(parsed["kind"], json!("transition"));
+        assert_eq!(parsed["seq"], json!(3));
+        assert_eq!(parsed["machine"], json!("order_workflow"));
+        assert_eq!(parsed["event"]["type"], json!("CHARGE_ERR"));
+    }
+
+    #[test]
+    fn late_subscriber_gets_full_history_then_live_records() {
+        let chart = load_order_workflow();
+        let mut runner = StarchartSyncRunner::start(&chart, HostCallbacks::new()).expect("start");
+        runner
+            .send_with_payload("APPROVED", json!({"amount": 250}))
+            .expect("APPROVED");
+
+        // Attach after two records already happened.
+        let mut late = runner.subscribe_traces();
+        runner.send("CHARGE_OK").expect("CHARGE_OK");
+
+        let records = late.drain();
+        assert_contiguous(&records);
+        assert_eq!(records.len(), 3);
+        assert!(matches!(records[0].event, TraceEvent::Started { .. }));
+        assert!(matches!(
+            &records[2].event,
+            TraceEvent::Transition { to, .. } if to == &vec!["fulfilled".to_owned()]
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_subscriber_on_another_thread_receives_every_transition() {
+        let src = r#"
+S = state_space("counting", "done")
+
+def bump(ctx: dict, event: dict) -> dict:
+    next_ctx = dict(ctx)
+    next_ctx["n"] = ctx["n"] + 1
+    return next_ctx
+
+chart = machine(
+    id = "burst",
+    initial = S.counting,
+    context = {"n": 0},
+    states = {
+        S.counting: state(
+            on = [
+                internal_transition(event = "TICK", assign = bump),
+                transition(event = "FINISH", target = S.done),
+            ],
+        ),
+        S.done: final_state(),
+    },
+)
+"#;
+        const TICKS: usize = 200;
+        let chart = compile_starlark_str("burst.star", src, None).expect("compile");
+        let actor = StarchartActor::spawn(&chart, HostCallbacks::new()).expect("spawn");
+        let mut rx = actor.subscribe_traces();
+
+        // Deliberately slow consumer on a plain OS thread.
+        let consumer = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            while let Some(record) = rx.blocking_recv() {
+                std::thread::sleep(std::time::Duration::from_micros(300));
+                seen.push(record);
+            }
+            seen
+        });
+
+        for _ in 0..TICKS {
+            actor.send("TICK").await.expect("TICK");
+        }
+        actor.send("FINISH").await.expect("FINISH");
+        actor.wait_done().await.expect("done");
+        actor.stop().await;
+        actor.trace_hub().close();
+
+        let seen = tokio::task::spawn_blocking(move || consumer.join().expect("consumer thread"))
+            .await
+            .expect("join");
+        assert_contiguous(&seen);
+
+        let transitions: Vec<_> = seen
+            .iter()
+            .filter_map(|r| match &r.event {
+                TraceEvent::Transition { event, context, .. } => {
+                    Some((event.event_type.clone(), context["n"].clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(transitions.len(), TICKS + 1, "every transition must arrive");
+        for (i, (ty, n)) in transitions.iter().take(TICKS).enumerate() {
+            assert_eq!(ty, "TICK");
+            assert_eq!(n, &json!(i + 1), "context snapshot per step");
+        }
+        assert_eq!(transitions[TICKS].0, "FINISH");
+    }
+
+    #[tokio::test]
+    async fn exec_service_streams_stdout_and_stderr_progress_with_lifecycle() {
+        let src = r#"
+load("@starchart/exec", "invoke_cmd")
+
+S = state_space("building", "ok", "failed")
+
+chart = machine(
+    id = "build",
+    initial = S.building,
+    states = {
+        S.building: state(
+            invoke = invoke_cmd(
+                id = "compile",
+                cmd = ["sh", "-c", "echo one; echo two >&2; echo three"],
+                on_done = S.ok,
+                on_error = S.failed,
+            ),
+        ),
+        S.ok: final_state(),
+        S.failed: final_state(),
+    },
+)
+"#;
+        let chart = compile_starlark_str("build.star", src, None).expect("compile");
+        let actor = StarchartActor::spawn_with_builtins(&chart).expect("spawn");
+        actor.wait_done().await.expect("done");
+        assert!(actor.is_in("ok"));
+        actor.stop().await;
+
+        let records = actor.trace_hub().history();
+        assert_contiguous(&records);
+
+        let started = records
+            .iter()
+            .find_map(|r| match &r.event {
+                TraceEvent::ServiceStarted { invoke_id, state, input, .. } => {
+                    Some((invoke_id.clone(), state.clone(), input.clone()))
+                }
+                _ => None,
+            })
+            .expect("service_started");
+        assert_eq!(started.0, "compile");
+        assert_eq!(started.1, "building");
+        assert_eq!(started.2["cmd"][0], json!("sh"), "unwrapped input: {}", started.2);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        for r in &records {
+            if let TraceEvent::ServiceProgress { invoke_id, stream, chunk, .. } = &r.event {
+                assert_eq!(invoke_id, "compile");
+                match stream {
+                    ProgressKind::Stdout => stdout.push(chunk.clone()),
+                    ProgressKind::Stderr => stderr.push(chunk.clone()),
+                    other => panic!("unexpected stream {other:?}"),
+                }
+            }
+        }
+        assert_eq!(stdout, vec!["one", "three"]);
+        assert_eq!(stderr, vec!["two"]);
+
+        let finished = records
+            .iter()
+            .find_map(|r| match &r.event {
+                TraceEvent::ServiceFinished { ok, output, .. } => Some((*ok, output.clone())),
+                _ => None,
+            })
+            .expect("service_finished");
+        assert!(finished.0);
+        assert_eq!(finished.1.expect("output")["stdout"], json!("one\nthree\n"));
+
+        // The completion transition follows the service's progress.
+        let finish_seq = records
+            .iter()
+            .find(|r| matches!(r.event, TraceEvent::ServiceFinished { .. }))
+            .map(|r| r.seq)
+            .expect("finish seq");
+        let done_transition = records
+            .iter()
+            .find(|r| matches!(&r.event, TraceEvent::Transition { to, .. } if to == &vec!["ok".to_owned()]))
+            .expect("transition to ok");
+        assert!(done_transition.seq > finish_seq);
+    }
+
+    #[tokio::test]
+    async fn custom_async_service_can_report_progress_and_failures_are_traced() {
+        let src = r#"
+S = state_space("working", "ok", "failed")
+chart = machine(
+    id = "custom",
+    initial = S.working,
+    states = {
+        S.working: state(
+            invoke = invoke(src = "JOB", input = {"n": 2}, on_done = S.ok, on_error = S.failed),
+        ),
+        S.ok: final_state(),
+        S.failed: final_state(),
+    },
+)
+"#;
+        let chart = compile_starlark_str("custom.star", src, None).expect("compile");
+        let callbacks = HostCallbacks::new().on_async_service("JOB", |_ctx, input| async move {
+            for i in 0..input["n"].as_u64().unwrap_or(0) {
+                report_progress(ProgressKind::Log, format!("step {i}"));
+            }
+            anyhow::bail!("job exploded")
+        });
+        let actor = StarchartActor::spawn(&chart, callbacks).expect("spawn");
+        actor.wait_done().await.expect("done");
+        assert!(actor.is_in("failed"));
+        actor.stop().await;
+
+        let records = actor.trace_hub().history();
+        let progress: Vec<_> = records
+            .iter()
+            .filter_map(|r| match &r.event {
+                TraceEvent::ServiceProgress { invoke_id, state, chunk, .. } => {
+                    Some((invoke_id.clone(), state.clone(), chunk.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        // Unnamed invokes are identified by their owning state.
+        assert_eq!(
+            progress,
+            vec![
+                ("working".to_owned(), "working".to_owned(), "step 0".to_owned()),
+                ("working".to_owned(), "working".to_owned(), "step 1".to_owned()),
+            ]
+        );
+        let failure = records
+            .iter()
+            .find_map(|r| match &r.event {
+                TraceEvent::ServiceFinished { ok: false, error, .. } => error.clone(),
+                _ => None,
+            })
+            .expect("failed service_finished");
+        assert!(failure.contains("job exploded"), "{failure}");
+        assert!(matches!(records.last().map(|r| &r.event), Some(TraceEvent::Stopped { .. })));
     }
 }

@@ -5,8 +5,10 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde_json::{Value, json};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+
+use crate::trace::{ProgressKind, progress_enabled, report_progress};
 
 /// Executes an `ExecSpec` (or `list[str]`) command specification from `@starchart/exec`.
 /// Uses `kill_on_drop(true)` so exiting the owning state immediately terminates the child process.
@@ -76,16 +78,32 @@ pub async fn execute_command(_ctx: Value, input: Value) -> anyhow::Result<Value>
         drop(child_stdin);
     }
 
-    let output = tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
-        .await
-        .map_err(|_| anyhow::anyhow!("command `{program}` timed out after {timeout_ms}ms"))?
-        .with_context(|| format!("failed waiting on command `{program}`"))?;
+    let stdout_pipe = child.stdout.take().context("child stdout not piped")?;
+    let stderr_pipe = child.stderr.take().context("child stderr not piped")?;
 
-    let code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    // Read both pipes line by line (forwarding each line as trace progress) while waiting
+    // for exit. Everything runs in this future, so cancelling the invoke drops the child
+    // (`kill_on_drop`) and the readers together.
+    let run = async {
+        let (stdout_bytes, stderr_bytes, status) = tokio::try_join!(
+            read_streamed(stdout_pipe, ProgressKind::Stdout),
+            read_streamed(stderr_pipe, ProgressKind::Stderr),
+            child.wait(),
+        )?;
+        Ok::<_, std::io::Error>((stdout_bytes, stderr_bytes, status))
+    };
 
-    if check && !output.status.success() {
+    let (stdout_bytes, stderr_bytes, status) =
+        tokio::time::timeout(Duration::from_millis(timeout_ms), run)
+            .await
+            .map_err(|_| anyhow::anyhow!("command `{program}` timed out after {timeout_ms}ms"))?
+            .with_context(|| format!("failed waiting on command `{program}`"))?;
+
+    let code = status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+
+    if check && !status.success() {
         let detail = if !stderr.trim().is_empty() {
             stderr.trim()
         } else {
@@ -110,4 +128,27 @@ fn parse_string_list(arr: &[Value]) -> anyhow::Result<Vec<String>> {
         out.push(s.to_owned());
     }
     Ok(out)
+}
+
+/// Reads `pipe` to EOF, returning all bytes and reporting each line as `stream` progress.
+async fn read_streamed<R: AsyncRead + Unpin>(
+    pipe: R,
+    stream: ProgressKind,
+) -> std::io::Result<Vec<u8>> {
+    let mut reader = BufReader::new(pipe);
+    let mut all = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line).await?;
+        if n == 0 {
+            break;
+        }
+        all.extend_from_slice(&line);
+        if progress_enabled() {
+            let text = String::from_utf8_lossy(&line);
+            report_progress(stream, text.trim_end_matches(['\n', '\r']));
+        }
+    }
+    Ok(all)
 }

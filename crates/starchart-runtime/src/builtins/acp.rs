@@ -19,6 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use xstate_statemachine::core::Status;
 
+use crate::trace::{ProgressKind, progress_enabled, report_progress};
 use crate::{HostCallbacks, StarchartActor};
 
 /// Executes a single ACP prompt turn against a configured `AcpAgent` subprocess over `stdio`.
@@ -72,31 +73,40 @@ pub async fn execute_acp_turn(_ctx: Value, input: Value) -> anyhow::Result<Value
     let config_map = agent.get("config").and_then(Value::as_object);
 
     match protocol {
-        "CLAUDE_CLI" => {
-            return execute_claude_cli_turn(
-                command_prog,
-                &args,
-                &canonical_cwd,
-                model,
-                env_map,
-                config_map,
-                timeout_ms,
-                prompt_text,
-            )
-            .await;
-        }
-        "CODEX_CLI" => {
-            return execute_codex_cli_turn(
-                command_prog,
-                &args,
-                &canonical_cwd,
-                model,
-                env_map,
-                config_map,
-                timeout_ms,
-                prompt_text,
-            )
-            .await;
+        "CLAUDE_CLI" | "CODEX_CLI" => {
+            // These CLIs return the whole answer at the end, so report it as one chunk.
+            report_progress(ProgressKind::Log, format!("running {command_prog} ({protocol})"));
+            let result = if protocol == "CLAUDE_CLI" {
+                execute_claude_cli_turn(
+                    command_prog,
+                    &args,
+                    &canonical_cwd,
+                    model,
+                    env_map,
+                    config_map,
+                    timeout_ms,
+                    prompt_text,
+                )
+                .await
+            } else {
+                execute_codex_cli_turn(
+                    command_prog,
+                    &args,
+                    &canonical_cwd,
+                    model,
+                    env_map,
+                    config_map,
+                    timeout_ms,
+                    prompt_text,
+                )
+                .await
+            }?;
+            if let Some(text) = result.get("text").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                report_progress(ProgressKind::AgentText, text);
+            }
+            return Ok(result);
         }
         _ => {}
     }
@@ -583,6 +593,7 @@ async fn await_rpc_response<W: AsyncWrite + Unpin>(
                 && let Some(update) = params.get("update")
             {
                 extract_chunk_text(update, accumulated_text);
+                report_acp_update(update);
                 updates.push(update.clone());
             }
             continue;
@@ -606,6 +617,69 @@ async fn await_rpc_response<W: AsyncWrite + Unpin>(
     }
 
     bail!("ACP agent closed stdout before responding to request id {expected_id}")
+}
+
+/// Forwards one ACP `session/update` as trace progress (agent text, thoughts, tool calls, plans).
+fn report_acp_update(update: &Value) {
+    if !progress_enabled() {
+        return;
+    }
+    let kind = update
+        .get("sessionUpdate")
+        .or_else(|| update.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let content_text = || {
+        update
+            .get("content")
+            .and_then(|c| c.get("text"))
+            .or_else(|| update.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    match kind {
+        "agent_message_chunk" | "message_chunk" | "" => {
+            if let Some(t) = content_text() {
+                report_progress(ProgressKind::AgentText, t);
+            }
+        }
+        "agent_thought_chunk" => {
+            if let Some(t) = content_text() {
+                report_progress(ProgressKind::AgentThought, t);
+            }
+        }
+        "tool_call" | "tool_call_update" => {
+            let title = update.get("title").and_then(Value::as_str).unwrap_or("");
+            let status = update.get("status").and_then(Value::as_str).unwrap_or("");
+            let id = update.get("toolCallId").and_then(Value::as_str).unwrap_or("");
+            let label = if title.is_empty() { id } else { title };
+            let chunk = if status.is_empty() {
+                label.to_owned()
+            } else {
+                format!("{label} [{status}]")
+            };
+            report_progress(ProgressKind::ToolCall, chunk);
+        }
+        "plan" => {
+            let entries = update
+                .get("entries")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|e| {
+                            let content = e.get("content").and_then(Value::as_str)?;
+                            let status = e.get("status").and_then(Value::as_str).unwrap_or("");
+                            Some(format!("- [{status}] {content}"))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            report_progress(ProgressKind::Plan, entries);
+        }
+        _ => {}
+    }
 }
 
 fn extract_chunk_text(update: &Value, out: &mut String) {

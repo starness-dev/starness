@@ -7,6 +7,8 @@ use anyhow::{Context, bail};
 use reqwest::{Client, Method};
 use serde_json::{Map, Value, json};
 
+use crate::trace::{ProgressKind, report_progress};
+
 fn shared_http_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -61,6 +63,8 @@ pub async fn execute_http_request(_ctx: Value, input: Value) -> anyhow::Result<V
         req = req.body(b.to_owned());
     }
 
+    report_progress(ProgressKind::Http, format!("{method_str} {url}"));
+
     let response = req
         .send()
         .await
@@ -80,6 +84,11 @@ pub async fn execute_http_request(_ctx: Value, input: Value) -> anyhow::Result<V
         .bytes()
         .await
         .context("failed reading HTTP response body")?;
+
+    report_progress(
+        ProgressKind::Http,
+        format!("{method_str} {url} -> {status} ({} bytes)", bytes.len()),
+    );
 
     let body_val = if bytes.is_empty() {
         Value::Null
