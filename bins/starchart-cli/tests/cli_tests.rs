@@ -353,3 +353,140 @@ chart = machine(
     assert!(kinds.contains(&"service_finished"));
     assert_eq!(kinds.last(), Some(&"stopped"), "{trace}");
 }
+
+#[test]
+fn run_acp_turn_uses_native_starchart_mcp_bridge_and_streams_artifact_traces() {
+    let dir = std::env::temp_dir().join(format!(
+        "starchart_cli_mcp_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let agent_py = dir.join("mock_agent.py");
+    let chart_path = dir.join("workflow.star");
+
+    std::fs::write(
+        &agent_py,
+        r#"import json, os, subprocess, sys
+
+def send_acp(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def mcp_rpc(proc, req_id, method, params=None):
+    msg = {"jsonrpc": "2.0", "id": req_id, "method": method}
+    if params is not None:
+        msg["params"] = params
+    proc.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
+    proc.stdin.flush()
+    return json.loads(proc.stdout.readline().decode("utf-8"))
+
+mcp_proc = None
+for raw in sys.stdin:
+    req = json.loads(raw)
+    m, rid = req.get("method"), req.get("id")
+    if m == "initialize":
+        send_acp({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1, "agentCapabilities": {}}})
+    elif m == "session/new":
+        srv = req["params"]["mcpServers"][0]
+        # Verify the CLI passed its own native `starchart mcp-bridge` binary!
+        assert os.path.basename(srv["command"]).startswith("starchart"), f"expected native starchart binary, got {srv}"
+        assert srv["args"][0] == "mcp-bridge", f"unexpected args: {srv}"
+        mcp_proc = subprocess.Popen([srv["command"]] + srv["args"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        mcp_rpc(mcp_proc, 1, "initialize", {"protocolVersion": "2024-11-05"})
+        send_acp({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": "cli-sess-1"}})
+    elif m == "session/prompt":
+        res = mcp_rpc(mcp_proc, 2, "tools/call", {
+            "name": "submit_plan",
+            "arguments": {"summary": "Native bridge plan", "steps": ["step A", "step B"]}
+        })
+        assert res["result"]["isError"] is False, res
+        mcp_proc.stdin.close()
+        mcp_proc.wait(timeout=5)
+        send_acp({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+        break
+"#,
+    )
+    .expect("write mock_agent.py");
+
+    let chart_src = format!(
+        r#"
+load("@starchart/acp", "acp_agent", "artifact_tool", "invoke_agent")
+
+Ctx = record(summary = str)
+Plan = record(summary = str, steps = list[str])
+
+def save_plan(ctx: Ctx, event: dict) -> Ctx:
+    plan = event["output"]["artifacts"]["submit_plan"]
+    return Ctx(summary = plan["summary"])
+
+planner = acp_agent(
+    id = "planner",
+    command = "python3",
+    args = ["-u", {agent_path}],
+)
+
+S = state_space("planning", "done", "failed")
+
+chart = machine(
+    id = "cli_mcp_workflow",
+    initial = S.planning,
+    context = Ctx(summary = ""),
+    states = {{
+        S.planning: state(
+            invoke = invoke_agent(
+                agent = planner,
+                prompt = "Make plan",
+                tools = [
+                    artifact_tool("submit_plan", schema = Plan, description = "Submit plan"),
+                ],
+                on_done = outcome(target = S.done, assign = save_plan),
+                on_error = S.failed,
+            ),
+        ),
+        S.done: final_state(),
+        S.failed: final_state(),
+    }},
+)
+"#,
+        agent_path = serde_json::to_string(&agent_py.to_string_lossy()).unwrap(),
+    );
+    std::fs::write(&chart_path, chart_src).expect("write workflow.star");
+
+    let output = Command::new(bin_path())
+        .arg("run")
+        .arg(&chart_path)
+        .arg("--trace")
+        .arg("-")
+        .output()
+        .expect("run starchart run --trace -");
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let records = parse_jsonl(&stdout);
+    let artifact_progress = records
+        .iter()
+        .find(|r| r["kind"] == "service_progress" && r["stream"] == "artifact")
+        .expect("expected `artifact` service_progress record in JSONL trace");
+    let chunk: serde_json::Value =
+        serde_json::from_str(artifact_progress["chunk"].as_str().unwrap()).unwrap();
+    assert_eq!(chunk["tool"], "submit_plan");
+    assert_eq!(chunk["artifact"]["summary"], "Native bridge plan");
+
+    let final_transition = records
+        .iter()
+        .rfind(|r| r["kind"] == "transition")
+        .expect("final transition");
+    assert_eq!(final_transition["to"], serde_json::json!(["done"]));
+    assert_eq!(
+        final_transition["context"]["summary"],
+        serde_json::json!("Native bridge plan")
+    );
+}

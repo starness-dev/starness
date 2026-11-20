@@ -101,6 +101,16 @@ enum Commands {
 
     /// Start the Starlark Language Server Protocol (LSP) server over stdio.
     Lsp,
+
+    /// Internal stdio <-> localhost TCP bridge for turn-scoped MCP tools.
+    #[command(name = "mcp-bridge", hide = true)]
+    McpBridge {
+        #[arg(long)]
+        addr: String,
+
+        #[arg(long)]
+        token: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -125,6 +135,27 @@ fn main() -> ExitCode {
         ),
         Commands::Acp { file, export } => run_acp_server(&file, &export),
         Commands::Lsp => run_lsp(),
+        Commands::McpBridge { addr, token } => run_mcp_bridge(&addr, &token),
+    }
+}
+
+fn run_mcp_bridge(addr: &str, token: &str) -> ExitCode {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("error: failed to initialize Tokio runtime for mcp-bridge: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match rt.block_on(starchart_runtime::builtins::mcp::run_stdio_bridge(addr, token)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: mcp-bridge failed: {err:#}");
+            ExitCode::FAILURE
+        }
     }
 }
 

@@ -13,7 +13,7 @@ Typed Starlark Harel statechart engine in Rust, backed by `xstate-statemachine` 
 
 - `load("@starchart/http", "HttpMethod", "HttpRequest", "http_request", "invoke_http")` — Async HTTP/TLS requests via `reqwest` (`rustls`).
 - `load("@starchart/exec", "ExecSpec", "exec_spec", "invoke_cmd")` — Async subprocess execution with automatic cancellation (`kill_on_drop`) on state exit.
-- `load("@starchart/acp", "AcpAgent", "acp_agent", "invoke_agent")` — Drives ACP v1 coding agents (`agy acp`, `opencode acp`, `claude-agent-acp`, `codex-acp`, or nested `starchart acp` workflows) over `stdio`.
+- `load("@starchart/acp", "AcpAgent", "ArtifactMode", "acp_agent", "artifact_tool", "invoke_agent", "read_tool")` — Drives ACP v1, Claude Code, and Codex coding agents over `stdio`, with turn-scoped MCP `read_tool`s and Starlark `record`-validated `artifact_tool`s (`submit_plan`, `submit_review`, etc.).
 
 ## Quick Start
 

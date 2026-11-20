@@ -1,187 +1,313 @@
-# Multi-agent orchestration across Antigravity (`agy`), Claude Code (`claude`), and Codex (`codex`)!
-# - `planning`:   `agy acp` produces a concise architecture plan
-# - `reviewing`:  `parallel_state` fans out concurrently to `claude` AND `codex` to review the plan!
-# - `testing`:    `cargo check` verifies the workspace compiles cleanly (loops back on failure)
+# Multi-agent plan -> parallel review -> implementation -> test workflow.
+#
+# Harness bindings (`planner`, `agent1`, `agent2`, `implementer`) are declared once at the top
+# so you can swap any slot between `agy_agent`, `claude_agent`, `codex_agent`, or `acp_agent`
+# without renaming states, context fields, or reducers.
 
-load("@starchart/agents", "agy_agent", "claude_agent", "codex_agent", "invoke_agent")
+load(
+    "@starchart/agents",
+    "ArtifactMode",
+    "agy_agent",
+    "artifact",
+    "artifact_list",
+    "artifact_tool",
+    "claude_agent",
+    "codex_agent",
+    "invoke_agent",
+)
 load("@starchart/exec", "invoke_cmd")
+
+PlanArtifact = record(
+    markdown = str,
+    files_to_modify = field(list[str], []),
+    reference_files = field(list[str], []),
+)
+
+ReviewVerdict = record(
+    approved = bool,
+    notes = str,
+)
+
+Finding = record(
+    severity = str,
+    file = field(str, ""),
+    message = str,
+)
+
+ImplementationReport = record(
+    summary = str,
+    files_changed = list[str],
+)
 
 PipelineCtx = record(
     task = str,
-    plan = str,
-    claude_notes = str,
-    codex_notes = str,
-    test_errors = str,
-    last_error = str,
-    attempts = int,
-    max_attempts = int,
+    plan = field(PlanArtifact | None, None),
+    agent1_review = field(ReviewVerdict | None, None),
+    agent2_review = field(ReviewVerdict | None, None),
+    agent2_findings = field(list[Finding], []),
+    implementation = field(ImplementationReport | None, None),
+    test_errors = field(str, ""),
+    last_error = field(str, ""),
+    plan_revisions = field(int, 0),
+    max_plan_revisions = field(int, 2),
+    impl_attempts = field(int, 0),
+    max_impl_attempts = field(int, 2),
 )
 
 S = state_space(
     "planning",
     "reviewing",
-    "claude_branch",
-    "claude_review",
-    "claude_done",
-    "codex_branch",
-    "codex_review",
-    "codex_done",
+    "agent1_branch",
+    "agent1_review",
+    "agent1_done",
+    "agent2_branch",
+    "agent2_review",
+    "agent2_done",
+    "implementing",
     "testing",
     "done",
     "escalated",
 )
 
+# --- Agent harness bindings (swap any slot here without touching the chart below) ---
+
 planner = agy_agent(
-    id = "agy_planner",
-    model = "gemini-3.8-flash-medium",
+    id = "planner",
 )
 
-claude = claude_agent(
-    id = "claude_reviewer",
+agent1 = claude_agent(
+    id = "agent1_reviewer",
     permission_mode = "plan",
 )
 
-codex = codex_agent(
-    id = "codex_auditor",
+agent2 = codex_agent(
+    id = "agent2_reviewer",
     sandbox = "read-only",
 )
 
+implementer = agy_agent(
+    id = "implementer",
+    args = ["acp", "--dangerously-skip-permissions"],
+)
+
+# --- State context selectors (pushed directly into each agent's turn) ---
+
+def planning_context(ctx: PipelineCtx) -> dict:
+    return {
+        "task": ctx.task,
+        "plan_revision": ctx.plan_revisions,
+        "previous_plan": ctx.plan,
+        "agent1_review": ctx.agent1_review,
+        "agent2_review": ctx.agent2_review,
+        "agent2_findings": ctx.agent2_findings,
+    }
+
+def implementation_context(ctx: PipelineCtx) -> dict:
+    return {
+        "task": ctx.task,
+        "approved_plan": ctx.plan,
+        "agent1_review": ctx.agent1_review,
+        "agent2_review": ctx.agent2_review,
+        "agent2_findings": ctx.agent2_findings,
+        "impl_attempt": ctx.impl_attempts,
+        "test_errors": ctx.test_errors,
+    }
+
+# --- Prompts ---
+
 def build_plan_prompt(ctx: PipelineCtx) -> str:
-    return "Reply in 3 short bullet points summarizing an approach for: " + ctx.task + " (do not edit files)."
+    if ctx.plan_revisions == 0:
+        return "Write a Markdown implementation plan for the task in `<context>` (do not edit files) and call `submit_plan`."
+    return "Your previous plan was rejected. Address `agent1_review`, `agent2_review`, and `agent2_findings` from `<context>` (do not edit files) and call `submit_plan`."
+
+def build_implement_prompt(ctx: PipelineCtx) -> str:
+    if ctx.impl_attempts == 0:
+        return "Implement `approved_plan` from `<context>` in the workspace (do not run `cargo test` yourself; the `testing` state runs it next), then call `submit_implementation`."
+    return "Tests failed on the previous attempt. Fix `test_errors` from `<context>` in the workspace (do not run `cargo test` yourself; the `testing` state runs it next), then call `submit_implementation`."
+
+# --- Guards & `update(ctx, ...)` reducers ---
+
+def all_reviews_approved(ctx: PipelineCtx, event: dict) -> bool:
+    return (
+        ctx.agent1_review != None
+        and ctx.agent1_review.approved
+        and ctx.agent2_review != None
+        and ctx.agent2_review.approved
+    )
 
 def save_plan(ctx: PipelineCtx, event: dict) -> PipelineCtx:
-    return PipelineCtx(
-        task = ctx.task,
-        plan = str(event.get("output", {}).get("text", "")),
-        claude_notes = ctx.claude_notes,
-        codex_notes = ctx.codex_notes,
-        test_errors = ctx.test_errors,
+    return update(
+        ctx,
+        plan = artifact(event, "submit_plan", PlanArtifact),
+        agent1_review = None,
+        agent2_review = None,
+        agent2_findings = [],
         last_error = "",
-        attempts = ctx.attempts,
-        max_attempts = ctx.max_attempts,
     )
 
-def build_claude_prompt(ctx: PipelineCtx) -> str:
-    return "In 2 concise sentences, review the ergonomics of this plan (do not edit files):\n" + ctx.plan
-
-def save_claude_notes(ctx: PipelineCtx, event: dict) -> PipelineCtx:
-    return PipelineCtx(
-        task = ctx.task,
-        plan = ctx.plan,
-        claude_notes = str(event.get("output", {}).get("text", "")),
-        codex_notes = ctx.codex_notes,
-        test_errors = ctx.test_errors,
-        last_error = ctx.last_error,
-        attempts = ctx.attempts,
-        max_attempts = ctx.max_attempts,
+def save_agent2_review(ctx: PipelineCtx, event: dict) -> PipelineCtx:
+    return update(
+        ctx,
+        agent2_review = artifact(event, "submit_review", ReviewVerdict),
+        agent2_findings = artifact_list(event, "report_finding", Finding),
     )
 
-def build_codex_prompt(ctx: PipelineCtx) -> str:
-    return "In 2 concise sentences, check edge cases in this plan (do not edit files):\n" + ctx.plan
-
-def save_codex_notes(ctx: PipelineCtx, event: dict) -> PipelineCtx:
-    return PipelineCtx(
-        task = ctx.task,
-        plan = ctx.plan,
-        claude_notes = ctx.claude_notes,
-        codex_notes = str(event.get("output", {}).get("text", "")),
-        test_errors = ctx.test_errors,
-        last_error = ctx.last_error,
-        attempts = ctx.attempts,
-        max_attempts = ctx.max_attempts,
+def bump_plan_revision(ctx: PipelineCtx, event: dict) -> PipelineCtx:
+    return update(
+        ctx,
+        last_error = "plan rejected by reviewers",
+        plan_revisions = ctx.plan_revisions + 1,
     )
 
-def can_retry(ctx: PipelineCtx, event: dict) -> bool:
-    return ctx.attempts < ctx.max_attempts
+def save_implementation(ctx: PipelineCtx, event: dict) -> PipelineCtx:
+    return update(
+        ctx,
+        implementation = artifact(event, "submit_implementation", ImplementationReport),
+        test_errors = "",
+        last_error = "",
+    )
 
 def record_test_failure(ctx: PipelineCtx, event: dict) -> PipelineCtx:
-    err = str(event.get("error", "check failure"))
-    return PipelineCtx(
-        task = ctx.task,
-        plan = ctx.plan,
-        claude_notes = ctx.claude_notes,
-        codex_notes = ctx.codex_notes,
+    err = str(event.get("error", "test suite failed"))
+    return update(
+        ctx,
         test_errors = err,
         last_error = err,
-        attempts = ctx.attempts + 1,
-        max_attempts = ctx.max_attempts,
+        impl_attempts = ctx.impl_attempts + 1,
     )
 
 def record_escalation_error(ctx: PipelineCtx, event: dict) -> PipelineCtx:
-    return PipelineCtx(
-        task = ctx.task,
-        plan = ctx.plan,
-        claude_notes = ctx.claude_notes,
-        codex_notes = ctx.codex_notes,
-        test_errors = ctx.test_errors,
-        last_error = str(event.get("error", "agent invocation failed")),
-        attempts = ctx.attempts,
-        max_attempts = ctx.max_attempts,
-    )
+    return update(ctx, last_error = str(event.get("error", "workflow escalated")))
 
 chart: StateMachine = machine(
     id = "multi_agent_acp",
-    description = "Antigravity + Claude Code + Codex parallel review & verification pipeline",
+    description = "Plan, parallel dual-agent review, implementation & test pipeline",
     initial = S.planning,
     context = PipelineCtx(
         task = "Typed Starlark statechart workflows across AI coding agents",
-        plan = "",
-        claude_notes = "",
-        codex_notes = "",
-        test_errors = "",
-        last_error = "",
-        attempts = 0,
-        max_attempts = 2,
     ),
     states = {
         S.planning: state(
             invoke = invoke_agent(
                 agent = planner,
+                context = planning_context,
                 prompt = build_plan_prompt,
+                tools = [
+                    artifact_tool(
+                        "submit_plan",
+                        description = "Submit the Markdown implementation plan and file lists.",
+                        schema = PlanArtifact,
+                        mode = ArtifactMode.replace,
+                        required = True,
+                        validate = lambda _ctx, plan: "`markdown` must not be empty" if plan.markdown.strip() == "" else None,
+                    ),
+                ],
                 on_done = outcome(target = S.reviewing, assign = save_plan),
                 on_error = outcome(target = S.escalated, assign = record_escalation_error),
             ),
         ),
-        # Orthogonal parallel fan-out: Claude Code AND Codex review the plan simultaneously!
+        # Orthogonal parallel fan-out: both reviewers finish, then `on_done` joins both verdicts.
         S.reviewing: parallel_state(
-            on_done = S.testing,
+            on_done = [
+                outcome(target = S.implementing, guard = all_reviews_approved),
+                outcome(
+                    target = S.planning,
+                    guard = lambda ctx, _ev: ctx.plan_revisions < ctx.max_plan_revisions,
+                    assign = bump_plan_revision,
+                ),
+                outcome(target = S.escalated, assign = record_escalation_error),
+            ],
             states = {
-                S.claude_branch: compound_state(
-                    initial = S.claude_review,
+                S.agent1_branch: compound_state(
+                    initial = S.agent1_review,
                     states = {
-                        S.claude_review: state(
+                        S.agent1_review: state(
                             invoke = invoke_agent(
-                                agent = claude,
-                                prompt = build_claude_prompt,
-                                on_done = outcome(target = S.claude_done, assign = save_claude_notes),
+                                agent = agent1,
+                                context = lambda ctx: {"task": ctx.task, "plan": ctx.plan},
+                                prompt = "Review the design & ergonomics of `plan` in `<context>` (do not edit files), then call `submit_review`.",
+                                tools = [
+                                    artifact_tool(
+                                        "submit_review",
+                                        description = "Submit review verdict and notes.",
+                                        schema = ReviewVerdict,
+                                        required = True,
+                                    ),
+                                ],
+                                on_done = outcome(
+                                    target = S.agent1_done,
+                                    assign = lambda ctx, ev: update(
+                                        ctx,
+                                        agent1_review = artifact(ev, "submit_review", ReviewVerdict),
+                                    ),
+                                ),
                                 on_error = outcome(target = S.escalated, assign = record_escalation_error),
                             ),
                         ),
-                        S.claude_done: final_state(),
+                        S.agent1_done: final_state(),
                     },
                 ),
-                S.codex_branch: compound_state(
-                    initial = S.codex_review,
+                S.agent2_branch: compound_state(
+                    initial = S.agent2_review,
                     states = {
-                        S.codex_review: state(
+                        S.agent2_review: state(
                             invoke = invoke_agent(
-                                agent = codex,
-                                prompt = build_codex_prompt,
-                                on_done = outcome(target = S.codex_done, assign = save_codex_notes),
+                                agent = agent2,
+                                context = lambda ctx: {"task": ctx.task, "plan": ctx.plan},
+                                prompt = "Audit edge cases in `plan` from `<context>` (`report_finding`), then call `submit_review`.",
+                                tools = [
+                                    artifact_tool(
+                                        "report_finding",
+                                        description = "Record an edge-case finding (may be called multiple times).",
+                                        schema = Finding,
+                                        mode = ArtifactMode.append,
+                                        required = False,
+                                    ),
+                                    artifact_tool(
+                                        "submit_review",
+                                        description = "Submit audit review verdict and notes.",
+                                        schema = ReviewVerdict,
+                                        required = True,
+                                    ),
+                                ],
+                                on_done = outcome(target = S.agent2_done, assign = save_agent2_review),
                                 on_error = outcome(target = S.escalated, assign = record_escalation_error),
                             ),
                         ),
-                        S.codex_done: final_state(),
+                        S.agent2_done: final_state(),
                     },
                 ),
             },
         ),
+        S.implementing: state(
+            invoke = invoke_agent(
+                agent = implementer,
+                context = implementation_context,
+                prompt = build_implement_prompt,
+                tools = [
+                    artifact_tool(
+                        "submit_implementation",
+                        description = "Submit summary and list of modified files once edits are complete.",
+                        schema = ImplementationReport,
+                        required = True,
+                        validate = lambda _ctx, r: "`files_changed` must not be empty" if len(r.files_changed) == 0 else None,
+                    ),
+                ],
+                on_done = outcome(target = S.testing, assign = save_implementation),
+                on_error = outcome(target = S.escalated, assign = record_escalation_error),
+            ),
+        ),
         S.testing: state(
             invoke = invoke_cmd(
-                cmd = ["cargo", "check", "--quiet", "--offline"],
+                cmd = ["cargo", "test", "--workspace", "--offline"],
+                timeout_ms = 300000,
                 on_done = S.done,
                 on_error = [
-                    outcome(target = S.planning, guard = can_retry, assign = record_test_failure),
+                    outcome(
+                        target = S.implementing,
+                        guard = lambda ctx, _ev: ctx.impl_attempts < ctx.max_impl_attempts,
+                        assign = record_test_failure,
+                    ),
                     outcome(target = S.escalated, assign = record_escalation_error),
                 ],
             ),
