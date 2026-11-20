@@ -3,6 +3,7 @@
 pub mod acp;
 pub mod exec;
 pub mod http;
+pub mod mcp;
 
 use starchart_starlark::{BUILTIN_ACP_SERVICE, BUILTIN_EXEC_SERVICE, BUILTIN_HTTP_SERVICE};
 

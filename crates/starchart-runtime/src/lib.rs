@@ -1088,19 +1088,22 @@ pub fn build_machine_logic_traced(
 ) -> MachineLogic<DynContext> {
     let mut logic = MachineLogic::dynamic();
     let record_ctor = chart.context_record_type.clone();
+    let type_registry = Arc::new(chart.type_registry.clone());
 
     for (guard_name, frozen_guard) in &chart.guards {
         let guard_fn = frozen_guard.clone();
         let rec_ctor = record_ctor.clone();
+        let reg = Arc::clone(&type_registry);
         let gname = guard_name.clone();
         logic = logic.guard(guard_name.clone(), move |ctx, event, _params| {
-            eval_starlark_guard(&gname, &guard_fn, rec_ctor.as_ref(), ctx, event)
+            eval_starlark_guard(&gname, &guard_fn, rec_ctor.as_ref(), &reg, ctx, event)
         });
     }
 
     for (reducer_name, frozen_reducer) in &chart.reducers {
         let reducer_fn = frozen_reducer.clone();
         let rec_ctor = record_ctor.clone();
+        let reg = Arc::clone(&type_registry);
         let rname = reducer_name.clone();
         logic = logic.action(
             reducer_name.clone(),
@@ -1109,6 +1112,7 @@ pub fn build_machine_logic_traced(
                     &rname,
                     &reducer_fn,
                     rec_ctor.as_ref(),
+                    &reg,
                     scope.context,
                     scope.event,
                 )?;
@@ -1155,9 +1159,10 @@ pub fn build_machine_logic_traced(
     for (delay_name, frozen_delay) in &chart.delays {
         let delay_fn = frozen_delay.clone();
         let rec_ctor = record_ctor.clone();
+        let reg = Arc::clone(&type_registry);
         let dname = delay_name.clone();
         logic = logic.delay_fn(delay_name.clone(), move |ctx, event| {
-            eval_starlark_delay(&dname, &delay_fn, rec_ctor.as_ref(), ctx, event)
+            eval_starlark_delay(&dname, &delay_fn, rec_ctor.as_ref(), &reg, ctx, event)
         });
     }
 
@@ -1175,11 +1180,13 @@ pub fn build_machine_logic_traced(
     }
 
     let input_slots = Arc::new(chart.inputs.clone());
+    let tool_slots = Arc::new(chart.tools.clone());
 
     for (service_name, service_fn) in &callbacks.sync_services {
         let service_fn = Arc::clone(service_fn);
         let sname = service_name.clone();
         let input_slots = Arc::clone(&input_slots);
+        let type_registry = Arc::clone(&type_registry);
         let rec_ctor = record_ctor.clone();
         let hub = trace.clone();
         logic = logic.service(service_name.clone(), move |ctx, raw_input| {
@@ -1195,6 +1202,7 @@ pub fn build_machine_logic_traced(
                     &user_input,
                     &input_slots,
                     rec_ctor.as_ref(),
+                    &type_registry,
                     ctx,
                 )?;
                 if let Some(scope) = &scope {
@@ -1218,28 +1226,48 @@ pub fn build_machine_logic_traced(
         let service_fn = Arc::clone(service_fn);
         let sname = service_name.clone();
         let input_slots = Arc::clone(&input_slots);
+        let tool_slots = Arc::clone(&tool_slots);
+        let type_registry = Arc::clone(&type_registry);
         let rec_ctor = record_ctor.clone();
         let hub = trace.clone();
         logic = logic.async_service(service_name.clone(), move |ctx, raw_input| {
             let (meta, user_input) = trace::split_invoke_envelope(&raw_input, &sname);
-            let resolved =
-                resolve_dynamic_service_input(&sname, &user_input, &input_slots, rec_ctor.as_ref(), &ctx);
+            let resolved = resolve_dynamic_service_input(
+                &sname,
+                &user_input,
+                &input_slots,
+                rec_ctor.as_ref(),
+                &type_registry,
+                &ctx,
+            );
             let scope = hub
                 .as_ref()
                 .zip(meta)
                 .map(|(hub, meta)| trace::ServiceScope { hub: Arc::clone(hub), meta });
+            let tool_scope = (!tool_slots.is_empty()).then(|| builtins::mcp::ToolRuntimeScope {
+                tools: Arc::clone(&tool_slots),
+                type_registry: Arc::clone(&type_registry),
+                context_record_type: rec_ctor.clone(),
+                ctx_snapshot: ctx.clone(),
+            });
             let service_fn = Arc::clone(&service_fn);
             let sname = sname.clone();
             Box::pin(async move {
                 let resolved_input = resolved?;
                 let started = std::time::Instant::now();
-                let fut = service_fn(ctx, resolved_input.clone());
+                let inner_fut = service_fn(ctx, resolved_input.clone());
+                let scoped_fut = async move {
+                    match tool_scope {
+                        Some(ts) => builtins::mcp::with_tool_runtime_scope(ts, inner_fut).await,
+                        None => inner_fut.await,
+                    }
+                };
                 let result = match &scope {
                     Some(scope) => {
                         scope.started(&resolved_input);
-                        trace::with_async_scope(scope.clone(), fut).await
+                        trace::with_async_scope(scope.clone(), scoped_fut).await
                     }
-                    None => fut.await,
+                    None => scoped_fut.await,
                 }
                 .map_err(|e| XStateError::Logic(format!("service `{sname}`: {e:#}")));
                 if let Some(scope) = &scope {
@@ -1304,29 +1332,32 @@ fn eval_starlark_guard(
     guard_name: &str,
     guard_fn: &OwnedFrozenValue,
     record_ctor: Option<&OwnedFrozenValue>,
+    type_registry: &starchart_starlark::TypeRegistry,
     ctx: &Value,
     event: &Event,
 ) -> Result<bool, XStateError> {
-    Module::with_temp_heap(|module| {
-        let ctx_val = alloc_context_on_heap(&module, record_ctor, ctx)
-            .map_err(|e| XStateError::Logic(format!("guard `{guard_name}`: {e}")))?;
-        let event_json = event_to_starlark_json(event);
-        let event_val = json_to_starlark_value(&event_json, module.heap());
+    starchart_starlark::with_active_type_registry(type_registry, || {
+        Module::with_temp_heap(|module| {
+            let ctx_val = alloc_context_on_heap(&module, record_ctor, Some(type_registry), ctx)
+                .map_err(|e| XStateError::Logic(format!("guard `{guard_name}`: {e}")))?;
+            let event_json = event_to_starlark_json(event);
+            let event_val = json_to_starlark_value(&event_json, module.heap());
 
-        // SAFETY: `module.frozen_heap()` retains a reference to `guard_fn.owner()` for `'v`.
-        let callable_val =
-            unsafe { guard_fn.owned_frozen_value(module.frozen_heap()) }.to_value();
+            // SAFETY: `module.frozen_heap()` retains a reference to `guard_fn.owner()` for `'v`.
+            let callable_val =
+                unsafe { guard_fn.owned_frozen_value(module.frozen_heap()) }.to_value();
 
-        let mut eval = Evaluator::new(&module);
-        let result = eval
-            .eval_function(callable_val, &[ctx_val, event_val], &[])
-            .map_err(|e| XStateError::Logic(format!("guard `{guard_name}`: {e:#}")))?;
+            let mut eval = Evaluator::new(&module);
+            let result = eval
+                .eval_function(callable_val, &[ctx_val, event_val], &[])
+                .map_err(|e| XStateError::Logic(format!("guard `{guard_name}`: {e:#}")))?;
 
-        result.unpack_bool().ok_or_else(|| {
-            XStateError::Logic(format!(
-                "guard `{guard_name}` returned `{}`, expected `bool`",
-                result.get_type()
-            ))
+            result.unpack_bool().ok_or_else(|| {
+                XStateError::Logic(format!(
+                    "guard `{guard_name}` returned `{}`, expected `bool`",
+                    result.get_type()
+                ))
+            })
         })
     })
 }
@@ -1335,36 +1366,39 @@ fn eval_starlark_reducer(
     reducer_name: &str,
     reducer_fn: &OwnedFrozenValue,
     record_ctor: Option<&OwnedFrozenValue>,
+    type_registry: &starchart_starlark::TypeRegistry,
     ctx: &Value,
     event: &Event,
 ) -> Result<Value, XStateError> {
-    Module::with_temp_heap(|module| {
-        let ctx_val = alloc_context_on_heap(&module, record_ctor, ctx)
-            .map_err(|e| XStateError::Logic(format!("reducer `{reducer_name}`: {e}")))?;
-        let event_json = event_to_starlark_json(event);
-        let event_val = json_to_starlark_value(&event_json, module.heap());
+    starchart_starlark::with_active_type_registry(type_registry, || {
+        Module::with_temp_heap(|module| {
+            let ctx_val = alloc_context_on_heap(&module, record_ctor, Some(type_registry), ctx)
+                .map_err(|e| XStateError::Logic(format!("reducer `{reducer_name}`: {e}")))?;
+            let event_json = event_to_starlark_json(event);
+            let event_val = json_to_starlark_value(&event_json, module.heap());
 
-        // SAFETY: `module.frozen_heap()` retains a reference to `reducer_fn.owner()` for `'v`.
-        let callable_val =
-            unsafe { reducer_fn.owned_frozen_value(module.frozen_heap()) }.to_value();
+            // SAFETY: `module.frozen_heap()` retains a reference to `reducer_fn.owner()` for `'v`.
+            let callable_val =
+                unsafe { reducer_fn.owned_frozen_value(module.frozen_heap()) }.to_value();
 
-        let mut eval = Evaluator::new(&module);
-        let result = eval
-            .eval_function(callable_val, &[ctx_val, event_val], &[])
-            .map_err(|e| XStateError::Logic(format!("reducer `{reducer_name}`: {e:#}")))?;
+            let mut eval = Evaluator::new(&module);
+            let result = eval
+                .eval_function(callable_val, &[ctx_val, event_val], &[])
+                .map_err(|e| XStateError::Logic(format!("reducer `{reducer_name}`: {e:#}")))?;
 
-        let next_json = result
-            .to_json_value()
-            .map_err(|e| XStateError::Logic(format!("reducer `{reducer_name}`: {e:#}")))?;
+            let next_json = result
+                .to_json_value()
+                .map_err(|e| XStateError::Logic(format!("reducer `{reducer_name}`: {e:#}")))?;
 
-        if !next_json.is_object() {
-            return Err(XStateError::Logic(format!(
-                "assign reducer `{reducer_name}` must return a dict or record, got `{}`",
-                result.get_type()
-            )));
-        }
+            if !next_json.is_object() {
+                return Err(XStateError::Logic(format!(
+                    "assign reducer `{reducer_name}` must return a dict or record, got `{}`",
+                    result.get_type()
+                )));
+            }
 
-        Ok(next_json)
+            Ok(next_json)
+        })
     })
 }
 
@@ -1372,39 +1406,42 @@ fn eval_starlark_delay(
     delay_name: &str,
     delay_fn: &OwnedFrozenValue,
     record_ctor: Option<&OwnedFrozenValue>,
+    type_registry: &starchart_starlark::TypeRegistry,
     ctx: &Value,
     event: &Event,
 ) -> Result<f64, XStateError> {
-    Module::with_temp_heap(|module| {
-        let ctx_val = alloc_context_on_heap(&module, record_ctor, ctx)
-            .map_err(|e| XStateError::Logic(format!("delay `{delay_name}`: {e}")))?;
-        let event_json = event_to_starlark_json(event);
-        let event_val = json_to_starlark_value(&event_json, module.heap());
+    starchart_starlark::with_active_type_registry(type_registry, || {
+        Module::with_temp_heap(|module| {
+            let ctx_val = alloc_context_on_heap(&module, record_ctor, Some(type_registry), ctx)
+                .map_err(|e| XStateError::Logic(format!("delay `{delay_name}`: {e}")))?;
+            let event_json = event_to_starlark_json(event);
+            let event_val = json_to_starlark_value(&event_json, module.heap());
 
-        // SAFETY: `module.frozen_heap()` retains a reference to `delay_fn.owner()` for `'v`.
-        let callable_val =
-            unsafe { delay_fn.owned_frozen_value(module.frozen_heap()) }.to_value();
+            // SAFETY: `module.frozen_heap()` retains a reference to `delay_fn.owner()` for `'v`.
+            let callable_val =
+                unsafe { delay_fn.owned_frozen_value(module.frozen_heap()) }.to_value();
 
-        let mut eval = Evaluator::new(&module);
-        let result = eval
-            .eval_function(callable_val, &[ctx_val, event_val], &[])
-            .map_err(|e| XStateError::Logic(format!("delay `{delay_name}`: {e:#}")))?;
+            let mut eval = Evaluator::new(&module);
+            let result = eval
+                .eval_function(callable_val, &[ctx_val, event_val], &[])
+                .map_err(|e| XStateError::Logic(format!("delay `{delay_name}`: {e:#}")))?;
 
-        let json_num = result
-            .to_json_value()
-            .map_err(|e| XStateError::Logic(format!("delay `{delay_name}`: {e:#}")))?;
-        let ms = json_num.as_f64().ok_or_else(|| {
-            XStateError::Logic(format!(
-                "delay `{delay_name}` returned `{}`, expected non-negative int/float ms",
-                result.get_type()
-            ))
-        })?;
-        if !ms.is_finite() || ms < 0.0 {
-            return Err(XStateError::Logic(format!(
-                "delay `{delay_name}` must return finite ms >= 0, got {ms}"
-            )));
-        }
-        Ok(ms)
+            let json_num = result
+                .to_json_value()
+                .map_err(|e| XStateError::Logic(format!("delay `{delay_name}`: {e:#}")))?;
+            let ms = json_num.as_f64().ok_or_else(|| {
+                XStateError::Logic(format!(
+                    "delay `{delay_name}` returned `{}`, expected non-negative int/float ms",
+                    result.get_type()
+                ))
+            })?;
+            if !ms.is_finite() || ms < 0.0 {
+                return Err(XStateError::Logic(format!(
+                    "delay `{delay_name}` must return finite ms >= 0, got {ms}"
+                )));
+            }
+            Ok(ms)
+        })
     })
 }
 
@@ -1413,6 +1450,7 @@ fn resolve_dynamic_service_input(
     raw_input: &Value,
     input_slots: &HashMap<String, OwnedFrozenValue>,
     record_ctor: Option<&OwnedFrozenValue>,
+    type_registry: &starchart_starlark::TypeRegistry,
     ctx: &Value,
 ) -> Result<Value, XStateError> {
     match raw_input {
@@ -1425,13 +1463,26 @@ fn resolve_dynamic_service_input(
                         "service `{service_name}` missing input slot `{slot_name}`"
                     ))
                 })?;
-                return eval_starlark_input_fn(service_name, slot_fn, record_ctor, ctx);
+                return eval_starlark_input_fn(
+                    service_name,
+                    slot_fn,
+                    record_ctor,
+                    type_registry,
+                    ctx,
+                );
             }
             let mut resolved_map = Map::with_capacity(map.len());
             for (k, v) in map {
                 resolved_map.insert(
                     k.clone(),
-                    resolve_dynamic_service_input(service_name, v, input_slots, record_ctor, ctx)?,
+                    resolve_dynamic_service_input(
+                        service_name,
+                        v,
+                        input_slots,
+                        record_ctor,
+                        type_registry,
+                        ctx,
+                    )?,
                 );
             }
             Ok(Value::Object(resolved_map))
@@ -1444,6 +1495,7 @@ fn resolve_dynamic_service_input(
                     item,
                     input_slots,
                     record_ctor,
+                    type_registry,
                     ctx,
                 )?);
             }
@@ -1457,33 +1509,45 @@ fn eval_starlark_input_fn(
     service_name: &str,
     input_fn: &OwnedFrozenValue,
     record_ctor: Option<&OwnedFrozenValue>,
+    type_registry: &starchart_starlark::TypeRegistry,
     ctx: &Value,
 ) -> Result<Value, XStateError> {
-    Module::with_temp_heap(|module| {
-        let ctx_val = alloc_context_on_heap(&module, record_ctor, ctx)
-            .map_err(|e| XStateError::Logic(format!("service `{service_name}` input: {e}")))?;
+    starchart_starlark::with_active_type_registry(type_registry, || {
+        Module::with_temp_heap(|module| {
+            let ctx_val = alloc_context_on_heap(&module, record_ctor, Some(type_registry), ctx)
+                .map_err(|e| XStateError::Logic(format!("service `{service_name}` input: {e}")))?;
 
-        // SAFETY: `module.frozen_heap()` retains a reference to `input_fn.owner()` for `'v`.
-        let callable_val =
-            unsafe { input_fn.owned_frozen_value(module.frozen_heap()) }.to_value();
+            // SAFETY: `module.frozen_heap()` retains a reference to `input_fn.owner()` for `'v`.
+            let callable_val =
+                unsafe { input_fn.owned_frozen_value(module.frozen_heap()) }.to_value();
 
-        let mut eval = Evaluator::new(&module);
-        let result = eval
-            .eval_function(callable_val, &[ctx_val], &[])
-            .map_err(|e| XStateError::Logic(format!("service `{service_name}` input: {e:#}")))?;
+            let mut eval = Evaluator::new(&module);
+            let result = eval
+                .eval_function(callable_val, &[ctx_val], &[])
+                .map_err(|e| XStateError::Logic(format!("service `{service_name}` input: {e:#}")))?;
 
-        result
-            .to_json_value()
-            .map_err(|e| XStateError::Logic(format!("service `{service_name}` input: {e:#}")))
+            result
+                .to_json_value()
+                .map_err(|e| XStateError::Logic(format!("service `{service_name}` input: {e:#}")))
+        })
     })
 }
 
-fn alloc_context_on_heap<'v>(
+pub(crate) fn alloc_context_on_heap<'v>(
     module: &Module<'v>,
     record_ctor: Option<&OwnedFrozenValue>,
+    type_registry: Option<&starchart_starlark::TypeRegistry>,
     ctx: &Value,
 ) -> Result<StarlarkVal<'v>, String> {
     if let (Some(ctor), Value::Object(map)) = (record_ctor, ctx) {
+        if let Some(reg) = type_registry
+            && let Ok(shape) = starchart_starlark::parse_type_expr(&ctor.value().to_string())
+        {
+            return starchart_starlark::instantiate_record_with_registry(
+                module, ctor, &shape, reg, ctx,
+            )
+            .map_err(|e| format!("{e:#}"));
+        }
         // SAFETY: `module.frozen_heap()` keeps `ctor`'s owner heap alive for `'v`.
         let ctor_val = unsafe { ctor.owned_frozen_value(module.frozen_heap()) }.to_value();
         let mut named: Vec<(&str, StarlarkVal<'v>)> = Vec::with_capacity(map.len());
@@ -2961,5 +3025,576 @@ chart = machine(
             .expect("failed service_finished");
         assert!(failure.contains("job exploded"), "{failure}");
         assert!(matches!(records.last().map(|r| &r.event), Some(TraceEvent::Stopped { .. })));
+    }
+
+    #[tokio::test]
+    async fn acp_turn_mcp_tools_read_context_repair_invalid_artifact_and_record_modes() {
+        // Mock ACP v1 agent subprocess that launches the `mcpServers[0]` stdio MCP bridge
+        // provided in `session/new`, calls `tools/list` + `tools/call` (`read_tool`, invalid
+        // `artifact_tool` -> self-repair -> `replace`, `append`, and `once`), and completes turn.
+        let mock_acp_agent_py = r#"
+import json, subprocess, sys
+
+def send_acp(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def mcp_rpc(proc, req_id, method, params=None):
+    msg = {"jsonrpc": "2.0", "id": req_id, "method": method}
+    if params is not None:
+        msg["params"] = params
+    proc.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
+    proc.stdin.flush()
+    line = proc.stdout.readline().decode("utf-8")
+    return json.loads(line)
+
+mcp_proc = None
+for raw in sys.stdin:
+    req = json.loads(raw)
+    m = req.get("method")
+    rid = req.get("id")
+    if m == "initialize":
+        send_acp({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1, "agentCapabilities": {}}})
+    elif m == "session/new":
+        servers = req["params"]["mcpServers"]
+        assert len(servers) == 1, f"expected 1 mcpServer, got {servers}"
+        srv = servers[0]
+        mcp_proc = subprocess.Popen(
+            [srv["command"]] + srv["args"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+        init_res = mcp_rpc(mcp_proc, 1, "initialize", {"protocolVersion": "2024-11-05"})
+        assert init_res["result"]["serverInfo"]["name"] == "starchart"
+        mcp_proc.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n").encode("utf-8"))
+        mcp_proc.stdin.flush()
+        send_acp({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": "sess-mcp-1"}})
+    elif m == "session/prompt":
+        tools_res = mcp_rpc(mcp_proc, 2, "tools/list")
+        names = [t["name"] for t in tools_res["result"]["tools"]]
+        assert names == ["get_failure_context", "submit_plan", "report_finding", "seal_turn"], f"tools={names}"
+
+        # 1. Call parameterized read_tool
+        read_res = mcp_rpc(mcp_proc, 3, "tools/call", {
+            "name": "get_failure_context",
+            "arguments": {"section": "tests"}
+        })
+        assert read_res["result"]["isError"] is False, read_res
+        read_payload = json.loads(read_res["result"]["content"][0]["text"])
+        assert read_payload == {"section": "tests", "errors": "assertion failed on line 42", "attempt": 1}
+
+        # 2. Call submit_plan with empty steps -> rejected by Starlark validator (`isError: true`)
+        bad_plan = mcp_rpc(mcp_proc, 4, "tools/call", {
+            "name": "submit_plan",
+            "arguments": {"summary": "Empty plan", "steps": []}
+        })
+        assert bad_plan["result"]["isError"] is True
+        assert "at least one step" in bad_plan["result"]["content"][0]["text"]
+
+        # 3. Call submit_plan with wrong field type -> rejected by Starlark Record constructor
+        bad_type = mcp_rpc(mcp_proc, 5, "tools/call", {
+            "name": "submit_plan",
+            "arguments": {"summary": "Wrong type", "steps": "not-a-list"}
+        })
+        assert bad_type["result"]["isError"] is True
+
+        # 4. Call submit_plan with valid v1, then revise with v2 (`mode = "replace"` -> v2 wins, default `risk` filled)
+        ok_v1 = mcp_rpc(mcp_proc, 6, "tools/call", {
+            "name": "submit_plan",
+            "arguments": {"summary": "Draft v1", "steps": ["step 1"]}
+        })
+        assert ok_v1["result"]["isError"] is False, ok_v1
+        ok_v2 = mcp_rpc(mcp_proc, 7, "tools/call", {
+            "name": "submit_plan",
+            "arguments": {"summary": "Final v2", "steps": ["fix line 42", "rerun cargo test"]}
+        })
+        assert ok_v2["result"]["isError"] is False, ok_v2
+
+        # 5. Call report_finding twice (`mode = "append"`)
+        f1 = mcp_rpc(mcp_proc, 8, "tools/call", {
+            "name": "report_finding",
+            "arguments": {"severity": "HIGH", "message": "off-by-one"}
+        })
+        f2 = mcp_rpc(mcp_proc, 9, "tools/call", {
+            "name": "report_finding",
+            "arguments": {"severity": "LOW", "message": "missing doc comment"}
+        })
+        assert f1["result"]["isError"] is False and f2["result"]["isError"] is False
+
+        # 6. Call seal_turn twice (`mode = "once"` -> second call rejected, first preserved)
+        s1 = mcp_rpc(mcp_proc, 10, "tools/call", {
+            "name": "seal_turn",
+            "arguments": {"signature": "sig-first"}
+        })
+        s2 = mcp_rpc(mcp_proc, 11, "tools/call", {
+            "name": "seal_turn",
+            "arguments": {"signature": "sig-second"}
+        })
+        assert s1["result"]["isError"] is False
+        assert s2["result"]["isError"] is True
+
+        mcp_proc.stdin.close()
+        mcp_proc.wait(timeout=5)
+
+        send_acp({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Plan submitted."}}}
+        })
+        send_acp({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+        break
+"#;
+
+        let src = format!(
+            r#"
+load("@starchart/acp", "ArtifactMode", "acp_agent", "artifact_tool", "invoke_agent", "read_tool")
+
+Severity = enum("LOW", "HIGH")
+
+Ctx = record(
+    test_errors = str,
+    attempt = int,
+    plan_summary = str,
+    step_count = int,
+    plan_risk = str,
+    finding_count = int,
+    seal_sig = str,
+)
+
+Query = record(section = str)
+
+Plan = record(
+    summary = str,
+    steps = list[str],
+    risk = field(str, "low"),
+)
+
+Finding = record(
+    severity = Severity,
+    message = str,
+)
+
+Seal = record(signature = str)
+
+def read_ctx(ctx: Ctx, q: Query) -> dict:
+    return {{
+        "section": q.section,
+        "errors": ctx.test_errors,
+        "attempt": ctx.attempt,
+    }}
+
+def validate_plan(ctx: Ctx, plan: Plan) -> str | None:
+    if len(plan.steps) == 0:
+        return "Plan must contain at least one step"
+    return None
+
+def has_two_steps(ctx: Ctx, event: dict) -> bool:
+    plan = event.get("output", {{}}).get("artifacts", {{}}).get("submit_plan", {{}})
+    return len(plan.get("steps", [])) == 2
+
+def save_turn_artifacts(ctx: Ctx, event: dict) -> Ctx:
+    artifacts = event.get("output", {{}}).get("artifacts", {{}})
+    plan = artifacts["submit_plan"]
+    findings = artifacts["report_finding"]
+    seal = artifacts["seal_turn"]
+    return Ctx(
+        test_errors = ctx.test_errors,
+        attempt = ctx.attempt,
+        plan_summary = plan["summary"],
+        step_count = len(plan["steps"]),
+        plan_risk = plan["risk"],
+        finding_count = len(findings),
+        seal_sig = seal["signature"],
+    )
+
+planner = acp_agent(
+    id = "planner",
+    command = "python3",
+    args = ["-u", "-c", {py_script}],
+)
+
+S = state_space("planning", "done", "failed")
+
+chart = machine(
+    id = "mcp_turn_test",
+    initial = S.planning,
+    context = Ctx(
+        test_errors = "assertion failed on line 42",
+        attempt = 1,
+        plan_summary = "",
+        step_count = 0,
+        plan_risk = "",
+        finding_count = 0,
+        seal_sig = "",
+    ),
+    states = {{
+        S.planning: state(
+            invoke = invoke_agent(
+                agent = planner,
+                prompt = "Create and submit plan",
+                tools = [
+                    read_tool(
+                        "get_failure_context",
+                        description = "Read failure details",
+                        schema = Query,
+                        handler = read_ctx,
+                    ),
+                    artifact_tool(
+                        "submit_plan",
+                        description = "Submit implementation plan",
+                        schema = Plan,
+                        mode = ArtifactMode.replace,
+                        required = True,
+                        validate = validate_plan,
+                    ),
+                    artifact_tool(
+                        "report_finding",
+                        description = "Append finding",
+                        schema = Finding,
+                        mode = ArtifactMode.append,
+                        required = False,
+                    ),
+                    artifact_tool(
+                        "seal_turn",
+                        description = "Seal the turn once",
+                        schema = Seal,
+                        mode = ArtifactMode.once,
+                        required = True,
+                    ),
+                ],
+                on_done = [
+                    outcome(target = S.done, guard = has_two_steps, assign = save_turn_artifacts),
+                    outcome(target = S.failed),
+                ],
+                on_error = S.failed,
+            ),
+        ),
+        S.done: final_state(),
+        S.failed: final_state(),
+    }},
+)
+"#,
+            py_script = serde_json::to_string(mock_acp_agent_py).unwrap(),
+        );
+
+        let chart = compile_starlark_str("mcp_turn_test.star", &src, None).expect("compile");
+        let actor = StarchartActor::spawn_with_builtins(&chart).expect("spawn");
+        actor.wait_done().await.expect("wait_done");
+        let final_ctx = actor.context().await.expect("context");
+        assert!(
+            actor.is_in("done"),
+            "expected `done`, active={:?}, ctx={final_ctx}",
+            actor.active_states(),
+        );
+        assert_eq!(final_ctx["plan_summary"], json!("Final v2"));
+        assert_eq!(final_ctx["step_count"], json!(2));
+        assert_eq!(final_ctx["plan_risk"], json!("low"));
+        assert_eq!(final_ctx["finding_count"], json!(2));
+        assert_eq!(final_ctx["seal_sig"], json!("sig-first"));
+
+        actor.stop().await;
+        let records = actor.trace_hub().history();
+        let artifact_chunks: Vec<Value> = records
+            .iter()
+            .filter_map(|r| match &r.event {
+                TraceEvent::ServiceProgress {
+                    stream: ProgressKind::Artifact,
+                    chunk,
+                    ..
+                } => Some(serde_json::from_str(chunk).expect("artifact progress JSON")),
+                _ => None,
+            })
+            .collect();
+        // 2 valid submit_plan calls + 2 report_finding calls + 1 valid seal_turn call = 5 artifact events!
+        assert_eq!(artifact_chunks.len(), 5, "artifact_chunks={artifact_chunks:?}");
+    }
+
+    #[tokio::test]
+    async fn acp_turn_missing_required_artifact_routes_to_on_error() {
+        let silent_acp_agent_py = r#"
+import json, sys
+def send_acp(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for raw in sys.stdin:
+    req = json.loads(raw)
+    m, rid = req.get("method"), req.get("id")
+    if m == "initialize":
+        send_acp({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1, "agentCapabilities": {}}})
+    elif m == "session/new":
+        send_acp({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": "sess-2"}})
+    elif m == "session/prompt":
+        # Finishes turn WITHOUT calling required `submit_plan`!
+        send_acp({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+        break
+"#;
+
+        let src = format!(
+            r#"
+load("@starchart/acp", "acp_agent", "artifact_tool", "invoke_agent")
+
+Ctx = record(err = str)
+Plan = record(summary = str)
+
+def record_err(ctx: Ctx, event: dict) -> Ctx:
+    return Ctx(err = str(event.get("error", "")))
+
+planner = acp_agent(
+    id = "planner",
+    command = "python3",
+    args = ["-u", "-c", {py_script}],
+)
+
+S = state_space("planning", "done", "escalated")
+
+chart = machine(
+    id = "missing_artifact",
+    initial = S.planning,
+    context = Ctx(err = ""),
+    states = {{
+        S.planning: state(
+            invoke = invoke_agent(
+                agent = planner,
+                prompt = "Submit plan",
+                tools = [
+                    artifact_tool("submit_plan", schema = Plan, required = True),
+                ],
+                on_done = S.done,
+                on_error = outcome(target = S.escalated, assign = record_err),
+            ),
+        ),
+        S.done: final_state(),
+        S.escalated: final_state(),
+    }},
+)
+"#,
+            py_script = serde_json::to_string(silent_acp_agent_py).unwrap(),
+        );
+
+        let chart = compile_starlark_str("missing_artifact.star", &src, None).expect("compile");
+        let actor = StarchartActor::spawn_with_builtins(&chart).expect("spawn");
+        actor.wait_done().await.expect("wait_done");
+        assert!(actor.is_in("escalated"));
+        let final_ctx = actor.context().await.expect("context");
+        let err_msg = final_ctx["err"].as_str().unwrap_or("").to_owned();
+        assert!(
+            err_msg.contains("submit_plan"),
+            "expected missing `submit_plan` error in context, got: {err_msg}"
+        );
+        actor.stop().await;
+    }
+
+    #[test]
+    fn nested_record_fields_in_machine_context_roundtrip_across_transitions_and_guards() {
+        let src = r##"
+PlanArtifact = record(
+    markdown = str,
+    files_to_modify = field(list[str], []),
+)
+
+ReviewVerdict = record(
+    approved = bool,
+    notes = str,
+)
+
+Finding = record(
+    severity = str,
+    message = str,
+)
+
+PipelineCtx = record(
+    task = str,
+    plan = field(PlanArtifact | None, None),
+    agent1_review = field(ReviewVerdict | None, None),
+    agent2_review = field(ReviewVerdict | None, None),
+    agent2_findings = field(list[Finding], []),
+)
+
+def store_plan(ctx: PipelineCtx, event: dict) -> PipelineCtx:
+    return PipelineCtx(
+        task = ctx.task,
+        plan = PlanArtifact(markdown = "# Plan\n- Update src/lib.rs", files_to_modify = ["src/lib.rs"]),
+        agent1_review = None,
+        agent2_review = None,
+        agent2_findings = [],
+    )
+
+def store_reviews(ctx: PipelineCtx, event: dict) -> PipelineCtx:
+    # Verify dot-access on nested `ctx.plan` works after JSON roundtrip!
+    note = "Reviewed: " + (ctx.plan.markdown.splitlines()[0] if ctx.plan != None else "")
+    return PipelineCtx(
+        task = ctx.task,
+        plan = ctx.plan,
+        agent1_review = ReviewVerdict(approved = True, notes = note),
+        agent2_review = ReviewVerdict(approved = True, notes = "LGTM"),
+        agent2_findings = [Finding(severity = "LOW", message = "nit")],
+    )
+
+def both_approved(ctx: PipelineCtx, event: dict) -> bool:
+    return (
+        ctx.agent1_review != None
+        and ctx.agent1_review.approved
+        and ctx.agent2_review != None
+        and ctx.agent2_review.approved
+        and len(ctx.agent2_findings) == 1
+        and ctx.agent2_findings[0].severity == "LOW"
+    )
+
+S = state_space("planning", "reviewing", "implementing", "rejected")
+
+chart = machine(
+    id = "nested_records",
+    initial = S.planning,
+    context = PipelineCtx(task = "demo"),
+    states = {
+        S.planning: state(
+            on = [transition(event = "PLAN_READY", target = S.reviewing, assign = store_plan)],
+        ),
+        S.reviewing: state(
+            on = [
+                internal_transition(event = "REVIEWS_IN", assign = store_reviews),
+                transition(event = "DECIDE", target = S.implementing, guard = both_approved),
+                transition(event = "DECIDE", target = S.rejected),
+            ],
+        ),
+        S.implementing: final_state(),
+        S.rejected: final_state(),
+    },
+)
+"##;
+        let chart = compile_starlark_str("nested_records.star", src, None).expect("compile");
+        let mut runner =
+            StarchartSyncRunner::start(&chart, HostCallbacks::new()).expect("runner");
+        runner.send("PLAN_READY").expect("PLAN_READY");
+        runner.send("REVIEWS_IN").expect("REVIEWS_IN");
+        runner.send("DECIDE").expect("DECIDE");
+        assert!(runner.is_in("implementing"));
+        assert_eq!(
+            runner.context()["agent1_review"]["notes"],
+            json!("Reviewed: # Plan")
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_agent_state_context_and_update_and_artifact_helpers_work_end_to_end() {
+        let mock_agent_py = r#"
+import json, subprocess, sys
+
+def send_acp(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def mcp_rpc(proc, req_id, method, params=None):
+    msg = {"jsonrpc": "2.0", "id": req_id, "method": method}
+    if params is not None:
+        msg["params"] = params
+    proc.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
+    proc.stdin.flush()
+    return json.loads(proc.stdout.readline().decode("utf-8"))
+
+mcp_proc = None
+for raw in sys.stdin:
+    req = json.loads(raw)
+    m, rid = req.get("method"), req.get("id")
+    if m == "initialize":
+        send_acp({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1, "agentCapabilities": {}}})
+    elif m == "session/new":
+        srv = req["params"]["mcpServers"][0]
+        mcp_proc = subprocess.Popen([srv["command"]] + srv["args"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        mcp_rpc(mcp_proc, 1, "initialize", {"protocolVersion": "2024-11-05"})
+        send_acp({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": "ctx-sess-1"}})
+    elif m == "session/prompt":
+        blocks = req["params"]["prompt"]
+        assert len(blocks) == 2, f"expected [<context>, prompt], got {blocks}"
+        assert "<context>" in blocks[0]["text"] and "oauth-pkce" in blocks[0]["text"], blocks
+        res = mcp_rpc(mcp_proc, 2, "tools/call", {
+            "name": "submit_review",
+            "arguments": {"approved": True, "notes": "Verified from pushed context"}
+        })
+        assert res["result"]["isError"] is False, res
+        f_res = mcp_rpc(mcp_proc, 3, "tools/call", {
+            "name": "report_finding",
+            "arguments": {"severity": "LOW", "message": "minor style note"}
+        })
+        assert f_res["result"]["isError"] is False, f_res
+        mcp_proc.stdin.close()
+        mcp_proc.wait(timeout=5)
+        send_acp({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+        break
+"#;
+
+        let src = format!(
+            r#"
+load("@starchart/agents", "ArtifactMode", "acp_agent", "artifact", "artifact_list", "artifact_tool", "invoke_agent")
+
+ReviewVerdict = record(approved = bool, notes = str)
+Finding = record(severity = str, message = str)
+
+PipelineCtx = record(
+    task = str,
+    unchanged_counter = field(int, 42),
+    agent1_review = field(ReviewVerdict | None, None),
+    findings = field(list[Finding], []),
+)
+
+def select_ctx(ctx: PipelineCtx) -> dict:
+    return {{"task": ctx.task}}
+
+def save_review(ctx: PipelineCtx, event: dict) -> PipelineCtx:
+    return update(
+        ctx,
+        agent1_review = artifact(event, "submit_review", ReviewVerdict),
+        findings = artifact_list(event, "report_finding", Finding),
+    )
+
+def is_approved(ctx: PipelineCtx, event: dict) -> bool:
+    return ctx.agent1_review != None and ctx.agent1_review.approved
+
+agent1 = acp_agent(
+    id = "agent1",
+    command = "python3",
+    args = ["-u", "-c", {py_script}],
+)
+
+S = state_space("reviewing", "done", "rejected")
+
+chart = machine(
+    id = "ctx_and_update",
+    initial = S.reviewing,
+    context = PipelineCtx(task = "oauth-pkce"),
+    states = {{
+        S.reviewing: state(
+            invoke = invoke_agent(
+                agent = agent1,
+                context = select_ctx,
+                prompt = "Review the task in `<context>`.",
+                tools = [
+                    artifact_tool("submit_review", schema = ReviewVerdict),
+                    artifact_tool("report_finding", schema = Finding, mode = ArtifactMode.append, required = False),
+                ],
+                on_done = outcome(target = S.done, assign = save_review),
+                on_error = S.rejected,
+            ),
+        ),
+        S.done: final_state(),
+        S.rejected: final_state(),
+    }},
+)
+"#,
+            py_script = serde_json::to_string(mock_agent_py).unwrap(),
+        );
+
+        let chart = compile_starlark_str("ctx_and_update.star", &src, None).expect("compile");
+        let actor = StarchartActor::spawn_with_builtins(&chart).expect("spawn");
+        actor.wait_done().await.expect("wait_done");
+        assert!(actor.is_in("done"));
+        let final_ctx = actor.context().await.expect("context");
+        assert_eq!(final_ctx["unchanged_counter"], json!(42));
+        assert_eq!(
+            final_ctx["agent1_review"]["notes"],
+            json!("Verified from pushed context")
+        );
+        assert_eq!(final_ctx["findings"][0]["severity"], json!("LOW"));
+        actor.stop().await;
     }
 }

@@ -46,6 +46,8 @@ pub enum ProgressKind {
     ToolCall,
     /// An agent's execution plan update.
     Plan,
+    /// A structured artifact submitted by an agent via a turn-scoped MCP `artifact_tool`.
+    Artifact,
     /// One line of subprocess standard output.
     Stdout,
     /// One line of subprocess standard error.
@@ -515,7 +517,7 @@ pub(crate) fn with_sync_scope<R>(scope: ServiceScope, f: impl FnOnce() -> R) -> 
     f()
 }
 
-fn current_scope() -> Option<ServiceScope> {
+pub(crate) fn current_scope() -> Option<ServiceScope> {
     ASYNC_SCOPE
         .try_with(Clone::clone)
         .ok()

@@ -19,11 +19,26 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use xstate_statemachine::core::Status;
 
+use crate::builtins::mcp::{BridgeLaunchSpec, TurnMcpServer};
 use crate::trace::{ProgressKind, progress_enabled, report_progress};
 use crate::{HostCallbacks, StarchartActor};
 
+/// Formats an optional `invoke_agent(..., context = ...)` value into `<context>...</context>`.
+fn render_state_context_block(machine_ctx: &Value, explicit_ctx: Option<&Value>) -> Option<String> {
+    let target = match explicit_ctx {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => return None,
+        Some(Value::Bool(true)) => machine_ctx,
+        Some(other) => other,
+    };
+    let body = match target {
+        Value::String(s) => s.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    };
+    Some(format!("<context>\n{body}\n</context>"))
+}
+
 /// Executes a single ACP prompt turn against a configured `AcpAgent` subprocess over `stdio`.
-pub async fn execute_acp_turn(_ctx: Value, input: Value) -> anyhow::Result<Value> {
+pub async fn execute_acp_turn(ctx: Value, input: Value) -> anyhow::Result<Value> {
     let obj = input
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("`@starchart/acp` input must be an object, got `{input}`"))?;
@@ -37,6 +52,8 @@ pub async fn execute_acp_turn(_ctx: Value, input: Value) -> anyhow::Result<Value
         .get("prompt")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("`@starchart/acp` `prompt` must resolve to a `str`"))?;
+
+    let context_block = render_state_context_block(&ctx, obj.get("context"));
 
     let protocol = agent
         .get("protocol")
@@ -71,12 +88,18 @@ pub async fn execute_acp_turn(_ctx: Value, input: Value) -> anyhow::Result<Value
     let canonical_cwd = std::fs::canonicalize(&session_cwd).unwrap_or(session_cwd);
     let env_map = agent.get("env").and_then(Value::as_object);
     let config_map = agent.get("config").and_then(Value::as_object);
+    let mcp_server = TurnMcpServer::start_if_configured(&input).await?;
+    let bridge_spec = mcp_server.as_ref().map(|s| s.launch_spec().clone());
 
     match protocol {
         "CLAUDE_CLI" | "CODEX_CLI" => {
             // These CLIs return the whole answer at the end, so report it as one chunk.
             report_progress(ProgressKind::Log, format!("running {command_prog} ({protocol})"));
-            let result = if protocol == "CLAUDE_CLI" {
+            let combined_prompt = match &context_block {
+                Some(block) => format!("{block}\n\n{prompt_text}"),
+                None => prompt_text.to_owned(),
+            };
+            let mut result = if protocol == "CLAUDE_CLI" {
                 execute_claude_cli_turn(
                     command_prog,
                     &args,
@@ -84,8 +107,9 @@ pub async fn execute_acp_turn(_ctx: Value, input: Value) -> anyhow::Result<Value
                     model,
                     env_map,
                     config_map,
+                    bridge_spec.as_ref(),
                     timeout_ms,
-                    prompt_text,
+                    &combined_prompt,
                 )
                 .await
             } else {
@@ -96,8 +120,9 @@ pub async fn execute_acp_turn(_ctx: Value, input: Value) -> anyhow::Result<Value
                     model,
                     env_map,
                     config_map,
+                    bridge_spec.as_ref(),
                     timeout_ms,
-                    prompt_text,
+                    &combined_prompt,
                 )
                 .await
             }?;
@@ -105,6 +130,13 @@ pub async fn execute_acp_turn(_ctx: Value, input: Value) -> anyhow::Result<Value
                 && !text.is_empty()
             {
                 report_progress(ProgressKind::AgentText, text);
+            }
+            let artifacts = match mcp_server {
+                Some(server) => server.finalize()?,
+                None => serde_json::Map::new(),
+            };
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("artifacts".to_owned(), Value::Object(artifacts));
             }
             return Ok(result);
         }
@@ -148,14 +180,23 @@ pub async fn execute_acp_turn(_ctx: Value, input: Value) -> anyhow::Result<Value
         &canonical_cwd,
         model,
         config_map.as_ref(),
+        mcp_server.as_ref(),
+        context_block.as_deref(),
         prompt_text,
     );
 
-    let result = tokio::time::timeout(Duration::from_millis(timeout_ms), turn_fut)
+    let mut result = tokio::time::timeout(Duration::from_millis(timeout_ms), turn_fut)
         .await
         .map_err(|_| anyhow::anyhow!("ACP agent `{command_prog}` timed out after {timeout_ms}ms"))??;
 
     let _ = child.kill().await;
+    let artifacts = match mcp_server {
+        Some(server) => server.finalize()?,
+        None => serde_json::Map::new(),
+    };
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("artifacts".to_owned(), Value::Object(artifacts));
+    }
     Ok(result)
 }
 
@@ -167,13 +208,15 @@ async fn execute_claude_cli_turn(
     model: &str,
     env_map: Option<&serde_json::Map<String, Value>>,
     config_map: Option<&serde_json::Map<String, Value>>,
+    bridge_spec: Option<&BridgeLaunchSpec>,
     timeout_ms: u64,
     prompt_text: &str,
 ) -> anyhow::Result<Value> {
     let mut cmd = Command::new(command_prog);
     cmd.arg("-p")
-        .arg("--output-format")
-        .arg("json")
+        .arg("--output-format=json")
+        .arg("--permission-prompts=none")
+        .arg(r#"--settings={"disableAllHooks":true,"preferredNotifChannel":"notifications_disabled"}"#)
         .args(extra_args)
         .current_dir(cwd)
         .env_remove("CLAUDECODE")
@@ -186,10 +229,26 @@ async fn execute_claude_cli_turn(
     if !model.is_empty() {
         cmd.arg("--model").arg(model);
     }
-    if let Some(cfg) = config_map
-        && let Some(perm_mode) = cfg.get("permission_mode").and_then(Value::as_str)
-        && !perm_mode.is_empty()
-    {
+    let perm_mode = config_map
+        .and_then(|cfg| cfg.get("permission_mode"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    if let Some(spec) = bridge_spec {
+        cmd.arg(format!("--mcp-config={}", spec.to_claude_mcp_config_json()))
+            .arg("--strict-mcp-config");
+        if perm_mode == "plan" {
+            // Claude CLI's `--permission-mode plan` blocks all MCP tool calls (`isError` / denied).
+            // Restrict built-in tools to read-only (`Read,Glob,Grep`) while allowing `mcp__starchart__*`!
+            cmd.arg("--tools=Read,Glob,Grep")
+                .arg("--allowedTools=Read,Glob,Grep,mcp__starchart__*");
+        } else {
+            cmd.arg("--allowedTools=mcp__starchart__*");
+            if !perm_mode.is_empty() {
+                cmd.arg("--permission-mode").arg(perm_mode);
+            }
+        }
+    } else if !perm_mode.is_empty() {
         cmd.arg("--permission-mode").arg(perm_mode);
     }
     if let Some(envs) = env_map {
@@ -268,6 +327,7 @@ async fn execute_codex_cli_turn(
     model: &str,
     env_map: Option<&serde_json::Map<String, Value>>,
     config_map: Option<&serde_json::Map<String, Value>>,
+    bridge_spec: Option<&BridgeLaunchSpec>,
     timeout_ms: u64,
     prompt_text: &str,
 ) -> anyhow::Result<Value> {
@@ -292,6 +352,9 @@ async fn execute_codex_cli_turn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    if let Some(spec) = bridge_spec {
+        cmd.args(spec.to_codex_cli_args());
+    }
     if !model.is_empty() {
         cmd.arg("-m").arg(model);
     }
@@ -357,14 +420,18 @@ async fn execute_codex_cli_turn(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_acp_client_session(
     mut stdin: ChildStdin,
     stdout: ChildStdout,
     cwd: &Path,
     model: &str,
     config_map: Option<&serde_json::Map<String, Value>>,
+    mcp_server: Option<&TurnMcpServer>,
+    context_block: Option<&str>,
     prompt_text: &str,
 ) -> anyhow::Result<Value> {
+    let bridge_spec = mcp_server.map(TurnMcpServer::launch_spec);
     let mut reader = BufReader::new(stdout).lines();
     let mut next_id: u64 = 1;
     let mut updates: Vec<Value> = Vec::new();
@@ -412,6 +479,10 @@ async fn run_acp_client_session(
     // 2. `session/new`
     let new_sess_id = next_id;
     next_id += 1;
+    let mcp_servers = match bridge_spec {
+        Some(spec) => vec![spec.to_acp_mcp_server()],
+        None => Vec::new(),
+    };
     send_jsonrpc(
         &mut stdin,
         &json!({
@@ -420,7 +491,7 @@ async fn run_acp_client_session(
             "method": "session/new",
             "params": {
                 "cwd": cwd.to_string_lossy(),
-                "mcpServers": [],
+                "mcpServers": mcp_servers,
             },
         }),
     )
@@ -515,6 +586,18 @@ async fn run_acp_client_session(
 
     // 4. `session/prompt`
     let prompt_req_id = next_id;
+    next_id += 1;
+    let mut prompt_blocks = Vec::with_capacity(2);
+    if let Some(ctx_text) = context_block {
+        prompt_blocks.push(json!({
+            "type": "text",
+            "text": ctx_text,
+        }));
+    }
+    prompt_blocks.push(json!({
+        "type": "text",
+        "text": prompt_text,
+    }));
     send_jsonrpc(
         &mut stdin,
         &json!({
@@ -523,18 +606,13 @@ async fn run_acp_client_session(
             "method": "session/prompt",
             "params": {
                 "sessionId": session_id,
-                "prompt": [
-                    {
-                        "type": "text",
-                        "text": prompt_text,
-                    }
-                ],
+                "prompt": prompt_blocks,
             },
         }),
     )
     .await?;
 
-    let prompt_res = await_rpc_response(
+    let mut prompt_res = await_rpc_response(
         prompt_req_id,
         &mut reader,
         &mut stdin,
@@ -544,6 +622,45 @@ async fn run_acp_client_session(
     )
     .await
     .context("ACP `session/prompt` failed")?;
+
+    // If the agent yielded `end_turn` before calling required artifact tools (e.g. while waiting
+    // on an internal backgrounded command), send one follow-up prompt in the same ACP session.
+    if let Some(server) = mcp_server {
+        let missing = server.missing_required_tools();
+        if !missing.is_empty() {
+            let followup_id = next_id;
+            let reminder = format!(
+                "You ended your turn before calling required artifact tool(s): {}. Finish any pending work and call them now.",
+                missing.join(", ")
+            );
+            if send_jsonrpc(
+                &mut stdin,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": followup_id,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": session_id,
+                        "prompt": [{ "type": "text", "text": reminder }],
+                    },
+                }),
+            )
+            .await
+            .is_ok()
+                && let Ok(res2) = await_rpc_response(
+                    followup_id,
+                    &mut reader,
+                    &mut stdin,
+                    cwd,
+                    &mut accumulated_text,
+                    &mut updates,
+                )
+                .await
+            {
+                prompt_res = res2;
+            }
+        }
+    }
 
     let stop_reason = prompt_res
         .get("stopReason")
