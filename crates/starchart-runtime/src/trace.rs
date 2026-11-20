@@ -171,6 +171,7 @@ pub struct TraceHub {
     machine_id: String,
     started: Instant,
     action_labels: HashMap<String, String>,
+    final_outputs: HashMap<String, Value>,
     inner: Mutex<HubInner>,
 }
 
@@ -195,10 +196,21 @@ impl TraceHub {
         action_labels: HashMap<String, String>,
         history_cap: usize,
     ) -> Arc<Self> {
+        Self::with_final_outputs(machine_id, action_labels, HashMap::new(), history_cap)
+    }
+
+    /// Creates a hub with both `action_labels` and top-level `final_state(output = ...)` fallbacks.
+    pub fn with_final_outputs(
+        machine_id: impl Into<String>,
+        action_labels: HashMap<String, String>,
+        final_outputs: HashMap<String, Value>,
+        history_cap: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             machine_id: machine_id.into(),
             started: Instant::now(),
             action_labels,
+            final_outputs,
             inner: Mutex::new(HubInner {
                 seq: 0,
                 history: VecDeque::new(),
@@ -374,6 +386,15 @@ impl Observer<DynContext> for TraceObserver {
     ) {
         let to = self.hub.strip_machine_prefix(state.leaf_ids(machine));
         let from = self.swap_states(&to);
+        let mut output = state.output().clone();
+        if output.is_null() && state.status() == xstate_statemachine::core::Status::Done {
+            for st in &to {
+                if let Some(leaf_out) = self.hub.final_outputs.get(st) {
+                    output = leaf_out.clone();
+                    break;
+                }
+            }
+        }
         self.hub.emit(TraceEvent::Transition {
             event: event_info(event),
             from,
@@ -383,7 +404,7 @@ impl Observer<DynContext> for TraceObserver {
             unhandled: report.unhandled,
             context: state.context().clone(),
             status: state.status().as_str().to_owned(),
-            output: state.output().clone(),
+            output,
             error: state.error().map(str::to_owned),
         });
     }

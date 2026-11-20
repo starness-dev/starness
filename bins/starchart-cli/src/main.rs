@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use indexmap::IndexMap;
 use serde_json::Value;
-use starchart_ir::{ActionDef, StateId, StateKind, StateNodeDef};
+use starchart_ir::{ActionDef, MachineDef, StateId, StateKind, StateNodeDef};
 use starchart_runtime::builtins::acp::serve_chart_as_acp_agent;
 use starchart_runtime::{
     HostCallbacks, StarchartActor, StarchartSyncRunner, TraceReceiver, render_mermaid,
@@ -82,6 +83,11 @@ enum Commands {
         #[arg(short, long = "event")]
         events: Vec<String>,
 
+        /// Stream live newline-delimited events (`EVENT_NAME`, `sleep:<ms>`, or JSON `'{"type":"..."}'`)
+        /// from `stdin` while the statechart executes.
+        #[arg(long = "events-stdin", alias = "stdin")]
+        events_stdin: bool,
+
         /// Write the full execution trace as JSON Lines to PATH (`-` for stdout; human-readable
         /// progress then moves to stderr). One record per line: `started`, `transition`,
         /// `service_started`, `service_progress`, `service_finished`, `error`, `stopped`, ...
@@ -124,6 +130,7 @@ fn main() -> ExitCode {
             context,
             force_async,
             events,
+            events_stdin,
             trace,
         } => run_execute(
             &file,
@@ -131,6 +138,7 @@ fn main() -> ExitCode {
             context.as_deref(),
             force_async,
             &events,
+            events_stdin,
             trace.as_deref(),
         ),
         Commands::Acp { file, export } => run_acp_server(&file, &export),
@@ -205,12 +213,14 @@ fn run_diagram(file: &Path, export: &str) -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_execute(
     file: &Path,
     export: &str,
     context_override: Option<&str>,
     force_async: bool,
     raw_events: &[String],
+    events_stdin: bool,
     trace_target: Option<&str>,
 ) -> ExitCode {
     let trace_out = match trace_target.map(open_trace_sink).transpose() {
@@ -257,8 +267,15 @@ fn run_execute(
         .iter()
         .any(|e| e.trim().starts_with("after:"));
 
-    if (force_async || uses_builtin_async) && !uses_simulated_clock {
-        return run_execute_async(compiled, action_names, service_names, raw_events, trace_out);
+    if (force_async || events_stdin || uses_builtin_async) && !uses_simulated_clock {
+        return run_execute_async(
+            compiled,
+            action_names,
+            service_names,
+            raw_events,
+            events_stdin,
+            trace_out,
+        );
     }
 
     run_execute_sync(compiled, action_names, service_names, raw_events, trace_out)
@@ -357,6 +374,7 @@ fn run_execute_async(
     action_names: HashSet<String>,
     service_names: HashSet<String>,
     raw_events: &[String],
+    events_stdin: bool,
     trace_out: Option<TraceSink>,
 ) -> ExitCode {
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -380,7 +398,7 @@ fn run_execute_async(
             }
         };
         let trace_writer = trace_out.map(|sink| spawn_trace_writer(actor.subscribe_traces(), sink));
-        let code = drive_async(&compiled, &actor, raw_events).await;
+        let code = drive_async(&compiled, &actor, raw_events, events_stdin).await;
         actor.stop().await;
         actor.trace_hub().close();
         tokio::task::spawn_blocking(move || finish_trace_writer(trace_writer))
@@ -390,89 +408,236 @@ fn run_execute_async(
     })
 }
 
+/// Spawns a detached OS thread reading lines from `stdin` so an open TTY/pipe never blocks Tokio shutdown.
+fn spawn_stdin_line_reader() -> tokio::sync::mpsc::UnboundedReceiver<std::io::Result<String>> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+fn actions_have_delayed_send(actions: &[ActionDef]) -> bool {
+    actions.iter().any(|a| {
+        matches!(
+            a,
+            ActionDef::Raise {
+                delay: Some(_),
+                ..
+            } | ActionDef::SendTo {
+                delay: Some(_),
+                ..
+            }
+        )
+    })
+}
+
+/// Returns `true` if any currently active state (or its active ancestor superstates) owns an
+/// in-flight `invoke`, an `after` timer, or a delayed `raise_event` / `send_to`.
+fn active_states_have_autonomous_work(ir: &MachineDef, active_paths: &[String]) -> bool {
+    for raw_path in active_paths {
+        let trimmed = raw_path
+            .strip_prefix(&format!("{}.", ir.id))
+            .unwrap_or(raw_path.as_str());
+        let mut current_map = &ir.states;
+        for seg in trimmed.split('.') {
+            let Some(node) = current_map.get(&StateId::from(seg)) else {
+                break;
+            };
+            if !node.invoke.is_empty()
+                || !node.after.is_empty()
+                || actions_have_delayed_send(&node.entry)
+                || node
+                    .on
+                    .iter()
+                    .any(|tr| actions_have_delayed_send(&tr.actions))
+            {
+                return true;
+            }
+            match &node.kind {
+                StateKind::Compound { states, .. } | StateKind::Parallel { states } => {
+                    current_map = states;
+                }
+                StateKind::Atomic | StateKind::Final | StateKind::History { .. } => break,
+            }
+        }
+    }
+    false
+}
+
 async fn drive_async(
     compiled: &CompiledChart,
     actor: &StarchartActor,
     raw_events: &[String],
+    events_stdin: bool,
 ) -> ExitCode {
-    {
-        let init_ctx = actor.context().await.unwrap_or(Value::Null);
-        say!(
-            "[init] machine=`{}` active={:?} context={}",
-            compiled.ir.id,
-            actor.active_states(),
-            init_ctx
-        );
+    let init_ctx = actor.context().await.unwrap_or(Value::Null);
+    say!(
+        "[init] machine=`{}` active={:?} context={}",
+        compiled.ir.id,
+        actor.active_states(),
+        init_ctx
+    );
 
-        for (idx, raw) in raw_events.iter().enumerate() {
-            let (event_type, payload) = match parse_cli_event(raw) {
-                Ok(pair) => pair,
+    let mut step_num: usize = 0;
+    for raw in raw_events {
+        step_num += 1;
+        if let Some(ms_str) = raw.trim().strip_prefix("sleep:") {
+            let ms: u64 = match ms_str.trim().parse() {
+                Ok(v) => v,
                 Err(err) => {
-                    eprintln!("ERROR parsing event #{}: {err}", idx + 1);
+                    eprintln!("ERROR parsing `sleep:{ms_str}` in event #{step_num}: {err}");
                     return ExitCode::from(1);
                 }
             };
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            continue;
+        }
 
-            let res = if payload.is_null() {
-                actor.send(&event_type).await
-            } else {
-                actor.send_with_payload(&event_type, payload).await
-            };
-            if let Err(err) = res {
-                eprintln!("ERROR dispatching `{event_type}`: {err}");
+        let (event_type, payload) = match parse_cli_event(raw) {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("ERROR parsing event #{step_num}: {err}");
                 return ExitCode::from(1);
             }
+        };
 
-            let ctx = actor.context().await.unwrap_or(Value::Null);
-            say!(
-                "[step {}] event=`{}` active={:?} done={} output={} context={}",
-                idx + 1,
-                event_type,
-                actor.active_states(),
-                actor.is_done(),
-                actor.output(),
-                ctx
-            );
+        let res = if payload.is_null() {
+            actor.send(&event_type).await
+        } else {
+            actor.send_with_payload(&event_type, payload).await
+        };
+        if let Err(err) = res {
+            eprintln!("ERROR dispatching `{event_type}`: {err}");
+            return ExitCode::from(1);
         }
 
-        // Stream live state transitions while autonomous async `invoke` pipelines run.
-        if !actor.is_done() {
-            let mut rx = actor.subscribe();
-            let mut prev_states = actor.active_states();
-            loop {
-                let view = rx.borrow_and_update().clone();
-                let current_states = actor.active_states();
-                if current_states != prev_states {
-                    say!(
-                        "[transition] machine=`{}` active={:?}",
-                        compiled.ir.id, current_states
-                    );
-                    prev_states = current_states;
-                }
-                if let Some(err) = view.error {
-                    eprintln!("ERROR executing `{}`: {err}", compiled.ir.id);
-                    return ExitCode::from(1);
-                }
-                if view.status != xstate_statemachine::core::Status::Running {
-                    break;
-                }
-                if rx.changed().await.is_err() {
-                    break;
-                }
-            }
-        }
-
-        let final_ctx = actor.context().await.unwrap_or(Value::Null);
+        let ctx = actor.context().await.unwrap_or(Value::Null);
         say!(
-            "[done] machine=`{}` active={:?} done={} output={} context={}",
-            compiled.ir.id,
+            "[step {}] event=`{}` active={:?} done={} output={} context={}",
+            step_num,
+            event_type,
             actor.active_states(),
             actor.is_done(),
             actor.output(),
-            final_ctx
+            ctx
         );
-        ExitCode::SUCCESS
     }
+
+    if !actor.is_done() {
+        let mut rx = actor.subscribe();
+        let mut stdin_rx = events_stdin.then(spawn_stdin_line_reader);
+        let mut stdin_open = events_stdin;
+        let mut prev_states = actor.active_states();
+
+        loop {
+            let view = rx.borrow_and_update().clone();
+            let current_states = actor.active_states();
+            if current_states != prev_states {
+                say!(
+                    "[transition] machine=`{}` active={:?}",
+                    compiled.ir.id, current_states
+                );
+                prev_states = current_states.clone();
+            }
+            if let Some(err) = view.error {
+                eprintln!("ERROR executing `{}`: {err}", compiled.ir.id);
+                return ExitCode::from(1);
+            }
+            if view.status != xstate_statemachine::core::Status::Running {
+                break;
+            }
+            if !stdin_open && !active_states_have_autonomous_work(&compiled.ir, &current_states) {
+                break;
+            }
+
+            tokio::select! {
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                maybe_line = async {
+                    match &mut stdin_rx {
+                        Some(ch) => ch.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if stdin_open => {
+                    match maybe_line {
+                        Some(Ok(line)) => {
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() || trimmed.starts_with('#') {
+                                continue;
+                            }
+                            if let Some(ms_str) = trimmed.strip_prefix("sleep:") {
+                                match ms_str.trim().parse::<u64>() {
+                                    Ok(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
+                                    Err(err) => eprintln!("WARN ignoring invalid `sleep:{ms_str}` on stdin: {err}"),
+                                }
+                                continue;
+                            }
+                            let (event_type, payload) = match parse_cli_event(trimmed) {
+                                Ok(pair) => pair,
+                                Err(err) => {
+                                    eprintln!("WARN ignoring invalid stdin event `{trimmed}`: {err}");
+                                    continue;
+                                }
+                            };
+                            step_num += 1;
+                            let res = if payload.is_null() {
+                                actor.send(&event_type).await
+                            } else {
+                                actor.send_with_payload(&event_type, payload).await
+                            };
+                            if let Err(err) = res {
+                                eprintln!("ERROR dispatching stdin event `{event_type}`: {err}");
+                                return ExitCode::from(1);
+                            }
+                            let ctx = actor.context().await.unwrap_or(Value::Null);
+                            prev_states = actor.active_states();
+                            say!(
+                                "[stdin {}] event=`{}` active={:?} done={} output={} context={}",
+                                step_num,
+                                event_type,
+                                prev_states,
+                                actor.is_done(),
+                                actor.output(),
+                                ctx
+                            );
+                            if actor.is_done() {
+                                break;
+                            }
+                        }
+                        Some(Err(err)) => {
+                            eprintln!("ERROR reading stdin event stream: {err}");
+                            stdin_open = false;
+                            stdin_rx = None;
+                        }
+                        None => {
+                            stdin_open = false;
+                            stdin_rx = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let final_ctx = actor.context().await.unwrap_or(Value::Null);
+    say!(
+        "[done] machine=`{}` active={:?} done={} output={} context={}",
+        compiled.ir.id,
+        actor.active_states(),
+        actor.is_done(),
+        actor.output(),
+        final_ctx
+    );
+    ExitCode::SUCCESS
 }
 
 fn run_execute_sync(

@@ -1626,7 +1626,12 @@ fn trace_action_labels(chart: &CompiledChart) -> HashMap<String, String> {
 }
 
 fn new_trace_hub(chart: &CompiledChart) -> Arc<TraceHub> {
-    TraceHub::new(chart.ir.id.clone(), trace_action_labels(chart))
+    TraceHub::with_final_outputs(
+        chart.ir.id.clone(),
+        trace_action_labels(chart),
+        collect_top_level_final_outputs(&chart.ir),
+        trace::DEFAULT_HISTORY_CAPACITY,
+    )
 }
 
 fn collect_top_level_final_outputs(ir: &MachineDef) -> HashMap<String, Value> {

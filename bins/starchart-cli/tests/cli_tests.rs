@@ -492,3 +492,159 @@ chart = machine(
         serde_json::json!("Native bridge plan")
     );
 }
+
+fn spawn_mock_deploy_control_api() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock deploy API");
+    let port = listener.local_addr().unwrap().port();
+    let incidents = Arc::new(AtomicUsize::new(0));
+    let incidents_clone = Arc::clone(&incidents);
+
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0_u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let first_line = req.lines().next().unwrap_or("");
+            let body = if first_line.contains("/v1/deploy-window") {
+                r#"{"freeze":false}"#
+            } else if first_line.contains("/v1/canary-metrics") {
+                r#"{"error_rate":0.001}"#
+            } else if first_line.contains("/v1/incidents") {
+                incidents_clone.fetch_add(1, Ordering::SeqCst);
+                r#"{"paged":true}"#
+            } else {
+                r#"{}"#
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+
+    (port, incidents)
+}
+
+#[test]
+fn run_events_stdin_drives_deployment_pipeline_with_pause_resume_to_live() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let (port, incidents) = spawn_mock_deploy_control_api();
+    let ctx_patch = serde_json::json!({
+        "control_api": format!("http://127.0.0.1:{port}"),
+        "bake_interval_ms": 40,
+    })
+    .to_string();
+
+    let mut child = Command::new(bin_path())
+        .arg("run")
+        .arg(workspace_file("examples/deployment_pipeline.star"))
+        .arg("--events-stdin")
+        .arg("--trace")
+        .arg("-")
+        .arg("--context")
+        .arg(&ctx_patch)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn starchart run --events-stdin");
+
+    {
+        let mut stdin = child.stdin.take().expect("stdin");
+        writeln!(stdin, "# Approve rollout quorum from two engineers").unwrap();
+        writeln!(stdin, r#"{{"type":"APPROVE","by":"alice"}}"#).unwrap();
+        writeln!(stdin, r#"{{"type":"APPROVE","by":"bob"}}"#).unwrap();
+        writeln!(stdin, "START_ROLLOUT").unwrap();
+        writeln!(stdin, "sleep:25").unwrap();
+        writeln!(stdin, "PAUSE").unwrap();
+        writeln!(stdin, "sleep:20").unwrap();
+        writeln!(stdin, "RESUME").unwrap();
+    }
+
+    let output = child.wait_with_output().expect("wait deployment_pipeline");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let records = parse_jsonl(&stdout);
+    let final_transition = records
+        .iter()
+        .rfind(|r| r["kind"] == "transition")
+        .expect("final transition");
+    assert_eq!(final_transition["to"], serde_json::json!(["live"]), "trace:\n{stdout}");
+    assert_eq!(final_transition["output"], serde_json::json!({"status": "live"}));
+    assert_eq!(
+        final_transition["context"]["approved_by"],
+        serde_json::json!(["alice", "bob"])
+    );
+    assert_eq!(incidents.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn run_events_stdin_handles_live_rollback_signal_and_pages_oncall() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let (port, incidents) = spawn_mock_deploy_control_api();
+    let ctx_patch = serde_json::json!({
+        "control_api": format!("http://127.0.0.1:{port}"),
+        "bake_interval_ms": 500,
+    })
+    .to_string();
+
+    let mut child = Command::new(bin_path())
+        .arg("run")
+        .arg(workspace_file("examples/deployment_pipeline.star"))
+        .arg("--events-stdin")
+        .arg("--trace")
+        .arg("-")
+        .arg("--context")
+        .arg(&ctx_patch)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn starchart run --events-stdin");
+
+    {
+        let mut stdin = child.stdin.take().expect("stdin");
+        writeln!(stdin, r#"{{"type":"APPROVE","by":"alice"}}"#).unwrap();
+        writeln!(stdin, r#"{{"type":"APPROVE","by":"bob"}}"#).unwrap();
+        writeln!(stdin, "START_ROLLOUT").unwrap();
+        // Wait until rollout enters `bake_wait`, then send emergency `ROLLBACK`!
+        writeln!(stdin, "sleep:80").unwrap();
+        writeln!(stdin, r#"{{"type":"ROLLBACK","reason":"sev1_p99_spike"}}"#).unwrap();
+    }
+
+    let output = child.wait_with_output().expect("wait rollback");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let records = parse_jsonl(&stdout);
+    let final_transition = records
+        .iter()
+        .rfind(|r| r["kind"] == "transition")
+        .expect("final transition");
+    assert_eq!(
+        final_transition["to"],
+        serde_json::json!(["rolled_back"]),
+        "trace:\n{stdout}"
+    );
+    assert_eq!(
+        final_transition["context"]["reason"],
+        serde_json::json!("sev1_p99_spike")
+    );
+    assert_eq!(incidents.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
