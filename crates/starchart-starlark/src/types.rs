@@ -745,12 +745,69 @@ impl<'v> UnpackValue<'v> for OneOrManyAfter<'v> {
     }
 }
 
+/// JSON object key used inside `InvokeDef.input` to reference a frozen `(ctx) -> value` Starlark callable slot.
+pub const INVOKE_INPUT_SLOT_KEY: &str = "__starchart_input_slot__";
+
+pub fn starlark_input_slot_name(slot: usize) -> String {
+    format!("__starlark_input_{slot}")
+}
+
+#[derive(Debug, Clone, Trace, Freeze, Allocative)]
+pub enum InvokeInputGen<V: ValueLifetimeless> {
+    Json(#[trace(unsafe_ignore)] JsonHolder),
+    Callable(V),
+    Object(Vec<(String, InvokeInputGen<V>)>),
+}
+
+unsafe impl<'v> Coerce<InvokeInputGen<Value<'v>>> for InvokeInputGen<FrozenValue> {}
+
+pub fn clone_invoke_input_to_value<'v, V: ValueLike<'v>>(
+    inp: &InvokeInputGen<V>,
+) -> InvokeInputGen<Value<'v>> {
+    match inp {
+        InvokeInputGen::Json(j) => InvokeInputGen::Json(j.clone()),
+        InvokeInputGen::Callable(v) => InvokeInputGen::Callable(v.to_value()),
+        InvokeInputGen::Object(entries) => InvokeInputGen::Object(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), clone_invoke_input_to_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+pub fn unpack_invoke_input_value<'v>(value: Value<'v>) -> anyhow::Result<InvokeInputGen<Value<'v>>> {
+    if value.is_none() {
+        return Ok(InvokeInputGen::Json(JsonHolder(serde_json::Value::Null)));
+    }
+    if let Some(dict) = DictRef::from_value(value) {
+        let mut entries = Vec::with_capacity(dict.len());
+        for (k, v) in dict.iter() {
+            let key = k
+                .unpack_str()
+                .ok_or_else(|| anyhow::anyhow!("invoke `input` dict keys must be strings, got `{k}`"))?
+                .to_owned();
+            entries.push((key, unpack_invoke_input_value(v)?));
+        }
+        return Ok(InvokeInputGen::Object(entries));
+    }
+    if Record::from_value(value).is_none()
+        && EnumValue::from_value(value).is_none()
+        && StarlarkCallable::<starlark::values::typing::StarlarkCallableParamAny, FrozenValue>::unpack_value_impl(value)
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        return Ok(InvokeInputGen::Callable(value));
+    }
+    Ok(InvokeInputGen::Json(JsonHolder(value.to_json_value()?)))
+}
+
 #[derive(Debug, Clone, Trace, Freeze, Allocative)]
 pub struct InvokeDataGen<V: ValueLifetimeless> {
     pub id: Option<String>,
     pub src: String,
-    #[trace(unsafe_ignore)]
-    pub input: JsonHolder,
+    pub input: InvokeInputGen<V>,
     pub on_done: Vec<OutcomeDataGen<V>>,
     pub on_error: Vec<OutcomeDataGen<V>>,
 }
@@ -763,7 +820,7 @@ pub fn clone_invoke_to_value<'v, V: ValueLike<'v>>(
     InvokeDataGen {
         id: inv.id.clone(),
         src: inv.src.clone(),
-        input: inv.input.clone(),
+        input: clone_invoke_input_to_value(&inv.input),
         on_done: inv.on_done.iter().map(clone_outcome_to_value).collect(),
         on_error: inv.on_error.iter().map(clone_outcome_to_value).collect(),
     }
@@ -948,6 +1005,7 @@ pub struct StarlarkMachineGen<V: ValueLifetimeless> {
     pub guard_slots: Vec<V>,
     pub reducer_slots: Vec<V>,
     pub delay_slots: Vec<V>,
+    pub input_slots: Vec<V>,
     /// Preserved initial context value if constructed from a Starlark `record(...)` type.
     pub initial_record_context: Option<V>,
 }
@@ -963,6 +1021,7 @@ impl<'v> Freeze for StarlarkMachineGen<Value<'v>> {
             guard_slots: self.guard_slots.freeze(freezer)?,
             reducer_slots: self.reducer_slots.freeze(freezer)?,
             delay_slots: self.delay_slots.freeze(freezer)?,
+            input_slots: self.input_slots.freeze(freezer)?,
             initial_record_context: self.initial_record_context.freeze(freezer)?,
         })
     }
@@ -1008,6 +1067,7 @@ pub fn build_and_validate_machine<'v>(
     let mut guard_slots: Vec<Value<'v>> = Vec::new();
     let mut reducer_slots: Vec<Value<'v>> = Vec::new();
     let mut delay_slots: Vec<Value<'v>> = Vec::new();
+    let mut input_slots: Vec<Value<'v>> = Vec::new();
 
     let mut states = IndexMap::new();
     for (state_id, node_data) in entries {
@@ -1016,6 +1076,7 @@ pub fn build_and_validate_machine<'v>(
             &mut guard_slots,
             &mut reducer_slots,
             &mut delay_slots,
+            &mut input_slots,
         );
         states.insert(state_id, ir_node);
     }
@@ -1036,6 +1097,7 @@ pub fn build_and_validate_machine<'v>(
         guard_slots,
         reducer_slots,
         delay_slots,
+        input_slots,
         initial_record_context,
     })
 }
@@ -1171,16 +1233,40 @@ fn lower_outcome<'v>(
     }
 }
 
+fn lower_invoke_input<'v>(
+    inp: InvokeInputGen<Value<'v>>,
+    input_slots: &mut Vec<Value<'v>>,
+) -> serde_json::Value {
+    match inp {
+        InvokeInputGen::Json(j) => j.0,
+        InvokeInputGen::Callable(val) => {
+            let slot = input_slots.len();
+            input_slots.push(val);
+            serde_json::json!({
+                INVOKE_INPUT_SLOT_KEY: starlark_input_slot_name(slot),
+            })
+        }
+        InvokeInputGen::Object(entries) => {
+            let mut map = serde_json::Map::with_capacity(entries.len());
+            for (k, v) in entries {
+                map.insert(k, lower_invoke_input(v, input_slots));
+            }
+            serde_json::Value::Object(map)
+        }
+    }
+}
+
 fn lower_invoke<'v>(
     inv: InvokeDataGen<Value<'v>>,
     guard_slots: &mut Vec<Value<'v>>,
     reducer_slots: &mut Vec<Value<'v>>,
     delay_slots: &mut Vec<Value<'v>>,
+    input_slots: &mut Vec<Value<'v>>,
 ) -> InvokeDef {
     InvokeDef {
         id: inv.id,
         src: inv.src,
-        input: inv.input.0,
+        input: lower_invoke_input(inv.input, input_slots),
         on_done: inv
             .on_done
             .into_iter()
@@ -1214,6 +1300,7 @@ fn lower_node<'v>(
     guard_slots: &mut Vec<Value<'v>>,
     reducer_slots: &mut Vec<Value<'v>>,
     delay_slots: &mut Vec<Value<'v>>,
+    input_slots: &mut Vec<Value<'v>>,
 ) -> StateNodeDef {
     let kind = match node.kind {
         NodeKindDataGen::Atomic => StateKind::Atomic,
@@ -1222,7 +1309,13 @@ fn lower_node<'v>(
             for (child_id, child_node) in children {
                 map.insert(
                     StateId(child_id),
-                    lower_node(child_node, guard_slots, reducer_slots, delay_slots),
+                    lower_node(
+                        child_node,
+                        guard_slots,
+                        reducer_slots,
+                        delay_slots,
+                        input_slots,
+                    ),
                 );
             }
             StateKind::Compound {
@@ -1235,7 +1328,13 @@ fn lower_node<'v>(
             for (child_id, child_node) in children {
                 map.insert(
                     StateId(child_id),
-                    lower_node(child_node, guard_slots, reducer_slots, delay_slots),
+                    lower_node(
+                        child_node,
+                        guard_slots,
+                        reducer_slots,
+                        delay_slots,
+                        input_slots,
+                    ),
                 );
             }
             StateKind::Parallel { states: map }
@@ -1278,7 +1377,7 @@ fn lower_node<'v>(
     let invoke = node
         .invoke
         .into_iter()
-        .map(|inv| lower_invoke(inv, guard_slots, reducer_slots, delay_slots))
+        .map(|inv| lower_invoke(inv, guard_slots, reducer_slots, delay_slots, input_slots))
         .collect();
     let on_done = node
         .on_done

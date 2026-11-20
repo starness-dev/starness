@@ -2,6 +2,7 @@
 
 pub mod dsl;
 pub mod loader;
+pub mod stdlib;
 pub mod types;
 
 pub use dsl::{chart_dialect, chart_globals, register_dsl};
@@ -9,10 +10,14 @@ pub use loader::{
     ChartCompileError, CompiledChart, FsResolver, InMemoryResolver, SourceResolver,
     compile_starlark_file, compile_starlark_str, compile_with_resolver,
 };
+pub use stdlib::{
+    ACP_MODULE_ID, BUILTIN_ACP_SERVICE, BUILTIN_EXEC_SERVICE, BUILTIN_HTTP_SERVICE, EXEC_MODULE_ID,
+    HTTP_MODULE_ID, is_builtin_service, resolve_builtin_module,
+};
 pub use types::{
-    FrozenStarlarkMachine, StarlarkAction, StarlarkAfter, StarlarkGuard, StarlarkInvoke,
-    StarlarkMachine, StarlarkOutcome, StarlarkStateId, StarlarkStateNode, StarlarkStateSpace,
-    StarlarkTransition, SymbolOrEnum,
+    FrozenStarlarkMachine, INVOKE_INPUT_SLOT_KEY, StarlarkAction, StarlarkAfter, StarlarkGuard,
+    StarlarkInvoke, StarlarkMachine, StarlarkOutcome, StarlarkStateId, StarlarkStateNode,
+    StarlarkStateSpace, StarlarkTransition, SymbolOrEnum, starlark_input_slot_name,
 };
 
 #[cfg(test)]
@@ -207,6 +212,75 @@ chart = machine(
                     GuardRef::Named("HAS_MASTER_KEY".into()),
                 ]),
             ])
+        );
+    }
+
+    #[test]
+    fn builtin_virtual_modules_http_exec_acp_resolve_and_typecheck() {
+        let src = r#"
+load("@starchart/http", "HttpMethod", "HttpRequest", "http_request", "invoke_http")
+load("@starchart/exec", "invoke_cmd")
+load("@starchart/acp", "acp_agent", "invoke_agent")
+
+Ctx = record(api_url = str, task = str)
+S = state_space("fetching", "coding", "testing", "done", "failed")
+
+coder = acp_agent(id = "coder", command = "agy", args = ["acp"], model = "gemini-2.5-pro")
+
+def make_req(ctx: Ctx) -> HttpRequest:
+    return http_request(method = HttpMethod.POST, url = ctx.api_url + "/items", json = {"ok": True})
+
+def make_prompt(ctx: Ctx) -> str:
+    return "Implement: " + ctx.task
+
+chart = machine(
+    id = "builtin_mods",
+    initial = S.fetching,
+    context = Ctx(api_url = "http://localhost:8080", task = "healthcheck"),
+    states = {
+        S.fetching: state(
+            invoke = invoke_http(request = make_req, on_done = S.coding, on_error = S.failed),
+        ),
+        S.coding: state(
+            invoke = invoke_agent(agent = coder, prompt = make_prompt, on_done = S.testing, on_error = S.failed),
+        ),
+        S.testing: state(
+            invoke = invoke_cmd(cmd = ["echo", "ok"], on_done = S.done, on_error = S.failed),
+        ),
+        S.done: final_state(),
+        S.failed: final_state(),
+    },
+)
+"#;
+        let compiled = compile_starlark_str("builtin_mods.star", src, None)
+            .expect("built-in @starchart/* modules should typecheck and compile");
+        assert_eq!(compiled.inputs.len(), 2);
+        assert_eq!(
+            compiled.ir.states[&starchart_ir::StateId::from("fetching")].invoke[0].src,
+            BUILTIN_HTTP_SERVICE
+        );
+        assert_eq!(
+            compiled.ir.states[&starchart_ir::StateId::from("coding")].invoke[0].src,
+            BUILTIN_ACP_SERVICE
+        );
+        assert_eq!(
+            compiled.ir.states[&starchart_ir::StateId::from("testing")].invoke[0].src,
+            BUILTIN_EXEC_SERVICE
+        );
+    }
+
+    #[test]
+    fn builtin_http_module_rejects_invalid_parameter_types_statically() {
+        let src = r#"
+load("@starchart/http", "http_request")
+fail("must fail static typecheck before evaluation")
+req = http_request(url = 12345)
+"#;
+        let err = compile_starlark_str("bad_http.star", src, None)
+            .expect_err("non-string url must fail static typecheck");
+        assert!(
+            matches!(err, ChartCompileError::Typecheck(_)),
+            "expected Typecheck error, got: {err}"
         );
     }
 }

@@ -9,16 +9,18 @@ use starlark::syntax::{Dialect, DialectTypes};
 use starlark::values::Value;
 use starlark::values::dict::UnpackDictEntries;
 use starlark::values::list::UnpackList;
+use starlark::values::none::NoneOr;
 use starlark::values::record::Record;
 use starlark::values::tuple::UnpackTuple;
 
 use crate::types::{
     ActionDataGen, ActionInput, AfterDataGen, AssignCallable, DelayInput, GuardExprGen, GuardInput,
-    InvokeDataGen, InvokeOutcomesInput, JsonHolder, NodeKindDataGen, OneOrManyAfter,
-    OneOrManyInvoke, OutcomeDataGen, StarlarkAction, StarlarkAfter, StarlarkGuard, StarlarkInvoke,
-    StarlarkMachine, StarlarkOutcome, StarlarkStateId, StarlarkStateNode, StarlarkStateSpace,
-    StarlarkTransition, StateNodeDataGen, SymbolOrEnum, TransitionDataGen,
+    InvokeDataGen, InvokeInputGen, InvokeOutcomesInput, JsonHolder, NodeKindDataGen,
+    OneOrManyAfter, OneOrManyInvoke, OutcomeDataGen, StarlarkAction, StarlarkAfter, StarlarkGuard,
+    StarlarkInvoke, StarlarkMachine, StarlarkOutcome, StarlarkStateId, StarlarkStateNode,
+    StarlarkStateSpace, StarlarkTransition, StateNodeDataGen, SymbolOrEnum, TransitionDataGen,
     build_and_validate_machine, clone_node_to_value, clone_transition_to_value,
+    unpack_invoke_input_value,
 };
 
 fn unpack_optional_json(val: Option<Value<'_>>) -> anyhow::Result<Option<JsonHolder>> {
@@ -370,32 +372,37 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
     /// Declares an invoked host service or child statechart started on state entry and cancelled on exit.
     fn invoke<'v>(
         #[starlark(require = named)] src: SymbolOrEnum,
-        #[starlark(require = named)] id: Option<&str>,
+        #[starlark(require = named, default = NoneOr::None)] id: NoneOr<&str>,
         #[starlark(require = named)] input: Option<Value<'v>>,
-        #[starlark(require = named)] on_done: Option<InvokeOutcomesInput<'v>>,
-        #[starlark(require = named)] on_error: Option<InvokeOutcomesInput<'v>>,
+        #[starlark(require = named, default = NoneOr::None)] on_done: NoneOr<
+            InvokeOutcomesInput<'v>,
+        >,
+        #[starlark(require = named, default = NoneOr::None)] on_error: NoneOr<
+            InvokeOutcomesInput<'v>,
+        >,
     ) -> anyhow::Result<StarlarkInvoke<'v>> {
         if src.0.trim().is_empty() {
             bail!("invoke `src` must not be empty");
         }
-        if let Some(explicit_id) = id
+        let id_opt = id.into_option();
+        if let Some(explicit_id) = id_opt
             && explicit_id.trim().is_empty()
         {
             bail!("invoke `id` must not be empty");
         }
 
-        let input_json = match input {
-            Some(val) if !val.is_none() => val.to_json_value()?,
-            _ => serde_json::Value::Null,
+        let input_data = match input {
+            Some(val) if !val.is_none() => unpack_invoke_input_value(val)?,
+            _ => InvokeInputGen::Json(JsonHolder(serde_json::Value::Null)),
         };
 
         Ok(StarlarkInvoke {
             data: InvokeDataGen {
-                id: id.map(str::to_owned),
+                id: id_opt.map(str::to_owned),
                 src: src.0,
-                input: JsonHolder(input_json),
-                on_done: on_done.map(|o| o.0).unwrap_or_default(),
-                on_error: on_error.map(|o| o.0).unwrap_or_default(),
+                input: input_data,
+                on_done: on_done.into_option().map(|o| o.0).unwrap_or_default(),
+                on_error: on_error.into_option().map(|o| o.0).unwrap_or_default(),
             },
         })
     }

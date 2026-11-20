@@ -13,7 +13,8 @@ use starlark::values::{FrozenValue, OwnedFrozenValue, ValueLike};
 use thiserror::Error;
 
 use crate::dsl::{chart_dialect, chart_globals};
-use crate::types::FrozenStarlarkMachine;
+use crate::stdlib::resolve_builtin_module;
+use crate::types::{FrozenStarlarkMachine, starlark_input_slot_name};
 
 /// Compiled, validated statechart paired with thread-safe frozen Starlark callables.
 #[derive(Debug, Clone)]
@@ -22,6 +23,7 @@ pub struct CompiledChart {
     pub guards: HashMap<String, OwnedFrozenValue>,
     pub reducers: HashMap<String, OwnedFrozenValue>,
     pub delays: HashMap<String, OwnedFrozenValue>,
+    pub inputs: HashMap<String, OwnedFrozenValue>,
     /// Optional frozen `RecordType` constructor if `machine(context = ...)` used a Starlark `record(...)`.
     pub context_record_type: Option<OwnedFrozenValue>,
 }
@@ -240,7 +242,10 @@ fn compile_module_recursive(
 
     for load in ast.loads() {
         let load_str = load.module_id;
-        let (dep_id, dep_source) = resolver.resolve(module_id, load_str)?;
+        let (dep_id, dep_source) = match resolve_builtin_module(load_str) {
+            Some((builtin_id, builtin_src)) => (builtin_id.to_owned(), builtin_src.to_owned()),
+            None => resolver.resolve(module_id, load_str)?,
+        };
         let dep_compiled = compile_module_recursive(
             &dep_id,
             &dep_source,
@@ -378,6 +383,14 @@ fn extract_compiled_chart(
         delays.insert(name, owned);
     }
 
+    let mut inputs = HashMap::with_capacity(machine.input_slots.len());
+    for (slot, frozen_fn) in machine.input_slots.iter().copied().enumerate() {
+        let name = starlark_input_slot_name(slot);
+        // SAFETY: `frozen_fn` was frozen into `frozen_module`'s heap during `module.freeze()`.
+        let owned = unsafe { OwnedFrozenValue::new(heap.dupe(), frozen_fn) };
+        inputs.insert(name, owned);
+    }
+
     let context_record_type = machine
         .initial_record_context
         .and_then(|initial_rec| find_matching_record_type(initial_rec, loaded_modules));
@@ -387,6 +400,7 @@ fn extract_compiled_chart(
         guards,
         reducers,
         delays,
+        inputs,
         context_record_type,
     })
 }
