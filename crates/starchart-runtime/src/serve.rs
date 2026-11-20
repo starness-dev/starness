@@ -1,18 +1,27 @@
-//! HTTP/1.1 + SSE daemon (`starchart serve`) and JSON state-file persistence.
+//! Multi-machine, multi-instance HTTP/1.1 + SSE daemon (`starchart serve`) backed by SQLite.
 //!
-//! Exposes a running [`StarchartActor`] over HTTP with zero external framework dependencies:
-//! - `GET /health` — liveness & machine status
-//! - `GET /state` (and `GET /`) — active states, context, history, status, output
-//! - `GET /diagram` — Harel `stateDiagram-v2` Mermaid definition
-//! - `GET /trace` — lossless Server-Sent Events (`text/event-stream`) or JSONL (`?format=jsonl`)
-//! - `POST /events` / `POST /events/<EVENT>` — dispatch external events & return updated state
+//! Routes:
+//! - `GET /health` (and `GET /`) — daemon liveness, loaded machines, live actor count, DB target
+//! - `GET /trace` — server-wide SSE / JSONL trace firehose across all instances
+//! - `GET /machines` — list registered `.star` machine definitions
+//! - `GET /machines/:machine` — inspect a machine definition & instance counts
+//! - `GET /machines/:machine/diagram` — Harel `stateDiagram-v2` Mermaid definition
+//! - `POST /machines/:machine/instances` — create/start an instance (`{"id"?, "context"?, "idempotent"?}`)
+//! - `GET /machines/:machine/instances` — list instances (`?status=active|waiting|completed|cancelled|failed`)
+//! - `GET /machines/:machine/instances/:id` — inspect an instance snapshot
+//! - `POST /machines/:machine/instances/:id/events` (and `/events/:event`) — route an event to an instance
+//! - `POST /machines/:machine/instances/:id/cancel` — cancel a running/waiting instance
+//! - `DELETE /machines/:machine/instances/:id` — cancel instance (or delete from SQLite with `?purge=true`)
+//! - `GET /machines/:machine/instances/:id/trace` — per-instance SSE (`text/event-stream`) or JSONL (`?format=jsonl`)
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use starchart_ir::{MachineDef, StateId, StateKind, StateNodeDef};
@@ -20,10 +29,15 @@ use starchart_starlark::CompiledChart;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
+use xstate_statemachine::core::Status;
 
-use crate::{HostCallbacks, StarchartActor, render_mermaid};
+use crate::store::{InstanceSnapshot, InstanceStatus, SqliteStore};
+use crate::{
+    HostCallbacks, StarchartActor, active_states_have_autonomous_work, machine_is_completable,
+    render_mermaid,
+};
 
-/// Human-readable, resumable state snapshot persisted by `--state-file`.
+/// Human-readable, resumable state snapshot shape used when rehydrating an [`MachineDef`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedChartState {
     pub machine: String,
@@ -42,17 +56,31 @@ pub struct PersistedChartState {
 /// Applies a [`PersistedChartState`] onto a cloned [`MachineDef`] so spawning a new actor
 /// resumes in the saved active states, context, and shallow-history targets.
 pub fn apply_persisted_state_to_ir(ir: &mut MachineDef, saved: &PersistedChartState) {
-    if saved.context.is_object() {
-        ir.context = saved.context.clone();
+    apply_snapshot_fields_to_ir(ir, &saved.context, &saved.history, &saved.active_states);
+}
+
+/// Applies an [`InstanceSnapshot`] onto a cloned [`MachineDef`] for SQLite rehydration.
+pub fn apply_instance_snapshot_to_ir(ir: &mut MachineDef, snap: &InstanceSnapshot) {
+    apply_snapshot_fields_to_ir(ir, &snap.context, &snap.history, &snap.active_states);
+}
+
+fn apply_snapshot_fields_to_ir(
+    ir: &mut MachineDef,
+    context: &Value,
+    history: &HashMap<String, String>,
+    active_states: &[String],
+) {
+    if context.is_object() {
+        ir.context = context.clone();
     }
 
-    // Restore shallow/deep history `default_target` fallbacks from `saved.history`.
-    for (compound_id, last_child) in &saved.history {
+    // Restore shallow/deep history `default_target` fallbacks from `history`.
+    for (compound_id, last_child) in history {
         set_history_default_recursive(&mut ir.states, compound_id, last_child);
     }
 
     // Restore `initial` pointers along the saved active state path(s).
-    for path in &saved.active_states {
+    for path in active_states {
         let trimmed = path
             .strip_prefix(&format!("{}.", ir.id))
             .unwrap_or(path.as_str());
@@ -127,81 +155,161 @@ pub fn record_compound_history(active_states: &[String], history: &mut HashMap<S
     }
 }
 
-/// Configuration for [`serve_chart_http`].
+/// One compiled statechart definition plus host callbacks to register in [`serve_charts_http`].
+#[derive(Clone)]
+pub struct ServeDefinition {
+    pub chart: CompiledChart,
+    pub callbacks: HostCallbacks,
+}
+
+impl std::fmt::Debug for ServeDefinition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServeDefinition")
+            .field("machine_id", &self.chart.ir.id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Configuration for [`serve_charts_http`].
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     pub bind_addr: String,
-    pub state_file: Option<PathBuf>,
-    pub exit_on_done: bool,
+    /// SQLite database target (`":memory:"` by default, or file path on disk).
+    pub db: String,
+    /// Optional shutdown notifier enabling callers/tests to stop the HTTP loop cleanly.
+    pub shutdown: Option<Arc<Notify>>,
 }
 
-struct SharedServerState {
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            bind_addr: "127.0.0.1:8080".to_owned(),
+            db: ":memory:".to_owned(),
+            shutdown: None,
+        }
+    }
+}
+
+struct RegisteredMachine {
+    chart: CompiledChart,
+    callbacks: HostCallbacks,
     diagram: String,
+    completable: bool,
+}
+
+struct LiveInstance {
+    machine_id: String,
+    instance_id: String,
+    ir: MachineDef,
     actor: StarchartActor,
-    state_file: Option<PathBuf>,
-    exit_on_done: bool,
+    created_at_ms: u64,
     history: Mutex<HashMap<String, String>>,
     persist_lock: AsyncMutex<()>,
     event_lock: AsyncMutex<()>,
-    shutdown: Notify,
+    trace_closed: AtomicBool,
+    trace_notify: Arc<Notify>,
+    finalized: AtomicBool,
 }
 
-impl SharedServerState {
-    async fn snapshot_state(&self) -> PersistedChartState {
+struct ServerState {
+    machines: IndexMap<String, Arc<RegisteredMachine>>,
+    store: Arc<SqliteStore>,
+    live_instances: Mutex<HashMap<(String, String), Arc<LiveInstance>>>,
+    create_lock: AsyncMutex<()>,
+    next_id_counter: AtomicU64,
+    global_trace_notify: Notify,
+    shutdown: Arc<Notify>,
+}
+
+impl LiveInstance {
+    async fn capture_snapshot(&self, forced_status: Option<InstanceStatus>) -> InstanceSnapshot {
         let view = self.actor.subscribe().borrow().clone();
         let active_states = self.actor.active_states();
         let history = {
-            let mut h = self.history.lock().unwrap_or_else(|p| p.into_inner());
+            let mut h = self
+                .history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             record_compound_history(&active_states, &mut h);
             h.clone()
         };
         let context = self.actor.context().await.unwrap_or(Value::Null);
-        PersistedChartState {
-            machine: self.actor.machine_id.clone(),
-            status: view.status.as_str().to_owned(),
-            done: self.actor.is_done(),
+        let computed_status = if let Some(forced) = forced_status {
+            forced
+        } else if view.error.is_some() {
+            InstanceStatus::Failed
+        } else if self.actor.is_done() || view.status == Status::Done {
+            InstanceStatus::Completed
+        } else if view.status == Status::Stopped {
+            InstanceStatus::Cancelled
+        } else if active_states_have_autonomous_work(&self.ir, &active_states) {
+            InstanceStatus::Active
+        } else {
+            InstanceStatus::Waiting
+        };
+
+        InstanceSnapshot {
+            machine: self.machine_id.clone(),
+            id: self.instance_id.clone(),
+            status: computed_status,
+            done: computed_status == InstanceStatus::Completed,
             active_states,
             history,
             context,
             output: self.actor.output(),
             error: view.error,
+            created_at_ms: self.created_at_ms,
+            updated_at_ms: now_epoch_ms(),
         }
-    }
-
-    async fn persist_if_configured(&self) -> anyhow::Result<PersistedChartState> {
-        let _guard = self.persist_lock.lock().await;
-        let snap = self.snapshot_state().await;
-        if let Some(path) = &self.state_file {
-            write_state_file_atomic(path, &snap)?;
-        }
-        Ok(snap)
     }
 }
 
-fn write_state_file_atomic(path: &Path, snap: &PersistedChartState) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
+impl ServerState {
+    fn get_live(&self, machine_id: &str, instance_id: &str) -> Option<Arc<LiveInstance>> {
+        let guard = self
+            .live_instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .get(&(machine_id.to_owned(), instance_id.to_owned()))
+            .cloned()
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let tmp_name = format!(
-        "{}.{}.{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("state"),
-        std::process::id(),
-        nanos
-    );
-    let tmp_path = path.with_file_name(tmp_name);
-    let bytes = serde_json::to_vec_pretty(snap)?;
-    std::fs::write(&tmp_path, bytes)?;
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
+
+    fn remove_live(&self, machine_id: &str, instance_id: &str) -> Option<Arc<LiveInstance>> {
+        let mut guard = self
+            .live_instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.remove(&(machine_id.to_owned(), instance_id.to_owned()))
+    }
+
+    fn live_count(&self) -> usize {
+        self.live_instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|inst| !inst.finalized.load(Ordering::Relaxed))
+            .count()
+    }
+
+    fn generate_instance_id(&self) -> String {
+        let seq = self.next_id_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let ms = now_epoch_ms();
+        format!("inst-{ms:x}-{seq}")
+    }
 }
 
-/// Binds a TCP listener for [`serve_chart_http`], returning `(TcpListener, SocketAddr)` so callers
+fn now_epoch_ms() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(0)
+}
+
+/// Binds a TCP listener for [`serve_charts_http`], returning `(TcpListener, SocketAddr)` so callers
 /// can log the bound address (including ephemeral `127.0.0.1:0` ports) before entering the loop.
 pub async fn bind_serve_listener(bind_addr: &str) -> anyhow::Result<(TcpListener, SocketAddr)> {
     let listener = TcpListener::bind(bind_addr)
@@ -211,76 +319,66 @@ pub async fn bind_serve_listener(bind_addr: &str) -> anyhow::Result<(TcpListener
     Ok((listener, local))
 }
 
-/// Starts a [`StarchartActor`] (resuming from `options.state_file` if it exists on disk) and serves
-/// HTTP + SSE endpoints on `listener`.
-pub async fn serve_chart_http(
-    mut chart: CompiledChart,
-    callbacks: HostCallbacks,
+/// Hosts one or more compiled `.star` statechart definitions on `listener`, persisting instance
+/// snapshots and execution traces to SQLite (`:memory:` by default, or `options.db` on disk).
+/// Any non-terminal (`active` or `waiting`) instances present in `options.db` are automatically
+/// rehydrated on startup.
+pub async fn serve_charts_http(
+    definitions: Vec<ServeDefinition>,
     listener: TcpListener,
     options: ServeOptions,
 ) -> anyhow::Result<()> {
-    let mut initial_history = HashMap::new();
-    if let Some(path) = &options.state_file
-        && path.is_file()
-    {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("failed reading state file `{}`", path.display()))?;
-        let saved: PersistedChartState = serde_json::from_str(&raw)
-            .with_context(|| format!("invalid JSON in state file `{}`", path.display()))?;
-        if saved.machine != chart.ir.id {
-            bail!(
-                "state file `{}` belongs to machine `{}`, expected `{}`",
-                path.display(),
-                saved.machine,
-                chart.ir.id
-            );
-        }
-        initial_history = saved.history.clone();
-        apply_persisted_state_to_ir(&mut chart.ir, &saved);
+    if definitions.is_empty() {
+        bail!("serve_charts_http requires at least one statechart definition");
     }
 
-    let diagram = render_mermaid(&chart)?;
-    let actor = StarchartActor::spawn(&chart, callbacks)?;
-    record_compound_history(&actor.active_states(), &mut initial_history);
-
-    let shared = Arc::new(SharedServerState {
-        diagram,
-        actor,
-        state_file: options.state_file,
-        exit_on_done: options.exit_on_done,
-        history: Mutex::new(initial_history),
-        persist_lock: AsyncMutex::new(()),
-        event_lock: AsyncMutex::new(()),
-        shutdown: Notify::new(),
-    });
-
-    // Persist initial state immediately.
-    let initial_snap = shared.persist_if_configured().await?;
-    if shared.exit_on_done && initial_snap.done {
-        shared.actor.stop().await;
-        shared.actor.trace_hub().close();
-        return Ok(());
+    let mut machines = IndexMap::with_capacity(definitions.len());
+    for def in definitions {
+        let id = def.chart.ir.id.clone();
+        if machines.contains_key(&id) {
+            bail!("duplicate machine id `{id}` registered in starchart serve");
+        }
+        let diagram = render_mermaid(&def.chart)
+            .with_context(|| format!("failed rendering Mermaid diagram for `{id}`"))?;
+        let completable = machine_is_completable(&def.chart.ir);
+        machines.insert(
+            id,
+            Arc::new(RegisteredMachine {
+                chart: def.chart,
+                callbacks: def.callbacks,
+                diagram,
+                completable,
+            }),
+        );
     }
 
-    // Background watcher: persists state on autonomous `invoke`/`after` transitions
-    // and triggers `--exit-on-done` once the machine reaches a final state.
-    let watcher_state = Arc::clone(&shared);
-    let watcher_handle = tokio::spawn(async move {
-        let mut rx = watcher_state.actor.subscribe();
-        while rx.changed().await.is_ok() {
-            let Ok(snap) = watcher_state.persist_if_configured().await else {
-                continue;
-            };
-            if watcher_state.exit_on_done && (snap.done || snap.error.is_some()) {
-                watcher_state.shutdown.notify_waiters();
-                break;
-            }
-        }
+    let store = Arc::new(SqliteStore::open(&options.db)?);
+    let shutdown = options
+        .shutdown
+        .unwrap_or_else(|| Arc::new(Notify::new()));
+
+    let state = Arc::new(ServerState {
+        machines,
+        store,
+        live_instances: Mutex::new(HashMap::new()),
+        create_lock: AsyncMutex::new(()),
+        next_id_counter: AtomicU64::new(0),
+        global_trace_notify: Notify::new(),
+        shutdown: Arc::clone(&shutdown),
     });
+
+    // Rehydrate any `active` or `waiting` instances stored in SQLite across restarts.
+    let resumable = state.store.list_resumable_instances()?;
+    for saved in resumable {
+        if let Some(reg) = state.machines.get(&saved.machine).cloned() {
+            let _ = spawn_or_rehydrate_instance(&state, &reg, saved.id.clone(), None, Some(&saved))
+                .await?;
+        }
+    }
 
     loop {
         tokio::select! {
-            _ = shared.shutdown.notified() => {
+            _ = shutdown.notified() => {
                 break;
             }
             accept_res = listener.accept() => {
@@ -288,7 +386,7 @@ pub async fn serve_chart_http(
                     Ok(pair) => pair,
                     Err(_) => continue,
                 };
-                let conn_state = Arc::clone(&shared);
+                let conn_state = Arc::clone(&state);
                 tokio::spawn(async move {
                     let _ = handle_http_connection(stream, conn_state).await;
                 });
@@ -296,18 +394,194 @@ pub async fn serve_chart_http(
         }
     }
 
-    watcher_handle.abort();
-    // Acquire `event_lock` so any in-flight `POST /events` response finishes flushing before shutdown.
-    let _drain_events = shared.event_lock.lock().await;
-    let _ = shared.persist_if_configured().await;
-    shared.actor.stop().await;
-    shared.actor.trace_hub().close();
+    // Gracefully flush and stop all currently live actors on daemon shutdown (preserving their
+    // `active`/`waiting` status in SQLite so they resume cleanly on the next startup).
+    let remaining: Vec<Arc<LiveInstance>> = {
+        let mut map = state
+            .live_instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.drain().map(|(_, v)| v).collect()
+    };
+    for live in remaining {
+        let _ev_guard = live.event_lock.lock().await;
+        let _p_guard = live.persist_lock.lock().await;
+        let snap = live.capture_snapshot(None).await;
+        let _ = state.store.upsert_instance(&snap);
+        live.actor.stop().await;
+        live.actor.trace_hub().close();
+    }
+
     Ok(())
+}
+
+async fn spawn_or_rehydrate_instance(
+    server: &Arc<ServerState>,
+    reg: &Arc<RegisteredMachine>,
+    instance_id: String,
+    context_patch: Option<&serde_json::Map<String, Value>>,
+    rehydrated: Option<&InstanceSnapshot>,
+) -> anyhow::Result<InstanceSnapshot> {
+    let mut chart = reg.chart.clone();
+    let mut initial_history = HashMap::new();
+    let created_at_ms = match rehydrated {
+        Some(saved) => {
+            initial_history = saved.history.clone();
+            apply_instance_snapshot_to_ir(&mut chart.ir, saved);
+            saved.created_at_ms
+        }
+        None => {
+            if let Some(patch) = context_patch
+                && let Value::Object(ctx_map) = &mut chart.ir.context
+            {
+                for (k, v) in patch {
+                    ctx_map.insert(k.clone(), v.clone());
+                }
+            }
+            now_epoch_ms()
+        }
+    };
+
+    let machine_id = chart.ir.id.clone();
+    let base_seq = server.store.max_trace_seq(&machine_id, &instance_id)?;
+    let instance_ir = chart.ir.clone();
+    let actor = StarchartActor::spawn_instance(
+        &chart,
+        reg.callbacks.clone(),
+        instance_id.clone(),
+        base_seq,
+    )?;
+    let mut trace_rx = actor.subscribe_traces();
+
+    let live = Arc::new(LiveInstance {
+        machine_id: machine_id.clone(),
+        instance_id: instance_id.clone(),
+        ir: instance_ir,
+        actor,
+        created_at_ms,
+        history: Mutex::new(initial_history),
+        persist_lock: AsyncMutex::new(()),
+        event_lock: AsyncMutex::new(()),
+        trace_closed: AtomicBool::new(false),
+        trace_notify: Arc::new(Notify::new()),
+        finalized: AtomicBool::new(false),
+    });
+
+    // Persist the `instances` row BEFORE inserting `trace_events` (foreign key constraint).
+    let initial_snap = {
+        let _p_guard = live.persist_lock.lock().await;
+        let snap = live.capture_snapshot(None).await;
+        server.store.upsert_instance(&snap)?;
+        snap
+    };
+
+    let initial_traces = trace_rx.drain();
+    if !initial_traces.is_empty() {
+        let _ = server
+            .store
+            .insert_trace_records(&machine_id, &instance_id, &initial_traces);
+        live.trace_notify.notify_waiters();
+        server.global_trace_notify.notify_waiters();
+    }
+
+    // If the statechart entered a `final_state` immediately during startup, finalize and drop actor now.
+    if initial_snap.status.is_terminal() {
+        live.finalized.store(true, Ordering::SeqCst);
+        live.actor.stop().await;
+        live.actor.trace_hub().close();
+        let tail = trace_rx.drain();
+        if !tail.is_empty() {
+            let _ = server
+                .store
+                .insert_trace_records(&machine_id, &instance_id, &tail);
+        }
+        live.trace_closed.store(true, Ordering::SeqCst);
+        live.trace_notify.notify_waiters();
+        server.global_trace_notify.notify_waiters();
+        return Ok(initial_snap);
+    }
+
+    {
+        let mut map = server
+            .live_instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.insert((machine_id.clone(), instance_id.clone()), Arc::clone(&live));
+    }
+
+    // Background task 1: stream `TraceRecord`s into SQLite `trace_events` and wake SSE followers.
+    let trace_server = Arc::clone(server);
+    let trace_live = Arc::clone(&live);
+    tokio::spawn(async move {
+        while let Some(first) = trace_rx.recv().await {
+            let mut batch = vec![first];
+            batch.extend(trace_rx.drain());
+            let _ = trace_server.store.insert_trace_records(
+                &trace_live.machine_id,
+                &trace_live.instance_id,
+                &batch,
+            );
+            trace_live.trace_notify.notify_waiters();
+            trace_server.global_trace_notify.notify_waiters();
+        }
+        trace_live.trace_closed.store(true, Ordering::SeqCst);
+        trace_server.remove_live(&trace_live.machine_id, &trace_live.instance_id);
+        trace_live.trace_notify.notify_waiters();
+        trace_server.global_trace_notify.notify_waiters();
+    });
+
+    // Background task 2: persist autonomous state transitions (`invoke` / `after`) and drop
+    // completed/failed actors from RAM as soon as they reach a terminal state.
+    let watch_server = Arc::clone(server);
+    let watch_live = Arc::clone(&live);
+    tokio::spawn(async move {
+        let mut rx = watch_live.actor.subscribe();
+        while rx.changed().await.is_ok() {
+            let Ok(snap) = sync_and_maybe_finalize(&watch_server, &watch_live, None).await else {
+                continue;
+            };
+            if snap.status.is_terminal() {
+                break;
+            }
+        }
+    });
+
+    Ok(initial_snap)
+}
+
+async fn sync_and_maybe_finalize(
+    server: &Arc<ServerState>,
+    live: &Arc<LiveInstance>,
+    forced_status: Option<InstanceStatus>,
+) -> anyhow::Result<InstanceSnapshot> {
+    let snap = {
+        let _p_guard = live.persist_lock.lock().await;
+        let snap = live.capture_snapshot(forced_status).await;
+        server.store.upsert_instance(&snap)?;
+        snap
+    };
+
+    if snap.status.is_terminal() && !live.finalized.swap(true, Ordering::SeqCst) {
+        live.actor.stop().await;
+        live.actor.trace_hub().close();
+    }
+
+    Ok(snap)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CreateInstanceBody {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    context: Option<Value>,
+    #[serde(default)]
+    idempotent: Option<bool>,
 }
 
 async fn handle_http_connection(
     stream: TcpStream,
-    state: Arc<SharedServerState>,
+    state: Arc<ServerState>,
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -328,13 +602,14 @@ async fn handle_http_connection(
     }
     let method = parts[0].to_ascii_uppercase();
     let raw_target = parts[1];
-    let (path, query) = match raw_target.split_once('?') {
+    let (raw_path, query) = match raw_target.split_once('?') {
         Some((p, q)) => (p, q),
         None => (raw_target, ""),
     };
 
     let mut content_length: usize = 0;
     let mut accept_header = String::new();
+    let mut last_event_id: Option<u64> = None;
     let mut line = String::new();
     loop {
         line.clear();
@@ -348,10 +623,11 @@ async fn handle_http_connection(
         if let Some((k, v)) = trimmed.split_once(':') {
             let key = k.trim().to_ascii_lowercase();
             let val = v.trim();
-            if key == "content-length" {
-                content_length = val.parse::<usize>().unwrap_or(0);
-            } else if key == "accept" {
-                accept_header = val.to_ascii_lowercase();
+            match key.as_str() {
+                "content-length" => content_length = val.parse::<usize>().unwrap_or(0),
+                "accept" => accept_header = val.to_ascii_lowercase(),
+                "last-event-id" => last_event_id = val.parse::<u64>().ok(),
+                _ => {}
             }
         }
     }
@@ -372,96 +648,567 @@ async fn handle_http_connection(
     }
 
     if method == "OPTIONS" {
-        let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Last-Event-ID\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         write_half.write_all(resp.as_bytes()).await?;
         write_half.flush().await?;
         return Ok(());
     }
 
-    match (method.as_str(), path) {
-        ("GET", "/health") => {
-            let snap = state.snapshot_state().await;
+    let query_params = parse_query_params(query);
+    let segments: Vec<String> = raw_path
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(percent_decode)
+        .collect();
+    let seg_refs: Vec<&str> = segments.iter().map(String::as_str).collect();
+
+    match (method.as_str(), seg_refs.as_slice()) {
+        // GET / or GET /health
+        ("GET", [] | ["health"]) => {
+            let machine_ids: Vec<&String> = state.machines.keys().collect();
             write_json_response(
                 &mut write_half,
                 "200 OK",
                 &json!({
-                    "ok": snap.error.is_none(),
-                    "machine": snap.machine,
-                    "status": snap.status,
-                    "done": snap.done,
+                    "ok": true,
+                    "db": state.store.target(),
+                    "machines": machine_ids,
+                    "live_instances": state.live_count(),
                 }),
             )
             .await?;
         }
-        ("GET", "/" | "/state") => {
-            let snap = state.snapshot_state().await;
-            let val = serde_json::to_value(&snap)?;
-            write_json_response(&mut write_half, "200 OK", &val).await?;
+
+        // GET /trace — server-wide firehose across all machines and instances
+        ("GET", ["trace"]) => {
+            let wants_jsonl = query_params.get("format").is_some_and(|v| v == "jsonl")
+                || accept_header.contains("application/x-ndjson");
+            let follow = query_params
+                .get("follow")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true);
+            stream_global_trace(&mut write_half, &state, wants_jsonl, follow).await?;
         }
-        ("GET", "/diagram") => {
+
+        // GET /machines — list registered machine definitions
+        ("GET", ["machines"]) => {
+            let mut list = Vec::with_capacity(state.machines.len());
+            for (id, reg) in &state.machines {
+                let counts = state
+                    .store
+                    .count_instances_by_status(id)
+                    .unwrap_or_default();
+                list.push(machine_summary_json(reg, &counts));
+            }
+            write_json_response(&mut write_half, "200 OK", &json!({ "machines": list })).await?;
+        }
+
+        // GET /machines/:machine
+        ("GET", ["machines", machine_id]) => {
+            let Some(reg) = state.machines.get(*machine_id) else {
+                return write_not_found(
+                    &mut write_half,
+                    format!("machine `{machine_id}` is not registered"),
+                )
+                .await;
+            };
+            let counts = state
+                .store
+                .count_instances_by_status(machine_id)
+                .unwrap_or_default();
+            write_json_response(&mut write_half, "200 OK", &machine_summary_json(reg, &counts))
+                .await?;
+        }
+
+        // GET /machines/:machine/diagram
+        ("GET", ["machines", machine_id, "diagram"]) => {
+            let Some(reg) = state.machines.get(*machine_id) else {
+                return write_not_found(
+                    &mut write_half,
+                    format!("machine `{machine_id}` is not registered"),
+                )
+                .await;
+            };
             write_text_response(
                 &mut write_half,
                 "200 OK",
                 "text/plain; charset=utf-8",
-                &state.diagram,
+                &reg.diagram,
             )
             .await?;
         }
-        ("GET", "/trace") => {
-            let wants_jsonl = query.split('&').any(|kv| kv == "format=jsonl")
-                || accept_header.contains("application/x-ndjson");
-            stream_trace_response(&mut write_half, &state, wants_jsonl).await?;
+
+        // POST /machines/:machine/instances — spawn a new instance
+        ("POST", ["machines", machine_id, "instances"]) => {
+            let Some(reg) = state.machines.get(*machine_id).cloned() else {
+                return write_not_found(
+                    &mut write_half,
+                    format!("machine `{machine_id}` is not registered"),
+                )
+                .await;
+            };
+
+            let req_body: CreateInstanceBody = if body_bytes.iter().all(u8::is_ascii_whitespace) {
+                CreateInstanceBody::default()
+            } else {
+                match serde_json::from_slice(&body_bytes) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        return write_json_response(
+                            &mut write_half,
+                            "400 Bad Request",
+                            &json!({"error": format!("invalid JSON body: {err}")}),
+                        )
+                        .await;
+                    }
+                }
+            };
+
+            let context_patch = match &req_body.context {
+                None | Some(Value::Null) => None,
+                Some(Value::Object(map)) => Some(map),
+                Some(_) => {
+                    return write_json_response(
+                        &mut write_half,
+                        "400 Bad Request",
+                        &json!({"error": "`context` override must be a JSON object"}),
+                    )
+                    .await;
+                }
+            };
+
+            let instance_id = match req_body.id {
+                Some(raw_id) => {
+                    let trimmed = raw_id.trim().to_owned();
+                    if trimmed.is_empty()
+                        || trimmed.contains('/')
+                        || trimmed.chars().any(char::is_whitespace)
+                    {
+                        return write_json_response(
+                            &mut write_half,
+                            "400 Bad Request",
+                            &json!({"error": "instance `id` must be non-empty and must not contain `/` or whitespace"}),
+                        )
+                        .await;
+                    }
+                    trimmed
+                }
+                None => state.generate_instance_id(),
+            };
+
+            let idempotent = req_body.idempotent.unwrap_or(false)
+                || query_params
+                    .get("idempotent")
+                    .is_some_and(|v| v == "true" || v == "1");
+
+            let _create_guard = state.create_lock.lock().await;
+            if let Some(existing) = state.store.get_instance(machine_id, &instance_id)? {
+                let status_line = if idempotent {
+                    "200 OK"
+                } else {
+                    "409 Conflict"
+                };
+                let body = if idempotent {
+                    serde_json::to_value(&existing)?
+                } else {
+                    json!({
+                        "error": format!(
+                            "instance `{instance_id}` already exists for machine `{machine_id}`"
+                        ),
+                        "instance": existing,
+                    })
+                };
+                return write_json_response(&mut write_half, status_line, &body).await;
+            }
+
+            let created = match spawn_or_rehydrate_instance(
+                &state,
+                &reg,
+                instance_id,
+                context_patch,
+                None,
+            )
+            .await
+            {
+                Ok(snap) => snap,
+                Err(err) => {
+                    return write_json_response(
+                        &mut write_half,
+                        "500 Internal Server Error",
+                        &json!({"error": format!("{err:#}")}),
+                    )
+                    .await;
+                }
+            };
+
+            write_json_response(
+                &mut write_half,
+                "201 Created",
+                &serde_json::to_value(&created)?,
+            )
+            .await?;
         }
-        ("POST", p) if p == "/events" || p == "/event" || p.starts_with("/events/") => {
-            let path_event = p.strip_prefix("/events/").filter(|s| !s.is_empty());
+
+        // GET /machines/:machine/instances — list instances
+        ("GET", ["machines", machine_id, "instances"]) => {
+            if !state.machines.contains_key(*machine_id) {
+                return write_not_found(
+                    &mut write_half,
+                    format!("machine `{machine_id}` is not registered"),
+                )
+                .await;
+            };
+
+            let status_filter = match query_params.get("status") {
+                Some(raw_status) => match InstanceStatus::parse_str(raw_status) {
+                    Some(st) => Some(st),
+                    None => {
+                        return write_json_response(
+                            &mut write_half,
+                            "400 Bad Request",
+                            &json!({"error": format!("unknown instance status filter `{raw_status}`")}),
+                        )
+                        .await;
+                    }
+                },
+                None => None,
+            };
+            let limit = query_params
+                .get("limit")
+                .and_then(|s| s.parse::<usize>().ok());
+
+            let instances = state
+                .store
+                .list_instances(machine_id, status_filter, limit)?;
+            write_json_response(
+                &mut write_half,
+                "200 OK",
+                &json!({
+                    "machine": machine_id,
+                    "instances": instances,
+                }),
+            )
+            .await?;
+        }
+
+        // GET /machines/:machine/instances/:id — inspect instance snapshot
+        ("GET", ["machines", machine_id, "instances", instance_id]) => {
+            if !state.machines.contains_key(*machine_id) {
+                return write_not_found(
+                    &mut write_half,
+                    format!("machine `{machine_id}` is not registered"),
+                )
+                .await;
+            }
+            if let Some(live) = state.get_live(machine_id, instance_id)
+                && !live.finalized.load(Ordering::SeqCst)
+            {
+                let snap = sync_and_maybe_finalize(&state, &live, None).await?;
+                return write_json_response(
+                    &mut write_half,
+                    "200 OK",
+                    &serde_json::to_value(&snap)?,
+                )
+                .await;
+            }
+            match state.store.get_instance(machine_id, instance_id)? {
+                Some(snap) => {
+                    write_json_response(&mut write_half, "200 OK", &serde_json::to_value(&snap)?)
+                        .await?;
+                }
+                None => {
+                    write_not_found(
+                        &mut write_half,
+                        format!("instance `{instance_id}` not found for machine `{machine_id}`"),
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        // POST /machines/:machine/instances/:id/events[/:event]
+        (
+            "POST",
+            ["machines", machine_id, "instances", instance_id, "events" | "event"]
+            | ["machines", machine_id, "instances", instance_id, "events", _],
+        ) => {
+            let Some(reg) = state.machines.get(*machine_id).cloned() else {
+                return write_not_found(
+                    &mut write_half,
+                    format!("machine `{machine_id}` is not registered"),
+                )
+                .await;
+            };
+
+            let path_event = if seg_refs.len() == 6 {
+                Some(seg_refs[5])
+            } else {
+                None
+            };
             let (event_type, payload) = match parse_http_event(path_event, &body_bytes) {
                 Ok(pair) => pair,
                 Err(err) => {
-                    write_json_response(
+                    return write_json_response(
                         &mut write_half,
                         "400 Bad Request",
                         &json!({ "error": format!("{err:#}") }),
                     )
-                    .await?;
-                    return Ok(());
+                    .await;
                 }
             };
 
-            let _guard = state.event_lock.lock().await;
+            let live = match ensure_live_instance(&state, &reg, machine_id, instance_id).await? {
+                EnsureLiveResult::Live(l) => l,
+                EnsureLiveResult::Terminal(snap) => {
+                    return write_json_response(
+                        &mut write_half,
+                        "409 Conflict",
+                        &json!({
+                            "error": format!(
+                                "instance `{instance_id}` is `{}` and no longer accepts events",
+                                snap.status.as_str()
+                            ),
+                            "instance": snap,
+                        }),
+                    )
+                    .await;
+                }
+                EnsureLiveResult::NotFound => {
+                    return write_not_found(
+                        &mut write_half,
+                        format!("instance `{instance_id}` not found for machine `{machine_id}`"),
+                    )
+                    .await;
+                }
+            };
+
+            let _ev_guard = live.event_lock.lock().await;
             let send_res = if payload.is_null() {
-                state.actor.send(&event_type).await
+                live.actor.send(&event_type).await
             } else {
-                state.actor.send_with_payload(&event_type, payload).await
+                live.actor.send_with_payload(&event_type, payload).await
             };
             if let Err(err) = send_res {
-                write_json_response(
+                return write_json_response(
                     &mut write_half,
                     "500 Internal Server Error",
                     &json!({ "error": err.to_string() }),
                 )
-                .await?;
-                return Ok(());
+                .await;
             }
 
-            let snap = state.persist_if_configured().await?;
-            let val = serde_json::to_value(&snap)?;
-            write_json_response(&mut write_half, "200 OK", &val).await?;
-
-            if state.exit_on_done && (snap.done || snap.error.is_some()) {
-                state.shutdown.notify_waiters();
-            }
+            let snap = sync_and_maybe_finalize(&state, &live, None).await?;
+            write_json_response(&mut write_half, "200 OK", &serde_json::to_value(&snap)?).await?;
         }
-        _ => {
+
+        // DELETE /machines/:machine/instances/:id (or POST .../cancel)
+        ("DELETE", ["machines", machine_id, "instances", instance_id])
+        | ("POST", ["machines", machine_id, "instances", instance_id, "cancel"]) => {
+            if !state.machines.contains_key(*machine_id) {
+                return write_not_found(
+                    &mut write_half,
+                    format!("machine `{machine_id}` is not registered"),
+                )
+                .await;
+            }
+            let purge = method == "DELETE"
+                && query_params
+                    .get("purge")
+                    .is_some_and(|v| v == "true" || v == "1");
+
+            if let Some(live) = state.remove_live(machine_id, instance_id) {
+                let _ev_guard = live.event_lock.lock().await;
+                live.finalized.store(true, Ordering::SeqCst);
+                let cancelled_snap = {
+                    let _p_guard = live.persist_lock.lock().await;
+                    let mut snap = live
+                        .capture_snapshot(Some(InstanceStatus::Cancelled))
+                        .await;
+                    snap.status = InstanceStatus::Cancelled;
+                    snap.done = false;
+                    state.store.upsert_instance(&snap)?;
+                    snap
+                };
+                live.actor.stop().await;
+                live.actor.trace_hub().close();
+
+                if purge {
+                    state.store.delete_instance(machine_id, instance_id)?;
+                    return write_json_response(
+                        &mut write_half,
+                        "200 OK",
+                        &json!({
+                            "deleted": true,
+                            "machine": machine_id,
+                            "id": instance_id,
+                        }),
+                    )
+                    .await;
+                }
+                return write_json_response(
+                    &mut write_half,
+                    "200 OK",
+                    &serde_json::to_value(&cancelled_snap)?,
+                )
+                .await;
+            }
+
+            let Some(mut existing) = state.store.get_instance(machine_id, instance_id)? else {
+                return write_not_found(
+                    &mut write_half,
+                    format!("instance `{instance_id}` not found for machine `{machine_id}`"),
+                )
+                .await;
+            };
+
+            if purge {
+                state.store.delete_instance(machine_id, instance_id)?;
+                return write_json_response(
+                    &mut write_half,
+                    "200 OK",
+                    &json!({
+                        "deleted": true,
+                        "machine": machine_id,
+                        "id": instance_id,
+                    }),
+                )
+                .await;
+            }
+
+            if !existing.status.is_terminal() {
+                existing.status = InstanceStatus::Cancelled;
+                existing.done = false;
+                existing.updated_at_ms = now_epoch_ms();
+                state.store.upsert_instance(&existing)?;
+            }
             write_json_response(
                 &mut write_half,
-                "404 Not Found",
-                &json!({ "error": format!("route `{method} {path}` not found") }),
+                "200 OK",
+                &serde_json::to_value(&existing)?,
+            )
+            .await?;
+        }
+
+        // GET /machines/:machine/instances/:id/trace — per-instance SSE or JSONL stream
+        ("GET", ["machines", machine_id, "instances", instance_id, "trace"]) => {
+            if !state.machines.contains_key(*machine_id) {
+                return write_not_found(
+                    &mut write_half,
+                    format!("machine `{machine_id}` is not registered"),
+                )
+                .await;
+            }
+            if state
+                .store
+                .get_instance(machine_id, instance_id)?
+                .is_none()
+            {
+                return write_not_found(
+                    &mut write_half,
+                    format!("instance `{instance_id}` not found for machine `{machine_id}`"),
+                )
+                .await;
+            }
+
+            let wants_jsonl = query_params.get("format").is_some_and(|v| v == "jsonl")
+                || accept_header.contains("application/x-ndjson");
+            let after_seq = query_params
+                .get("after")
+                .and_then(|s| s.parse::<u64>().ok())
+                .or(last_event_id)
+                .unwrap_or(0);
+            let follow = query_params
+                .get("follow")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true);
+
+            stream_instance_trace(
+                &mut write_half,
+                &state,
+                machine_id,
+                instance_id,
+                after_seq,
+                wants_jsonl,
+                follow,
+            )
+            .await?;
+        }
+
+        _ => {
+            write_not_found(
+                &mut write_half,
+                format!("route `{method} {raw_path}` not found"),
             )
             .await?;
         }
     }
 
     Ok(())
+}
+
+enum EnsureLiveResult {
+    Live(Arc<LiveInstance>),
+    Terminal(Box<InstanceSnapshot>),
+    NotFound,
+}
+
+async fn ensure_live_instance(
+    state: &Arc<ServerState>,
+    reg: &Arc<RegisteredMachine>,
+    machine_id: &str,
+    instance_id: &str,
+) -> anyhow::Result<EnsureLiveResult> {
+    if let Some(live) = state.get_live(machine_id, instance_id)
+        && !live.finalized.load(Ordering::SeqCst)
+    {
+        return Ok(EnsureLiveResult::Live(live));
+    }
+
+    let _create_guard = state.create_lock.lock().await;
+    if let Some(live) = state.get_live(machine_id, instance_id)
+        && !live.finalized.load(Ordering::SeqCst)
+    {
+        return Ok(EnsureLiveResult::Live(live));
+    }
+
+    let Some(saved) = state.store.get_instance(machine_id, instance_id)? else {
+        return Ok(EnsureLiveResult::NotFound);
+    };
+    if saved.status.is_terminal() {
+        return Ok(EnsureLiveResult::Terminal(Box::new(saved)));
+    }
+
+    // Rehydrate on demand if `saved` is `active` or `waiting` in SQLite without a live actor.
+    let snap = spawn_or_rehydrate_instance(
+        state,
+        reg,
+        instance_id.to_owned(),
+        None,
+        Some(&saved),
+    )
+    .await?;
+    if snap.status.is_terminal() {
+        return Ok(EnsureLiveResult::Terminal(Box::new(snap)));
+    }
+    match state.get_live(machine_id, instance_id) {
+        Some(live) => Ok(EnsureLiveResult::Live(live)),
+        None => Ok(EnsureLiveResult::Terminal(Box::new(snap))),
+    }
+}
+
+fn machine_summary_json(
+    reg: &RegisteredMachine,
+    counts: &HashMap<String, usize>,
+) -> Value {
+    json!({
+        "id": reg.chart.ir.id,
+        "description": reg.chart.ir.description,
+        "initial": reg.chart.ir.initial.as_str(),
+        "completable": reg.completable,
+        "default_context": reg.chart.ir.context,
+        "instance_counts": counts,
+    })
 }
 
 fn parse_http_event(path_event: Option<&str>, body: &[u8]) -> anyhow::Result<(String, Value)> {
@@ -478,12 +1225,12 @@ fn parse_http_event(path_event: Option<&str>, body: &[u8]) -> anyhow::Result<(St
             return Ok((ev_name.to_owned(), Value::Null));
         }
         let parsed: Value = serde_json::from_str(body_str)
-            .context("invalid JSON payload in POST /events/<event>")?;
+            .context("invalid JSON payload in POST .../events/<event>")?;
         return Ok((ev_name.to_owned(), parsed));
     }
 
     if body_str.is_empty() {
-        bail!("POST /events requires a JSON object `{{\"type\": \"...\"}}` or plain event name");
+        bail!("POST .../events requires a JSON object `{{\"type\": \"...\"}}` or plain event name");
     }
 
     if body_str.starts_with('{') {
@@ -509,9 +1256,121 @@ fn parse_http_event(path_event: Option<&str>, body: &[u8]) -> anyhow::Result<(St
     }
 }
 
-async fn stream_trace_response<W: AsyncWriteExt + Unpin>(
+async fn stream_instance_trace<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
-    state: &SharedServerState,
+    state: &Arc<ServerState>,
+    machine_id: &str,
+    instance_id: &str,
+    mut cursor_seq: u64,
+    as_jsonl: bool,
+    follow: bool,
+) -> anyhow::Result<()> {
+    write_stream_headers(writer, as_jsonl).await?;
+
+    loop {
+        // Register the notification future BEFORE reading SQLite so we never miss a wakeup!
+        let live_opt = state.get_live(machine_id, instance_id);
+        let notify_arc = live_opt.as_ref().map(|l| Arc::clone(&l.trace_notify));
+        let notified_fut = notify_arc.as_ref().map(|n| n.notified());
+
+        loop {
+            let batch = state.store.read_instance_traces_after(
+                machine_id,
+                instance_id,
+                cursor_seq,
+                256,
+            )?;
+            if batch.is_empty() {
+                break;
+            }
+            for (seq, json_line) in batch {
+                write_raw_trace_frame(writer, seq, &json_line, as_jsonl).await?;
+                cursor_seq = seq;
+            }
+        }
+
+        if !follow {
+            break;
+        }
+
+        match (live_opt, notified_fut) {
+            (Some(live), Some(notified)) => {
+                if live.trace_closed.load(Ordering::SeqCst) {
+                    // Drain once more after `trace_closed` in case final records landed right before load.
+                    for (seq, json_line) in state.store.read_instance_traces_after(
+                        machine_id,
+                        instance_id,
+                        cursor_seq,
+                        256,
+                    )? {
+                        write_raw_trace_frame(writer, seq, &json_line, as_jsonl).await?;
+                    }
+                    break;
+                }
+                tokio::select! {
+                    _ = state.shutdown.notified() => break,
+                    _ = notified => {}
+                }
+            }
+            _ => {
+                // Instance is no longer live (completed, failed, cancelled, or purged).
+                // Perform one final read in case the trace task committed right after `get_live` returned `None`.
+                for (seq, json_line) in state.store.read_instance_traces_after(
+                    machine_id,
+                    instance_id,
+                    cursor_seq,
+                    256,
+                )? {
+                    write_raw_trace_frame(writer, seq, &json_line, as_jsonl).await?;
+                }
+                break;
+            }
+        }
+    }
+
+    let _ = writer.shutdown().await;
+    Ok(())
+}
+
+async fn stream_global_trace<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    state: &Arc<ServerState>,
+    as_jsonl: bool,
+    follow: bool,
+) -> anyhow::Result<()> {
+    write_stream_headers(writer, as_jsonl).await?;
+    let mut cursor_rowid: i64 = 0;
+
+    loop {
+        let notified = state.global_trace_notify.notified();
+        loop {
+            let batch = state.store.read_global_traces_after(cursor_rowid, 256)?;
+            if batch.is_empty() {
+                break;
+            }
+            for (rowid, _seq, json_line) in batch {
+                let sse_id = u64::try_from(rowid).unwrap_or(0);
+                write_raw_trace_frame(writer, sse_id, &json_line, as_jsonl).await?;
+                cursor_rowid = rowid;
+            }
+        }
+
+        if !follow {
+            break;
+        }
+
+        tokio::select! {
+            _ = state.shutdown.notified() => break,
+            _ = notified => {}
+        }
+    }
+
+    let _ = writer.shutdown().await;
+    Ok(())
+}
+
+async fn write_stream_headers<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
     as_jsonl: bool,
 ) -> anyhow::Result<()> {
     let content_type = if as_jsonl {
@@ -520,46 +1379,34 @@ async fn stream_trace_response<W: AsyncWriteExt + Unpin>(
         "text/event-stream; charset=utf-8"
     };
     let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
     );
     writer.write_all(header.as_bytes()).await?;
     writer.flush().await?;
-
-    let mut rx = state.actor.subscribe_traces();
-    loop {
-        tokio::select! {
-            _ = state.shutdown.notified() => {
-                // Drain any buffered final records before closing stream.
-                for record in rx.drain() {
-                    write_trace_frame(writer, &record, as_jsonl).await?;
-                }
-                break;
-            }
-            maybe_rec = rx.recv() => {
-                match maybe_rec {
-                    Some(record) => write_trace_frame(writer, &record, as_jsonl).await?,
-                    None => break,
-                }
-            }
-        }
-    }
     Ok(())
 }
 
-async fn write_trace_frame<W: AsyncWriteExt + Unpin>(
+async fn write_raw_trace_frame<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
-    record: &crate::TraceRecord,
+    id: u64,
+    json_line: &str,
     as_jsonl: bool,
 ) -> anyhow::Result<()> {
-    let json_line = record.to_json_line();
     let frame = if as_jsonl {
         format!("{json_line}\n")
     } else {
-        format!("id: {}\ndata: {json_line}\n\n", record.seq)
+        format!("id: {id}\ndata: {json_line}\n\n")
     };
     writer.write_all(frame.as_bytes()).await?;
     writer.flush().await?;
     Ok(())
+}
+
+async fn write_not_found<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: String,
+) -> anyhow::Result<()> {
+    write_json_response(writer, "404 Not Found", &json!({ "error": msg })).await
 }
 
 async fn write_json_response<W: AsyncWriteExt + Unpin>(
@@ -585,4 +1432,50 @@ async fn write_text_response<W: AsyncWriteExt + Unpin>(
     writer.flush().await?;
     let _ = writer.shutdown().await;
     Ok(())
+}
+
+fn parse_query_params(query: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        match pair.split_once('=') {
+            Some((k, v)) => {
+                map.insert(percent_decode(k), percent_decode(v));
+            }
+            None => {
+                map.insert(percent_decode(pair), "true".to_owned());
+            }
+        }
+    }
+    map
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }

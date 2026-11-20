@@ -7,9 +7,10 @@ pub mod store;
 pub mod trace;
 
 pub use serve::{
-    PersistedChartState, ServeOptions, apply_persisted_state_to_ir, bind_serve_listener,
-    serve_chart_http,
+    PersistedChartState, ServeDefinition, ServeOptions, apply_persisted_state_to_ir,
+    bind_serve_listener, record_compound_history, serve_charts_http,
 };
+pub use store::{InstanceSnapshot, InstanceStatus, SqliteStore};
 pub use trace::{
     ProgressKind, TraceEvent, TraceEventInfo, TraceHub, TraceReceiver, TraceRecord,
     progress_enabled, report_progress,

@@ -734,62 +734,148 @@ fn read_bound_addr(stdout: &mut std::io::BufReader<std::process::ChildStdout>) -
 }
 
 #[test]
-fn serve_http_endpoints_post_events_sse_trace_and_exit_on_done() {
+fn serve_multi_machine_instances_in_memory_sqlite_sse_and_non_completable_actors() {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
     use std::process::Stdio;
 
-    let (api_port, _incidents) = spawn_mock_deploy_control_api();
-    let state_file = std::env::temp_dir().join(format!(
-        "starchart_serve_done_{}_{}.json",
+    // Create a temporary non-completable `.star` definition (zero top-level `final_state`s)
+    // to host alongside `examples/` on the same server & port.
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "starchart_serve_multi_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos()
     ));
-    let ctx_patch = serde_json::json!({
-        "control_api": format!("http://127.0.0.1:{api_port}"),
-        "bake_interval_ms": 30,
-    })
-    .to_string();
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let flag_star = tmp_dir.join("feature_flag.star");
+    std::fs::write(
+        &flag_star,
+        r#"
+FlagCtx = record(flips = field(int, 0))
+S = state_space("disabled", "enabled")
 
+chart: StateMachine = machine(
+    id = "feature_flag",
+    description = "Long-lived non-completable toggle actor",
+    initial = S.disabled,
+    context = FlagCtx(),
+    states = {
+        S.disabled: state(
+            on = [
+                transition(
+                    event = "TOGGLE",
+                    target = S.enabled,
+                    assign = lambda ctx, _ev: update(ctx, flips = ctx.flips + 1),
+                ),
+            ],
+        ),
+        S.enabled: state(
+            on = [
+                transition(
+                    event = "TOGGLE",
+                    target = S.disabled,
+                    assign = lambda ctx, _ev: update(ctx, flips = ctx.flips + 1),
+                ),
+            ],
+        ),
+    },
+)
+"#,
+    )
+    .unwrap();
+
+    // Default `--db` is `:memory:`. Pass both `examples/` directory and `feature_flag.star`!
     let mut child = Command::new(bin_path())
         .arg("serve")
-        .arg(workspace_file("examples/deployment_pipeline.star"))
+        .arg(workspace_file("examples"))
+        .arg(&flag_star)
         .arg("--bind")
         .arg("127.0.0.1:0")
-        .arg("--context")
-        .arg(&ctx_patch)
-        .arg("--state-file")
-        .arg(&state_file)
-        .arg("--exit-on-done")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn starchart serve");
+        .expect("spawn multi-machine starchart serve");
 
     let mut stdout_reader = BufReader::new(child.stdout.take().expect("stdout"));
     let addr = read_bound_addr(&mut stdout_reader);
 
-    // 1. Check GET /health, GET /state, and GET /diagram
+    // 1. Check GET /health and GET /machines catalog (`completable: true` vs `false`)
     let (code, health_body) = http_call(&addr, "GET", "/health", None);
     assert_eq!(code, 200);
     let health: serde_json::Value = serde_json::from_str(&health_body).unwrap();
     assert_eq!(health["ok"], true);
-    assert_eq!(health["machine"], "deployment_pipeline");
+    assert_eq!(health["db"], ":memory:");
+    assert_eq!(health["live_instances"], 0);
 
-    let (code, diagram) = http_call(&addr, "GET", "/diagram", None);
+    let (code, machines_body) = http_call(&addr, "GET", "/machines", None);
+    assert_eq!(code, 200);
+    let machines: serde_json::Value = serde_json::from_str(&machines_body).unwrap();
+    let list = machines["machines"].as_array().unwrap();
+    let deploy_meta = list
+        .iter()
+        .find(|m| m["id"] == "deployment_pipeline")
+        .expect("deployment_pipeline registered");
+    assert_eq!(deploy_meta["completable"], true);
+    let flag_meta = list
+        .iter()
+        .find(|m| m["id"] == "feature_flag")
+        .expect("feature_flag registered");
+    assert_eq!(flag_meta["completable"], false);
+
+    let (code, diagram) = http_call(&addr, "GET", "/machines/deployment_pipeline/diagram", None);
     assert_eq!(code, 200);
     assert!(diagram.starts_with("stateDiagram-v2"));
 
-    // 2. Open an SSE GET /trace stream on a background thread before sending events!
+    // 2. Spawn two independent `deployment_pipeline` instances with caller-supplied IDs
+    let (code, inst1_body) = http_call(
+        &addr,
+        "POST",
+        "/machines/deployment_pipeline/instances",
+        Some(r#"{"id":"payments-v1","context":{"bake_interval_ms":25}}"#),
+    );
+    assert_eq!(code, 201, "body={inst1_body}");
+    let inst1: serde_json::Value = serde_json::from_str(&inst1_body).unwrap();
+    assert_eq!(inst1["id"], "payments-v1");
+    assert_eq!(inst1["status"], "waiting");
+
+    // Duplicate ID returns 409 Conflict by default, or 200 OK with `?idempotent=true`
+    let (code, _) = http_call(
+        &addr,
+        "POST",
+        "/machines/deployment_pipeline/instances",
+        Some(r#"{"id":"payments-v1"}"#),
+    );
+    assert_eq!(code, 409);
+    let (code, idem_body) = http_call(
+        &addr,
+        "POST",
+        "/machines/deployment_pipeline/instances?idempotent=true",
+        Some(r#"{"id":"payments-v1"}"#),
+    );
+    assert_eq!(code, 200);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&idem_body).unwrap()["id"],
+        "payments-v1"
+    );
+
+    let (code, _) = http_call(
+        &addr,
+        "POST",
+        "/machines/deployment_pipeline/instances",
+        Some(r#"{"id":"auth-v2","context":{"service":"auth-api"}}"#),
+    );
+    assert_eq!(code, 201);
+
+    // 3. Stream SSE trace on `payments-v1` while driving it to `live`
     let sse_addr = addr.clone();
     let sse_handle = std::thread::spawn(move || {
         let mut s = TcpStream::connect(&sse_addr).expect("connect SSE");
         write!(
             s,
-            "GET /trace HTTP/1.1\r\nHost: {sse_addr}\r\nAccept: text/event-stream\r\n\r\n"
+            "GET /machines/deployment_pipeline/instances/payments-v1/trace HTTP/1.1\r\nHost: {sse_addr}\r\nAccept: text/event-stream\r\n\r\n"
         )
         .unwrap();
         let reader = BufReader::new(s);
@@ -802,82 +888,157 @@ fn serve_http_endpoints_post_events_sse_trace_and_exit_on_done() {
         data_lines
     });
 
-    // 3. Dispatch approvals via both `POST /events` and `POST /events/<EVENT>`
-    let (code, s1) = http_call(
+    let (code, _) = http_call(
         &addr,
         "POST",
-        "/events",
+        "/machines/deployment_pipeline/instances/payments-v1/events",
         Some(r#"{"type":"APPROVE","by":"alice"}"#),
     );
     assert_eq!(code, 200);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&s1).unwrap()["context"]["approvals"],
-        1
+    let (code, _) = http_call(
+        &addr,
+        "POST",
+        "/machines/deployment_pipeline/instances/payments-v1/events/APPROVE",
+        Some(r#"{"by":"bob"}"#),
     );
-
-    let (code, s2) = http_call(&addr, "POST", "/events/APPROVE", Some(r#"{"by":"bob"}"#));
     assert_eq!(code, 200);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&s2).unwrap()["context"]["approvals"],
-        2
+    let (code, _) = http_call(
+        &addr,
+        "POST",
+        "/machines/deployment_pipeline/instances/payments-v1/events/START_ROLLOUT",
+        None,
     );
-
-    let (code, _) = http_call(&addr, "POST", "/events/START_ROLLOUT", None);
     assert_eq!(code, 200);
 
-    // 4. Server should run rollout to `live` and exit automatically (`--exit-on-done`).
-    let status = child.wait().expect("wait serve exit");
-    assert!(status.success());
-
+    // SSE stream closes automatically once `payments-v1` reaches `completed` and flushes trace!
     let sse_events = sse_handle.join().expect("join SSE");
     assert!(
-        sse_events.iter().any(|l| l.contains(r#""kind":"started""#)),
-        "expected SSE replay of `started`: {sse_events:?}"
+        sse_events
+            .iter()
+            .any(|l| l.contains(r#""kind":"started""#) && l.contains(r#""instance_id":"payments-v1""#)),
+        "expected started trace for payments-v1: {sse_events:?}"
     );
     assert!(
         sse_events.iter().any(|l| l.contains(r#""to":["live"]"#)),
-        "expected SSE transition to `live`: {sse_events:?}"
+        "expected transition to live: {sse_events:?}"
     );
 
-    let persisted: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&state_file).expect("read state file"))
-            .unwrap();
-    let _ = std::fs::remove_file(&state_file);
-    assert_eq!(persisted["done"], true);
-    assert_eq!(persisted["active_states"], serde_json::json!(["live"]));
-    assert_eq!(persisted["output"], serde_json::json!({"status": "live"}));
+    // `payments-v1` is now `completed`, evicted from `live_instances`, and rejects new events with 409,
+    // while still serving snapshot + historical trace from `:memory:` SQLite!
+    let (code, p1_done) = http_call(
+        &addr,
+        "GET",
+        "/machines/deployment_pipeline/instances/payments-v1",
+        None,
+    );
+    assert_eq!(code, 200);
+    let p1_snap: serde_json::Value = serde_json::from_str(&p1_done).unwrap();
+    assert_eq!(p1_snap["status"], "completed");
+    assert_eq!(p1_snap["done"], true);
+    assert_eq!(p1_snap["output"], serde_json::json!({"status": "live"}));
+
+    let (code, _) = http_call(
+        &addr,
+        "POST",
+        "/machines/deployment_pipeline/instances/payments-v1/events/APPROVE",
+        None,
+    );
+    assert_eq!(code, 409);
+
+    // Sibling instance `auth-v2` is untouched and still `waiting` (`live_instances == 1`)!
+    let (_, health2_body) = http_call(&addr, "GET", "/health", None);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&health2_body).unwrap()["live_instances"],
+        1
+    );
+    let (_, auth_body) = http_call(
+        &addr,
+        "GET",
+        "/machines/deployment_pipeline/instances/auth-v2",
+        None,
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&auth_body).unwrap()["status"],
+        "waiting"
+    );
+
+    // 4. Drive non-completable `feature_flag` actor, then cancel (`DELETE`) and purge (`DELETE ?purge=true`)
+    let (code, _) = http_call(
+        &addr,
+        "POST",
+        "/machines/feature_flag/instances",
+        Some(r#"{"id":"dark-mode"}"#),
+    );
+    assert_eq!(code, 201);
+    let (code, toggled) = http_call(
+        &addr,
+        "POST",
+        "/machines/feature_flag/instances/dark-mode/events/TOGGLE",
+        None,
+    );
+    assert_eq!(code, 200);
+    let toggled_json: serde_json::Value = serde_json::from_str(&toggled).unwrap();
+    assert_eq!(toggled_json["status"], "waiting");
+    assert_eq!(toggled_json["active_states"], serde_json::json!(["enabled"]));
+    assert_eq!(toggled_json["context"]["flips"], 1);
+
+    let (code, cancelled) = http_call(
+        &addr,
+        "DELETE",
+        "/machines/feature_flag/instances/dark-mode",
+        None,
+    );
+    assert_eq!(code, 200);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&cancelled).unwrap()["status"],
+        "cancelled"
+    );
+
+    let (code, _) = http_call(
+        &addr,
+        "DELETE",
+        "/machines/feature_flag/instances/dark-mode?purge=true",
+        None,
+    );
+    assert_eq!(code, 200);
+    let (code, _) = http_call(
+        &addr,
+        "GET",
+        "/machines/feature_flag/instances/dark-mode",
+        None,
+    );
+    assert_eq!(code, 404);
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
 #[test]
-fn serve_resumes_paused_rollout_and_shallow_history_from_state_file_across_restart() {
+fn serve_rehydrates_in_flight_instances_from_sqlite_db_file_across_restart() {
     use std::io::BufReader;
     use std::process::Stdio;
 
     let (api_port, _incidents) = spawn_mock_deploy_control_api();
-    let state_file = std::env::temp_dir().join(format!(
-        "starchart_serve_resume_{}_{}.json",
+    let db_dir = std::env::temp_dir().join(format!(
+        "starchart_serve_sqlite_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos()
     ));
-    let ctx_patch = serde_json::json!({
-        "control_api": format!("http://127.0.0.1:{api_port}"),
-        "bake_interval_ms": 400,
-    })
-    .to_string();
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db_path = db_dir.join("starchart.db");
 
-    // --- Process 1: approve, start rollout, pause during bake_wait, then kill server ---
+    // --- Process 1: start server with `--db <path>/starchart.db` ---
     let mut server1 = Command::new(bin_path())
         .arg("serve")
         .arg(workspace_file("examples/deployment_pipeline.star"))
         .arg("--bind")
         .arg("127.0.0.1:0")
-        .arg("--context")
-        .arg(&ctx_patch)
-        .arg("--state-file")
-        .arg(&state_file)
+        .arg("--db")
+        .arg(&db_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -886,13 +1047,90 @@ fn serve_resumes_paused_rollout_and_shallow_history_from_state_file_across_resta
     let mut r1 = BufReader::new(server1.stdout.take().unwrap());
     let addr1 = read_bound_addr(&mut r1);
 
-    http_call(&addr1, "POST", "/events/APPROVE", Some(r#"{"by":"alice"}"#));
-    http_call(&addr1, "POST", "/events/APPROVE", Some(r#"{"by":"bob"}"#));
-    http_call(&addr1, "POST", "/events/START_ROLLOUT", None);
+    // Instance A (`fast-done`): completes before crash — should stay `completed` on disk and NOT spawn a live actor on restart.
+    let fast_create = serde_json::json!({
+        "id": "fast-done",
+        "context": { "bake_interval_ms": 15 }
+    })
+    .to_string();
+    http_call(
+        &addr1,
+        "POST",
+        "/machines/deployment_pipeline/instances",
+        Some(&fast_create),
+    );
+    http_call(
+        &addr1,
+        "POST",
+        "/machines/deployment_pipeline/instances/fast-done/events/APPROVE",
+        Some(r#"{"by":"alice"}"#),
+    );
+    http_call(
+        &addr1,
+        "POST",
+        "/machines/deployment_pipeline/instances/fast-done/events/APPROVE",
+        Some(r#"{"by":"bob"}"#),
+    );
+    http_call(
+        &addr1,
+        "POST",
+        "/machines/deployment_pipeline/instances/fast-done/events/START_ROLLOUT",
+        None,
+    );
+    for _ in 0..50 {
+        let (_, body) = http_call(
+            &addr1,
+            "GET",
+            "/machines/deployment_pipeline/instances/fast-done",
+            None,
+        );
+        if serde_json::from_str::<serde_json::Value>(&body).unwrap()["status"] == "completed" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 
-    // Wait briefly until `deploying_canary` enters `rolling_out.bake_wait`.
+    // Instance B (`paused-rollout`): approve, start rollout, pause during `bake_wait` (`shallow_history`), then crash server1!
+    let paused_create = serde_json::json!({
+        "id": "paused-rollout",
+        "context": {
+            "control_api": format!("http://127.0.0.1:{api_port}"),
+            "bake_interval_ms": 120,
+        }
+    })
+    .to_string();
+    http_call(
+        &addr1,
+        "POST",
+        "/machines/deployment_pipeline/instances",
+        Some(&paused_create),
+    );
+    http_call(
+        &addr1,
+        "POST",
+        "/machines/deployment_pipeline/instances/paused-rollout/events/APPROVE",
+        Some(r#"{"by":"alice"}"#),
+    );
+    http_call(
+        &addr1,
+        "POST",
+        "/machines/deployment_pipeline/instances/paused-rollout/events/APPROVE",
+        Some(r#"{"by":"bob"}"#),
+    );
+    http_call(
+        &addr1,
+        "POST",
+        "/machines/deployment_pipeline/instances/paused-rollout/events/START_ROLLOUT",
+        None,
+    );
+
     for _ in 0..40 {
-        let (_, body) = http_call(&addr1, "GET", "/state", None);
+        let (_, body) = http_call(
+            &addr1,
+            "GET",
+            "/machines/deployment_pipeline/instances/paused-rollout",
+            None,
+        );
         let st: serde_json::Value = serde_json::from_str(&body).unwrap();
         if st["active_states"] == serde_json::json!(["rolling_out.bake_wait"]) {
             break;
@@ -900,29 +1138,29 @@ fn serve_resumes_paused_rollout_and_shallow_history_from_state_file_across_resta
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
-    let (code, paused_body) = http_call(&addr1, "POST", "/events/PAUSE", None);
+    let (code, paused_body) = http_call(
+        &addr1,
+        "POST",
+        "/machines/deployment_pipeline/instances/paused-rollout/events/PAUSE",
+        None,
+    );
     assert_eq!(code, 200);
     let paused_json: serde_json::Value = serde_json::from_str(&paused_body).unwrap();
+    assert_eq!(paused_json["status"], "waiting");
     assert_eq!(paused_json["active_states"], serde_json::json!(["paused"]));
     assert_eq!(paused_json["history"]["rolling_out"], "bake_wait");
 
     let _ = server1.kill();
     let _ = server1.wait();
 
-    // --- Process 2: restart from `--state-file` with faster bake timer, send RESUME, finish ---
-    let mut saved: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
-    saved["context"]["bake_interval_ms"] = serde_json::json!(25);
-    std::fs::write(&state_file, serde_json::to_vec_pretty(&saved).unwrap()).unwrap();
-
+    // --- Process 2: restart against the same `--db` SQLite file ---
     let mut server2 = Command::new(bin_path())
         .arg("serve")
         .arg(workspace_file("examples/deployment_pipeline.star"))
         .arg("--bind")
         .arg("127.0.0.1:0")
-        .arg("--state-file")
-        .arg(&state_file)
-        .arg("--exit-on-done")
+        .arg("--db")
+        .arg(&db_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -931,7 +1169,31 @@ fn serve_resumes_paused_rollout_and_shallow_history_from_state_file_across_resta
     let mut r2 = BufReader::new(server2.stdout.take().unwrap());
     let addr2 = read_bound_addr(&mut r2);
 
-    let (code, resumed_initial) = http_call(&addr2, "GET", "/state", None);
+    // Only `paused-rollout` was rehydrated into RAM (`live_instances == 1`), while `fast-done` stays queryable from SQLite!
+    let (_, h2_body) = http_call(&addr2, "GET", "/health", None);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&h2_body).unwrap()["live_instances"],
+        1
+    );
+
+    let (code, fast_snap) = http_call(
+        &addr2,
+        "GET",
+        "/machines/deployment_pipeline/instances/fast-done",
+        None,
+    );
+    assert_eq!(code, 200);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&fast_snap).unwrap()["status"],
+        "completed"
+    );
+
+    let (code, resumed_initial) = http_call(
+        &addr2,
+        "GET",
+        "/machines/deployment_pipeline/instances/paused-rollout",
+        None,
+    );
     assert_eq!(code, 200);
     let init2: serde_json::Value = serde_json::from_str(&resumed_initial).unwrap();
     assert_eq!(init2["active_states"], serde_json::json!(["paused"]));
@@ -940,7 +1202,13 @@ fn serve_resumes_paused_rollout_and_shallow_history_from_state_file_across_resta
         serde_json::json!(["alice", "bob"])
     );
 
-    let (code, after_resume) = http_call(&addr2, "POST", "/events/RESUME", None);
+    // Send `RESUME` and verify `shallow_history` returns to `rolling_out.bake_wait` and completes to `live`!
+    let (code, after_resume) = http_call(
+        &addr2,
+        "POST",
+        "/machines/deployment_pipeline/instances/paused-rollout/events/RESUME",
+        None,
+    );
     assert_eq!(code, 200);
     let res_json: serde_json::Value = serde_json::from_str(&after_resume).unwrap();
     assert_eq!(
@@ -948,12 +1216,41 @@ fn serve_resumes_paused_rollout_and_shallow_history_from_state_file_across_resta
         serde_json::json!(["rolling_out.bake_wait"])
     );
 
-    let status2 = server2.wait().expect("wait server2 done");
-    assert!(status2.success());
+    let mut reached_live = false;
+    for _ in 0..50 {
+        let (_, body) = http_call(
+            &addr2,
+            "GET",
+            "/machines/deployment_pipeline/instances/paused-rollout",
+            None,
+        );
+        let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if st["status"] == "completed" && st["active_states"] == serde_json::json!(["live"]) {
+            reached_live = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(reached_live, "expected paused-rollout to reach `live` after RESUME");
 
-    let final_disk: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
-    let _ = std::fs::remove_file(&state_file);
-    assert_eq!(final_disk["done"], true);
-    assert_eq!(final_disk["active_states"], serde_json::json!(["live"]));
+    // Verify trace `seq` remained strictly monotonic across the SQLite restart!
+    let (code, trace_jsonl) = http_call(
+        &addr2,
+        "GET",
+        "/machines/deployment_pipeline/instances/paused-rollout/trace?format=jsonl",
+        None,
+    );
+    assert_eq!(code, 200);
+    let trace_records = parse_jsonl(&trace_jsonl);
+    assert!(trace_records.len() >= 4);
+    for pair in trace_records.windows(2) {
+        assert!(
+            pair[1]["seq"].as_u64().unwrap() > pair[0]["seq"].as_u64().unwrap(),
+            "expected strictly monotonic trace seq across restart: {pair:?}"
+        );
+    }
+
+    let _ = server2.kill();
+    let _ = server2.wait();
+    let _ = std::fs::remove_dir_all(&db_dir);
 }

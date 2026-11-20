@@ -8,11 +8,12 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use indexmap::IndexMap;
 use serde_json::Value;
-use starchart_ir::{ActionDef, MachineDef, StateId, StateKind, StateNodeDef};
+use starchart_ir::{ActionDef, StateId, StateKind, StateNodeDef};
 use starchart_runtime::builtins::acp::serve_chart_as_acp_agent;
 use starchart_runtime::{
-    HostCallbacks, ServeOptions, StarchartActor, StarchartSyncRunner, TraceReceiver,
-    bind_serve_listener, render_mermaid, serve_chart_http,
+    HostCallbacks, ServeDefinition, ServeOptions, StarchartActor, StarchartSyncRunner,
+    TraceReceiver, active_states_have_autonomous_work, bind_serve_listener, render_mermaid,
+    serve_charts_http,
 };
 use starchart_starlark::{
     CompiledChart, chart_dialect, chart_globals, compile_starlark_file, is_builtin_service,
@@ -96,10 +97,11 @@ enum Commands {
         trace: Option<String>,
     },
 
-    /// Run a `.star` statechart as an HTTP + SSE daemon (`POST /events`, `GET /state`, `GET /diagram`, `GET /trace`).
+    /// Run one or more `.star` statecharts as a multi-instance HTTP + SSE daemon backed by SQLite.
     Serve {
-        /// Path to the `.star` statechart file.
-        file: PathBuf,
+        /// One or more `.star` files or directories containing `.star` files.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
 
         /// Exported variable name holding the `StateMachine` (defaults to `chart`).
         #[arg(long, default_value = "chart")]
@@ -109,17 +111,9 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:8080")]
         bind: String,
 
-        /// Optional JSON object merged into the machine's initial `context` (when starting fresh).
-        #[arg(long)]
-        context: Option<String>,
-
-        /// Optional JSON snapshot file to persist state across restarts and resume automatically.
-        #[arg(long, value_name = "PATH")]
-        state_file: Option<PathBuf>,
-
-        /// Shut down the HTTP daemon automatically once the workflow reaches a `final_state`.
-        #[arg(long)]
-        exit_on_done: bool,
+        /// SQLite database target (`:memory:` by default, or a file path like `./starchart.db`).
+        #[arg(long, default_value = ":memory:", value_name = "PATH")]
+        db: String,
     },
 
     /// Expose a `.star` statechart workflow over `stdio` as an Agent Client Protocol (ACP v1) agent.
@@ -169,20 +163,11 @@ fn main() -> ExitCode {
             trace.as_deref(),
         ),
         Commands::Serve {
-            file,
+            paths,
             export,
             bind,
-            context,
-            state_file,
-            exit_on_done,
-        } => run_serve(
-            &file,
-            &export,
-            &bind,
-            context.as_deref(),
-            state_file,
-            exit_on_done,
-        ),
+            db,
+        } => run_serve(&paths, &export, &bind, &db),
         Commands::Acp { file, export } => run_acp_server(&file, &export),
         Commands::Lsp => run_lsp(),
         Commands::McpBridge { addr, token } => run_mcp_bridge(&addr, &token),
@@ -464,54 +449,6 @@ fn spawn_stdin_line_reader() -> tokio::sync::mpsc::UnboundedReceiver<std::io::Re
     rx
 }
 
-fn actions_have_delayed_send(actions: &[ActionDef]) -> bool {
-    actions.iter().any(|a| {
-        matches!(
-            a,
-            ActionDef::Raise {
-                delay: Some(_),
-                ..
-            } | ActionDef::SendTo {
-                delay: Some(_),
-                ..
-            }
-        )
-    })
-}
-
-/// Returns `true` if any currently active state (or its active ancestor superstates) owns an
-/// in-flight `invoke`, an `after` timer, or a delayed `raise_event` / `send_to`.
-fn active_states_have_autonomous_work(ir: &MachineDef, active_paths: &[String]) -> bool {
-    for raw_path in active_paths {
-        let trimmed = raw_path
-            .strip_prefix(&format!("{}.", ir.id))
-            .unwrap_or(raw_path.as_str());
-        let mut current_map = &ir.states;
-        for seg in trimmed.split('.') {
-            let Some(node) = current_map.get(&StateId::from(seg)) else {
-                break;
-            };
-            if !node.invoke.is_empty()
-                || !node.after.is_empty()
-                || actions_have_delayed_send(&node.entry)
-                || node
-                    .on
-                    .iter()
-                    .any(|tr| actions_have_delayed_send(&tr.actions))
-            {
-                return true;
-            }
-            match &node.kind {
-                StateKind::Compound { states, .. } | StateKind::Parallel { states } => {
-                    current_map = states;
-                }
-                StateKind::Atomic | StateKind::Final | StateKind::History { .. } => break,
-            }
-        }
-    }
-    false
-}
-
 async fn drive_async(
     compiled: &CompiledChart,
     actor: &StarchartActor,
@@ -779,46 +716,73 @@ fn drive_sync(
     ExitCode::SUCCESS
 }
 
-fn run_serve(
-    file: &Path,
-    export: &str,
-    bind: &str,
-    context_override: Option<&str>,
-    state_file: Option<PathBuf>,
-    exit_on_done: bool,
-) -> ExitCode {
-    let mut compiled = match compile_starlark_file(file, Some(export)) {
-        Ok(c) => c,
-        Err(err) => {
-            eprintln!("ERROR {}:\n{err}", file.display());
+fn collect_star_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for p in paths {
+        if p.is_dir() {
+            let entries = std::fs::read_dir(p)
+                .map_err(|e| format!("failed reading directory `{}`: {e}", p.display()))?;
+            let mut dir_files: Vec<PathBuf> = entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|child| {
+                    child.is_file() && child.extension().and_then(|s| s.to_str()) == Some("star")
+                })
+                .collect();
+            dir_files.sort();
+            if dir_files.is_empty() {
+                return Err(format!(
+                    "no `.star` files found in directory `{}`",
+                    p.display()
+                ));
+            }
+            files.extend(dir_files);
+        } else {
+            files.push(p.clone());
+        }
+    }
+    Ok(files)
+}
+
+fn run_serve(paths: &[PathBuf], export: &str, bind: &str, db: &str) -> ExitCode {
+    let star_files = match collect_star_files(paths) {
+        Ok(list) => list,
+        Err(msg) => {
+            eprintln!("ERROR {msg}");
             return ExitCode::from(1);
         }
     };
 
-    if let Some(patch_str) = context_override {
-        match serde_json::from_str::<Value>(patch_str) {
-            Ok(Value::Object(patch_map)) => {
-                if let Value::Object(ctx_map) = &mut compiled.ir.context {
-                    for (k, v) in patch_map {
-                        ctx_map.insert(k, v);
-                    }
-                }
-            }
-            Ok(_) => {
-                eprintln!("ERROR `--context` must be a JSON object");
-                return ExitCode::from(1);
-            }
-            Err(err) => {
-                eprintln!("ERROR invalid `--context` JSON: {err}");
-                return ExitCode::from(1);
-            }
-        }
-    }
+    let mut definitions = Vec::with_capacity(star_files.len());
+    let mut machine_ids = Vec::with_capacity(star_files.len());
+    let mut seen_ids = HashSet::new();
 
-    let mut action_names = HashSet::new();
-    let mut service_names = HashSet::new();
-    collect_actions_and_services(&compiled.ir.states, &mut action_names, &mut service_names);
-    let callbacks = build_cli_callbacks(action_names, service_names, true);
+    for file in &star_files {
+        let compiled = match compile_starlark_file(file, Some(export)) {
+            Ok(c) => c,
+            Err(err) => {
+                eprintln!("ERROR {}:\n{err}", file.display());
+                return ExitCode::from(1);
+            }
+        };
+        if !seen_ids.insert(compiled.ir.id.clone()) {
+            eprintln!(
+                "ERROR duplicate machine id `{}` in `{}`",
+                compiled.ir.id,
+                file.display()
+            );
+            return ExitCode::from(1);
+        }
+        let mut action_names = HashSet::new();
+        let mut service_names = HashSet::new();
+        collect_actions_and_services(&compiled.ir.states, &mut action_names, &mut service_names);
+        let callbacks = build_cli_callbacks(action_names, service_names, true);
+        machine_ids.push(compiled.ir.id.clone());
+        definitions.push(ServeDefinition {
+            chart: compiled,
+            callbacks,
+        });
+    }
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -833,8 +797,8 @@ fn run_serve(
 
     let options = ServeOptions {
         bind_addr: bind.to_owned(),
-        state_file,
-        exit_on_done,
+        db: db.to_owned(),
+        shutdown: None,
     };
 
     rt.block_on(async move {
@@ -846,15 +810,15 @@ fn run_serve(
             }
         };
         println!(
-            "[serve] machine=`{}` listening on http://{local_addr}",
-            compiled.ir.id
+            "[serve] machines={machine_ids:?} db=`{}` listening on http://{local_addr}",
+            options.db
         );
         let _ = std::io::stdout().flush();
 
-        match serve_chart_http(compiled, callbacks, listener, options).await {
+        match serve_charts_http(definitions, listener, options).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
-                eprintln!("ERROR serving statechart: {err:#}");
+                eprintln!("ERROR serving statecharts: {err:#}");
                 ExitCode::from(1)
             }
         }
