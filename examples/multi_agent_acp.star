@@ -12,6 +12,7 @@ PipelineCtx = record(
     claude_notes = str,
     codex_notes = str,
     test_errors = str,
+    last_error = str,
     attempts = int,
     max_attempts = int,
 )
@@ -55,6 +56,7 @@ def save_plan(ctx: PipelineCtx, event: dict) -> PipelineCtx:
         claude_notes = ctx.claude_notes,
         codex_notes = ctx.codex_notes,
         test_errors = ctx.test_errors,
+        last_error = "",
         attempts = ctx.attempts,
         max_attempts = ctx.max_attempts,
     )
@@ -69,6 +71,7 @@ def save_claude_notes(ctx: PipelineCtx, event: dict) -> PipelineCtx:
         claude_notes = str(event.get("output", {}).get("text", "")),
         codex_notes = ctx.codex_notes,
         test_errors = ctx.test_errors,
+        last_error = ctx.last_error,
         attempts = ctx.attempts,
         max_attempts = ctx.max_attempts,
     )
@@ -83,6 +86,7 @@ def save_codex_notes(ctx: PipelineCtx, event: dict) -> PipelineCtx:
         claude_notes = ctx.claude_notes,
         codex_notes = str(event.get("output", {}).get("text", "")),
         test_errors = ctx.test_errors,
+        last_error = ctx.last_error,
         attempts = ctx.attempts,
         max_attempts = ctx.max_attempts,
     )
@@ -91,13 +95,27 @@ def can_retry(ctx: PipelineCtx, event: dict) -> bool:
     return ctx.attempts < ctx.max_attempts
 
 def record_test_failure(ctx: PipelineCtx, event: dict) -> PipelineCtx:
+    err = str(event.get("error", "check failure"))
     return PipelineCtx(
         task = ctx.task,
         plan = ctx.plan,
         claude_notes = ctx.claude_notes,
         codex_notes = ctx.codex_notes,
-        test_errors = str(event.get("error", "check failure")),
+        test_errors = err,
+        last_error = err,
         attempts = ctx.attempts + 1,
+        max_attempts = ctx.max_attempts,
+    )
+
+def record_escalation_error(ctx: PipelineCtx, event: dict) -> PipelineCtx:
+    return PipelineCtx(
+        task = ctx.task,
+        plan = ctx.plan,
+        claude_notes = ctx.claude_notes,
+        codex_notes = ctx.codex_notes,
+        test_errors = ctx.test_errors,
+        last_error = str(event.get("error", "agent invocation failed")),
+        attempts = ctx.attempts,
         max_attempts = ctx.max_attempts,
     )
 
@@ -111,6 +129,7 @@ chart: StateMachine = machine(
         claude_notes = "",
         codex_notes = "",
         test_errors = "",
+        last_error = "",
         attempts = 0,
         max_attempts = 2,
     ),
@@ -120,7 +139,7 @@ chart: StateMachine = machine(
                 agent = planner,
                 prompt = build_plan_prompt,
                 on_done = outcome(target = S.reviewing, assign = save_plan),
-                on_error = S.escalated,
+                on_error = outcome(target = S.escalated, assign = record_escalation_error),
             ),
         ),
         # Orthogonal parallel fan-out: Claude Code AND Codex review the plan simultaneously!
@@ -135,7 +154,7 @@ chart: StateMachine = machine(
                                 agent = claude,
                                 prompt = build_claude_prompt,
                                 on_done = outcome(target = S.claude_done, assign = save_claude_notes),
-                                on_error = S.escalated,
+                                on_error = outcome(target = S.escalated, assign = record_escalation_error),
                             ),
                         ),
                         S.claude_done: final_state(),
@@ -149,7 +168,7 @@ chart: StateMachine = machine(
                                 agent = codex,
                                 prompt = build_codex_prompt,
                                 on_done = outcome(target = S.codex_done, assign = save_codex_notes),
-                                on_error = S.escalated,
+                                on_error = outcome(target = S.escalated, assign = record_escalation_error),
                             ),
                         ),
                         S.codex_done: final_state(),
@@ -163,7 +182,7 @@ chart: StateMachine = machine(
                 on_done = S.done,
                 on_error = [
                     outcome(target = S.planning, guard = can_retry, assign = record_test_failure),
-                    outcome(target = S.escalated),
+                    outcome(target = S.escalated, assign = record_escalation_error),
                 ],
             ),
         ),
