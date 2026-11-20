@@ -3,6 +3,7 @@
 
 pub mod builtins;
 pub mod serve;
+pub mod store;
 pub mod trace;
 
 pub use serve::{
