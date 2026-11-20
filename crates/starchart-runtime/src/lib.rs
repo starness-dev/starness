@@ -2,8 +2,13 @@
 //! bridging pure frozen Starlark guards, delays & reducers with effectful Rust host callbacks.
 
 pub mod builtins;
+pub mod serve;
 pub mod trace;
 
+pub use serve::{
+    PersistedChartState, ServeOptions, apply_persisted_state_to_ir, bind_serve_listener,
+    serve_chart_http,
+};
 pub use trace::{
     ProgressKind, TraceEvent, TraceEventInfo, TraceHub, TraceReceiver, TraceRecord,
     progress_enabled, report_progress,

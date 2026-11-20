@@ -648,3 +648,267 @@ fn run_events_stdin_handles_live_rollback_signal_and_pages_oncall() {
     );
     assert_eq!(incidents.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+fn http_call(addr: &str, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let mut stream = TcpStream::connect(addr).expect("connect to starchart serve");
+    let payload = body.unwrap_or("");
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream.write_all(req.as_bytes()).expect("write http request");
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).expect("read http response");
+    let (head, resp_body) = raw
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("missing http header separator for `{method} {path}`, raw={raw:?}"));
+    let status_code: u16 = head
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0);
+    (status_code, resp_body.to_owned())
+}
+
+fn read_bound_addr(stdout: &mut std::io::BufReader<std::process::ChildStdout>) -> String {
+    use std::io::BufRead;
+
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("read listening banner");
+    let idx = line
+        .find("http://")
+        .unwrap_or_else(|| panic!("expected `http://` in serve banner, got: {line:?}"));
+    line[idx + "http://".len()..].trim().to_owned()
+}
+
+#[test]
+fn serve_http_endpoints_post_events_sse_trace_and_exit_on_done() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    use std::process::Stdio;
+
+    let (api_port, _incidents) = spawn_mock_deploy_control_api();
+    let state_file = std::env::temp_dir().join(format!(
+        "starchart_serve_done_{}_{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let ctx_patch = serde_json::json!({
+        "control_api": format!("http://127.0.0.1:{api_port}"),
+        "bake_interval_ms": 30,
+    })
+    .to_string();
+
+    let mut child = Command::new(bin_path())
+        .arg("serve")
+        .arg(workspace_file("examples/deployment_pipeline.star"))
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .arg("--context")
+        .arg(&ctx_patch)
+        .arg("--state-file")
+        .arg(&state_file)
+        .arg("--exit-on-done")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn starchart serve");
+
+    let mut stdout_reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let addr = read_bound_addr(&mut stdout_reader);
+
+    // 1. Check GET /health, GET /state, and GET /diagram
+    let (code, health_body) = http_call(&addr, "GET", "/health", None);
+    assert_eq!(code, 200);
+    let health: serde_json::Value = serde_json::from_str(&health_body).unwrap();
+    assert_eq!(health["ok"], true);
+    assert_eq!(health["machine"], "deployment_pipeline");
+
+    let (code, diagram) = http_call(&addr, "GET", "/diagram", None);
+    assert_eq!(code, 200);
+    assert!(diagram.starts_with("stateDiagram-v2"));
+
+    // 2. Open an SSE GET /trace stream on a background thread before sending events!
+    let sse_addr = addr.clone();
+    let sse_handle = std::thread::spawn(move || {
+        let mut s = TcpStream::connect(&sse_addr).expect("connect SSE");
+        write!(
+            s,
+            "GET /trace HTTP/1.1\r\nHost: {sse_addr}\r\nAccept: text/event-stream\r\n\r\n"
+        )
+        .unwrap();
+        let reader = BufReader::new(s);
+        let mut data_lines = Vec::new();
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some(rest) = line.strip_prefix("data: ") {
+                data_lines.push(rest.to_owned());
+            }
+        }
+        data_lines
+    });
+
+    // 3. Dispatch approvals via both `POST /events` and `POST /events/<EVENT>`
+    let (code, s1) = http_call(
+        &addr,
+        "POST",
+        "/events",
+        Some(r#"{"type":"APPROVE","by":"alice"}"#),
+    );
+    assert_eq!(code, 200);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&s1).unwrap()["context"]["approvals"],
+        1
+    );
+
+    let (code, s2) = http_call(&addr, "POST", "/events/APPROVE", Some(r#"{"by":"bob"}"#));
+    assert_eq!(code, 200);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&s2).unwrap()["context"]["approvals"],
+        2
+    );
+
+    let (code, _) = http_call(&addr, "POST", "/events/START_ROLLOUT", None);
+    assert_eq!(code, 200);
+
+    // 4. Server should run rollout to `live` and exit automatically (`--exit-on-done`).
+    let status = child.wait().expect("wait serve exit");
+    assert!(status.success());
+
+    let sse_events = sse_handle.join().expect("join SSE");
+    assert!(
+        sse_events.iter().any(|l| l.contains(r#""kind":"started""#)),
+        "expected SSE replay of `started`: {sse_events:?}"
+    );
+    assert!(
+        sse_events.iter().any(|l| l.contains(r#""to":["live"]"#)),
+        "expected SSE transition to `live`: {sse_events:?}"
+    );
+
+    let persisted: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_file).expect("read state file"))
+            .unwrap();
+    let _ = std::fs::remove_file(&state_file);
+    assert_eq!(persisted["done"], true);
+    assert_eq!(persisted["active_states"], serde_json::json!(["live"]));
+    assert_eq!(persisted["output"], serde_json::json!({"status": "live"}));
+}
+
+#[test]
+fn serve_resumes_paused_rollout_and_shallow_history_from_state_file_across_restart() {
+    use std::io::BufReader;
+    use std::process::Stdio;
+
+    let (api_port, _incidents) = spawn_mock_deploy_control_api();
+    let state_file = std::env::temp_dir().join(format!(
+        "starchart_serve_resume_{}_{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let ctx_patch = serde_json::json!({
+        "control_api": format!("http://127.0.0.1:{api_port}"),
+        "bake_interval_ms": 400,
+    })
+    .to_string();
+
+    // --- Process 1: approve, start rollout, pause during bake_wait, then kill server ---
+    let mut server1 = Command::new(bin_path())
+        .arg("serve")
+        .arg(workspace_file("examples/deployment_pipeline.star"))
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .arg("--context")
+        .arg(&ctx_patch)
+        .arg("--state-file")
+        .arg(&state_file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn server1");
+
+    let mut r1 = BufReader::new(server1.stdout.take().unwrap());
+    let addr1 = read_bound_addr(&mut r1);
+
+    http_call(&addr1, "POST", "/events/APPROVE", Some(r#"{"by":"alice"}"#));
+    http_call(&addr1, "POST", "/events/APPROVE", Some(r#"{"by":"bob"}"#));
+    http_call(&addr1, "POST", "/events/START_ROLLOUT", None);
+
+    // Wait briefly until `deploying_canary` enters `rolling_out.bake_wait`.
+    for _ in 0..40 {
+        let (_, body) = http_call(&addr1, "GET", "/state", None);
+        let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if st["active_states"] == serde_json::json!(["rolling_out.bake_wait"]) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let (code, paused_body) = http_call(&addr1, "POST", "/events/PAUSE", None);
+    assert_eq!(code, 200);
+    let paused_json: serde_json::Value = serde_json::from_str(&paused_body).unwrap();
+    assert_eq!(paused_json["active_states"], serde_json::json!(["paused"]));
+    assert_eq!(paused_json["history"]["rolling_out"], "bake_wait");
+
+    let _ = server1.kill();
+    let _ = server1.wait();
+
+    // --- Process 2: restart from `--state-file` with faster bake timer, send RESUME, finish ---
+    let mut saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+    saved["context"]["bake_interval_ms"] = serde_json::json!(25);
+    std::fs::write(&state_file, serde_json::to_vec_pretty(&saved).unwrap()).unwrap();
+
+    let mut server2 = Command::new(bin_path())
+        .arg("serve")
+        .arg(workspace_file("examples/deployment_pipeline.star"))
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .arg("--state-file")
+        .arg(&state_file)
+        .arg("--exit-on-done")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn server2");
+
+    let mut r2 = BufReader::new(server2.stdout.take().unwrap());
+    let addr2 = read_bound_addr(&mut r2);
+
+    let (code, resumed_initial) = http_call(&addr2, "GET", "/state", None);
+    assert_eq!(code, 200);
+    let init2: serde_json::Value = serde_json::from_str(&resumed_initial).unwrap();
+    assert_eq!(init2["active_states"], serde_json::json!(["paused"]));
+    assert_eq!(
+        init2["context"]["approved_by"],
+        serde_json::json!(["alice", "bob"])
+    );
+
+    let (code, after_resume) = http_call(&addr2, "POST", "/events/RESUME", None);
+    assert_eq!(code, 200);
+    let res_json: serde_json::Value = serde_json::from_str(&after_resume).unwrap();
+    assert_eq!(
+        res_json["active_states"],
+        serde_json::json!(["rolling_out.bake_wait"])
+    );
+
+    let status2 = server2.wait().expect("wait server2 done");
+    assert!(status2.success());
+
+    let final_disk: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+    let _ = std::fs::remove_file(&state_file);
+    assert_eq!(final_disk["done"], true);
+    assert_eq!(final_disk["active_states"], serde_json::json!(["live"]));
+}

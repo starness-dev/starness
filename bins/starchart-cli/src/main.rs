@@ -11,7 +11,8 @@ use serde_json::Value;
 use starchart_ir::{ActionDef, MachineDef, StateId, StateKind, StateNodeDef};
 use starchart_runtime::builtins::acp::serve_chart_as_acp_agent;
 use starchart_runtime::{
-    HostCallbacks, StarchartActor, StarchartSyncRunner, TraceReceiver, render_mermaid,
+    HostCallbacks, ServeOptions, StarchartActor, StarchartSyncRunner, TraceReceiver,
+    bind_serve_listener, render_mermaid, serve_chart_http,
 };
 use starchart_starlark::{
     CompiledChart, chart_dialect, chart_globals, compile_starlark_file, is_builtin_service,
@@ -95,6 +96,32 @@ enum Commands {
         trace: Option<String>,
     },
 
+    /// Run a `.star` statechart as an HTTP + SSE daemon (`POST /events`, `GET /state`, `GET /diagram`, `GET /trace`).
+    Serve {
+        /// Path to the `.star` statechart file.
+        file: PathBuf,
+
+        /// Exported variable name holding the `StateMachine` (defaults to `chart`).
+        #[arg(long, default_value = "chart")]
+        export: String,
+
+        /// TCP address to bind (e.g. `127.0.0.1:8080` or `127.0.0.1:0` for an ephemeral port).
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        bind: String,
+
+        /// Optional JSON object merged into the machine's initial `context` (when starting fresh).
+        #[arg(long)]
+        context: Option<String>,
+
+        /// Optional JSON snapshot file to persist state across restarts and resume automatically.
+        #[arg(long, value_name = "PATH")]
+        state_file: Option<PathBuf>,
+
+        /// Shut down the HTTP daemon automatically once the workflow reaches a `final_state`.
+        #[arg(long)]
+        exit_on_done: bool,
+    },
+
     /// Expose a `.star` statechart workflow over `stdio` as an Agent Client Protocol (ACP v1) agent.
     Acp {
         /// Path to the `.star` statechart file.
@@ -140,6 +167,21 @@ fn main() -> ExitCode {
             &events,
             events_stdin,
             trace.as_deref(),
+        ),
+        Commands::Serve {
+            file,
+            export,
+            bind,
+            context,
+            state_file,
+            exit_on_done,
+        } => run_serve(
+            &file,
+            &export,
+            &bind,
+            context.as_deref(),
+            state_file,
+            exit_on_done,
         ),
         Commands::Acp { file, export } => run_acp_server(&file, &export),
         Commands::Lsp => run_lsp(),
@@ -735,6 +777,88 @@ fn drive_sync(
     }
 
     ExitCode::SUCCESS
+}
+
+fn run_serve(
+    file: &Path,
+    export: &str,
+    bind: &str,
+    context_override: Option<&str>,
+    state_file: Option<PathBuf>,
+    exit_on_done: bool,
+) -> ExitCode {
+    let mut compiled = match compile_starlark_file(file, Some(export)) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("ERROR {}:\n{err}", file.display());
+            return ExitCode::from(1);
+        }
+    };
+
+    if let Some(patch_str) = context_override {
+        match serde_json::from_str::<Value>(patch_str) {
+            Ok(Value::Object(patch_map)) => {
+                if let Value::Object(ctx_map) = &mut compiled.ir.context {
+                    for (k, v) in patch_map {
+                        ctx_map.insert(k, v);
+                    }
+                }
+            }
+            Ok(_) => {
+                eprintln!("ERROR `--context` must be a JSON object");
+                return ExitCode::from(1);
+            }
+            Err(err) => {
+                eprintln!("ERROR invalid `--context` JSON: {err}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    let mut action_names = HashSet::new();
+    let mut service_names = HashSet::new();
+    collect_actions_and_services(&compiled.ir.states, &mut action_names, &mut service_names);
+    let callbacks = build_cli_callbacks(action_names, service_names, true);
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("ERROR building Tokio runtime: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let options = ServeOptions {
+        bind_addr: bind.to_owned(),
+        state_file,
+        exit_on_done,
+    };
+
+    rt.block_on(async move {
+        let (listener, local_addr) = match bind_serve_listener(&options.bind_addr).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("ERROR {err:#}");
+                return ExitCode::from(1);
+            }
+        };
+        println!(
+            "[serve] machine=`{}` listening on http://{local_addr}",
+            compiled.ir.id
+        );
+        let _ = std::io::stdout().flush();
+
+        match serve_chart_http(compiled, callbacks, listener, options).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("ERROR serving statechart: {err:#}");
+                ExitCode::from(1)
+            }
+        }
+    })
 }
 
 fn run_acp_server(file: &Path, export: &str) -> ExitCode {
