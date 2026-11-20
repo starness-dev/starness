@@ -13,8 +13,55 @@ use starlark::values::{FrozenValue, OwnedFrozenValue, ValueLike};
 use thiserror::Error;
 
 use crate::dsl::{chart_dialect, chart_globals};
+use crate::schema::{TypeRegistry, TypeShape};
 use crate::stdlib::resolve_builtin_module;
-use crate::types::{FrozenStarlarkMachine, starlark_input_slot_name};
+use crate::types::{
+    AgentToolDataGen, ArtifactMode, FrozenStarlarkMachine, starlark_input_slot_name,
+    starlark_tool_slot_name,
+};
+
+/// Frozen, pre-validated MCP tool definition extracted from a `.star` statechart.
+#[derive(Debug, Clone)]
+pub enum CompiledAgentTool {
+    Artifact {
+        name: String,
+        description: String,
+        input_schema: serde_json::Value,
+        shape: TypeShape,
+        schema_ctor: OwnedFrozenValue,
+        mode: ArtifactMode,
+        required: bool,
+        validate: Option<OwnedFrozenValue>,
+    },
+    Read {
+        name: String,
+        description: String,
+        input_schema: serde_json::Value,
+        shape: Option<TypeShape>,
+        schema_ctor: Option<OwnedFrozenValue>,
+        handler: OwnedFrozenValue,
+    },
+}
+
+impl CompiledAgentTool {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Artifact { name, .. } | Self::Read { name, .. } => name,
+        }
+    }
+
+    pub fn description(&self) -> &str {
+        match self {
+            Self::Artifact { description, .. } | Self::Read { description, .. } => description,
+        }
+    }
+
+    pub fn input_schema(&self) -> &serde_json::Value {
+        match self {
+            Self::Artifact { input_schema, .. } | Self::Read { input_schema, .. } => input_schema,
+        }
+    }
+}
 
 /// Compiled, validated statechart paired with thread-safe frozen Starlark callables.
 #[derive(Debug, Clone)]
@@ -24,6 +71,8 @@ pub struct CompiledChart {
     pub reducers: HashMap<String, OwnedFrozenValue>,
     pub delays: HashMap<String, OwnedFrozenValue>,
     pub inputs: HashMap<String, OwnedFrozenValue>,
+    pub tools: HashMap<String, CompiledAgentTool>,
+    pub type_registry: TypeRegistry,
     /// Optional frozen `RecordType` constructor if `machine(context = ...)` used a Starlark `record(...)`.
     pub context_record_type: Option<OwnedFrozenValue>,
 }
@@ -391,6 +440,69 @@ fn extract_compiled_chart(
         inputs.insert(name, owned);
     }
 
+    let type_registry = TypeRegistry::from_frozen_modules(loaded_modules);
+
+    let mut tools = HashMap::with_capacity(machine.tool_slots.len());
+    for (slot, frozen_tool) in machine.tool_slots.iter().enumerate() {
+        let slot_key = starlark_tool_slot_name(slot);
+        let compiled_tool = match frozen_tool {
+            AgentToolDataGen::Artifact {
+                name,
+                description,
+                shape,
+                schema_ctor,
+                mode,
+                required,
+                validate,
+            } => {
+                let input_schema = shape.0.to_json_schema(&type_registry.shapes);
+                // SAFETY: `schema_ctor` and `validate` were frozen into `frozen_module`'s heap.
+                let ctor_owned = unsafe { OwnedFrozenValue::new(heap.dupe(), *schema_ctor) };
+                let validate_owned = validate
+                    .map(|v| unsafe { OwnedFrozenValue::new(heap.dupe(), v) });
+                CompiledAgentTool::Artifact {
+                    name: name.clone(),
+                    description: description.clone(),
+                    input_schema,
+                    shape: shape.0.clone(),
+                    schema_ctor: ctor_owned,
+                    mode: *mode,
+                    required: *required,
+                    validate: validate_owned,
+                }
+            }
+            AgentToolDataGen::Read {
+                name,
+                description,
+                shape,
+                schema_ctor,
+                handler,
+            } => {
+                let input_schema = match shape {
+                    Some(s) => s.0.to_json_schema(&type_registry.shapes),
+                    None => serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false,
+                    }),
+                };
+                // SAFETY: `schema_ctor` and `handler` were frozen into `frozen_module`'s heap.
+                let ctor_owned = schema_ctor
+                    .map(|v| unsafe { OwnedFrozenValue::new(heap.dupe(), v) });
+                let handler_owned = unsafe { OwnedFrozenValue::new(heap.dupe(), *handler) };
+                CompiledAgentTool::Read {
+                    name: name.clone(),
+                    description: description.clone(),
+                    input_schema,
+                    shape: shape.as_ref().map(|s| s.0.clone()),
+                    schema_ctor: ctor_owned,
+                    handler: handler_owned,
+                }
+            }
+        };
+        tools.insert(slot_key, compiled_tool);
+    }
+
     let context_record_type = machine
         .initial_record_context
         .and_then(|initial_rec| find_matching_record_type(initial_rec, loaded_modules));
@@ -401,6 +513,8 @@ fn extract_compiled_chart(
         reducers,
         delays,
         inputs,
+        tools,
+        type_registry,
         context_record_type,
     })
 }

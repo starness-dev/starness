@@ -15,7 +15,7 @@ use starlark::starlark_simple_value;
 use starlark::typing::Ty;
 use starlark::values::dict::DictRef;
 use starlark::values::enumeration::EnumValue;
-use starlark::values::list::UnpackList;
+use starlark::values::list::{ListRef, UnpackList};
 use starlark::values::record::Record;
 use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark::values::typing::StarlarkCallable;
@@ -23,6 +23,8 @@ use starlark::values::{
     Freeze, FreezeResult, Freezer, FrozenValue, Heap, NoSerialize, StarlarkValue, Trace,
     UnpackValue, Value, ValueLifetimeless, ValueLike, starlark_value,
 };
+
+use crate::schema::TypeShape;
 
 /// Accepts either a raw `str` or a Starlark `enum(...)` variant (`EnumValue`),
 /// extracting the underlying string name while preserving static typechecking.
@@ -752,11 +754,188 @@ pub fn starlark_input_slot_name(slot: usize) -> String {
     format!("__starlark_input_{slot}")
 }
 
+/// JSON object key used inside `InvokeDef.input` to reference a compiled MCP `AgentTool` slot.
+pub const INVOKE_TOOL_SLOT_KEY: &str = "__starchart_tool_slot__";
+
+pub fn starlark_tool_slot_name(slot: usize) -> String {
+    format!("__starlark_tool_{slot}")
+}
+
+/// Cardinality/overwrite behavior for an [`AgentToolDataGen::Artifact`] MCP tool within a single turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Allocative, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactMode {
+    /// Latest valid call in the turn overwrites previous value (`artifacts[name]` is an object).
+    Replace,
+    /// Each valid call appends to `artifacts[name]` (`list[object]`, defaulting to `[]` if uncalled).
+    Append,
+    /// Only one valid call is permitted per turn; subsequent calls return an MCP tool error.
+    Once,
+}
+
+impl ArtifactMode {
+    pub fn parse(raw: &str) -> anyhow::Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "replace" => Ok(Self::Replace),
+            "append" => Ok(Self::Append),
+            "once" => Ok(Self::Once),
+            other => anyhow::bail!(
+                "invalid `mode` `{other}`: expected `\"replace\"`, `\"append\"`, or `\"once\"`"
+            ),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Append => "append",
+            Self::Once => "once",
+        }
+    }
+}
+
+impl Freeze for ArtifactMode {
+    type Frozen = Self;
+
+    fn freeze(self, _freezer: &Freezer) -> FreezeResult<Self::Frozen> {
+        Ok(self)
+    }
+}
+
+/// Wrapper around [`TypeShape`] skipping `Allocative` traversal and implementing `Freeze`.
+#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+pub struct TypeShapeHolder(#[allocative(skip)] pub TypeShape);
+
+impl Freeze for TypeShapeHolder {
+    type Frozen = Self;
+
+    fn freeze(self, _freezer: &Freezer) -> FreezeResult<Self::Frozen> {
+        Ok(self)
+    }
+}
+
+/// Turn-scoped MCP tool specification (`artifact_tool` or `read_tool`) attached to `invoke_agent`.
+#[derive(Debug, Clone, Trace, Freeze, Allocative)]
+pub enum AgentToolDataGen<V: ValueLifetimeless> {
+    Artifact {
+        name: String,
+        description: String,
+        #[trace(unsafe_ignore)]
+        shape: TypeShapeHolder,
+        schema_ctor: V,
+        #[trace(unsafe_ignore)]
+        mode: ArtifactMode,
+        required: bool,
+        validate: Option<V>,
+    },
+    Read {
+        name: String,
+        description: String,
+        #[trace(unsafe_ignore)]
+        shape: Option<TypeShapeHolder>,
+        schema_ctor: Option<V>,
+        handler: V,
+    },
+}
+
+unsafe impl<'v> Coerce<AgentToolDataGen<Value<'v>>> for AgentToolDataGen<FrozenValue> {}
+
+impl<V: ValueLifetimeless> AgentToolDataGen<V> {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Artifact { name, .. } | Self::Read { name, .. } => name,
+        }
+    }
+}
+
+pub fn clone_agent_tool_to_value<'v, V: ValueLike<'v>>(
+    tool: &AgentToolDataGen<V>,
+) -> AgentToolDataGen<Value<'v>> {
+    match tool {
+        AgentToolDataGen::Artifact {
+            name,
+            description,
+            shape,
+            schema_ctor,
+            mode,
+            required,
+            validate,
+        } => AgentToolDataGen::Artifact {
+            name: name.clone(),
+            description: description.clone(),
+            shape: shape.clone(),
+            schema_ctor: schema_ctor.to_value(),
+            mode: *mode,
+            required: *required,
+            validate: validate.as_ref().map(|v| v.to_value()),
+        },
+        AgentToolDataGen::Read {
+            name,
+            description,
+            shape,
+            schema_ctor,
+            handler,
+        } => AgentToolDataGen::Read {
+            name: name.clone(),
+            description: description.clone(),
+            shape: shape.clone(),
+            schema_ctor: schema_ctor.as_ref().map(|v| v.to_value()),
+            handler: handler.to_value(),
+        },
+    }
+}
+
+/// Typed Starlark MCP tool value returned by `artifact_tool(...)` and `read_tool(...)`.
+#[derive(Debug, Clone, Coerce, Trace, Freeze, ProvidesStaticType, NoSerialize, Allocative)]
+#[repr(C)]
+pub struct StarlarkAgentToolGen<V: ValueLifetimeless> {
+    pub data: AgentToolDataGen<V>,
+}
+
+starlark_complex_value!(pub StarlarkAgentTool);
+
+impl<V: ValueLifetimeless> Display for StarlarkAgentToolGen<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.data {
+            AgentToolDataGen::Artifact { name, mode, .. } => {
+                write!(f, "artifact_tool(name={name:?}, mode={:?})", mode.as_str())
+            }
+            AgentToolDataGen::Read { name, .. } => write!(f, "read_tool(name={name:?})"),
+        }
+    }
+}
+
+#[starlark_value(type = "AgentTool")]
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for StarlarkAgentToolGen<V>
+where
+    Self: ProvidesStaticType<'v>,
+{
+    fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
+        match attribute {
+            "name" => Some(heap.alloc_str(self.data.name()).to_value()),
+            "kind" => {
+                let k = match &self.data {
+                    AgentToolDataGen::Artifact { .. } => "artifact",
+                    AgentToolDataGen::Read { .. } => "read",
+                };
+                Some(heap.alloc_str(k).to_value())
+            }
+            _ => None,
+        }
+    }
+
+    fn dir_attr(&self) -> Vec<String> {
+        vec!["name".to_owned(), "kind".to_owned()]
+    }
+}
+
 #[derive(Debug, Clone, Trace, Freeze, Allocative)]
 pub enum InvokeInputGen<V: ValueLifetimeless> {
     Json(#[trace(unsafe_ignore)] JsonHolder),
     Callable(V),
+    Array(Vec<InvokeInputGen<V>>),
     Object(Vec<(String, InvokeInputGen<V>)>),
+    AgentTool(AgentToolDataGen<V>),
 }
 
 unsafe impl<'v> Coerce<InvokeInputGen<Value<'v>>> for InvokeInputGen<FrozenValue> {}
@@ -767,18 +946,27 @@ pub fn clone_invoke_input_to_value<'v, V: ValueLike<'v>>(
     match inp {
         InvokeInputGen::Json(j) => InvokeInputGen::Json(j.clone()),
         InvokeInputGen::Callable(v) => InvokeInputGen::Callable(v.to_value()),
+        InvokeInputGen::Array(items) => {
+            InvokeInputGen::Array(items.iter().map(clone_invoke_input_to_value).collect())
+        }
         InvokeInputGen::Object(entries) => InvokeInputGen::Object(
             entries
                 .iter()
                 .map(|(k, v)| (k.clone(), clone_invoke_input_to_value(v)))
                 .collect(),
         ),
+        InvokeInputGen::AgentTool(t) => InvokeInputGen::AgentTool(clone_agent_tool_to_value(t)),
     }
 }
 
 pub fn unpack_invoke_input_value<'v>(value: Value<'v>) -> anyhow::Result<InvokeInputGen<Value<'v>>> {
     if value.is_none() {
         return Ok(InvokeInputGen::Json(JsonHolder(serde_json::Value::Null)));
+    }
+    if let Some(tool) = StarlarkAgentTool::from_value(value) {
+        return Ok(InvokeInputGen::AgentTool(clone_agent_tool_to_value(
+            &tool.data,
+        )));
     }
     if let Some(dict) = DictRef::from_value(value) {
         let mut entries = Vec::with_capacity(dict.len());
@@ -790,6 +978,13 @@ pub fn unpack_invoke_input_value<'v>(value: Value<'v>) -> anyhow::Result<InvokeI
             entries.push((key, unpack_invoke_input_value(v)?));
         }
         return Ok(InvokeInputGen::Object(entries));
+    }
+    if let Some(list) = ListRef::from_value(value) {
+        let mut items = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            items.push(unpack_invoke_input_value(item)?);
+        }
+        return Ok(InvokeInputGen::Array(items));
     }
     if Record::from_value(value).is_none()
         && EnumValue::from_value(value).is_none()
@@ -1006,6 +1201,7 @@ pub struct StarlarkMachineGen<V: ValueLifetimeless> {
     pub reducer_slots: Vec<V>,
     pub delay_slots: Vec<V>,
     pub input_slots: Vec<V>,
+    pub tool_slots: Vec<AgentToolDataGen<V>>,
     /// Preserved initial context value if constructed from a Starlark `record(...)` type.
     pub initial_record_context: Option<V>,
 }
@@ -1022,6 +1218,7 @@ impl<'v> Freeze for StarlarkMachineGen<Value<'v>> {
             reducer_slots: self.reducer_slots.freeze(freezer)?,
             delay_slots: self.delay_slots.freeze(freezer)?,
             input_slots: self.input_slots.freeze(freezer)?,
+            tool_slots: self.tool_slots.freeze(freezer)?,
             initial_record_context: self.initial_record_context.freeze(freezer)?,
         })
     }
@@ -1068,6 +1265,7 @@ pub fn build_and_validate_machine<'v>(
     let mut reducer_slots: Vec<Value<'v>> = Vec::new();
     let mut delay_slots: Vec<Value<'v>> = Vec::new();
     let mut input_slots: Vec<Value<'v>> = Vec::new();
+    let mut tool_slots: Vec<AgentToolDataGen<Value<'v>>> = Vec::new();
 
     let mut states = IndexMap::new();
     for (state_id, node_data) in entries {
@@ -1077,6 +1275,7 @@ pub fn build_and_validate_machine<'v>(
             &mut reducer_slots,
             &mut delay_slots,
             &mut input_slots,
+            &mut tool_slots,
         );
         states.insert(state_id, ir_node);
     }
@@ -1098,6 +1297,7 @@ pub fn build_and_validate_machine<'v>(
         reducer_slots,
         delay_slots,
         input_slots,
+        tool_slots,
         initial_record_context,
     })
 }
@@ -1236,6 +1436,7 @@ fn lower_outcome<'v>(
 fn lower_invoke_input<'v>(
     inp: InvokeInputGen<Value<'v>>,
     input_slots: &mut Vec<Value<'v>>,
+    tool_slots: &mut Vec<AgentToolDataGen<Value<'v>>>,
 ) -> serde_json::Value {
     match inp {
         InvokeInputGen::Json(j) => j.0,
@@ -1246,12 +1447,25 @@ fn lower_invoke_input<'v>(
                 INVOKE_INPUT_SLOT_KEY: starlark_input_slot_name(slot),
             })
         }
+        InvokeInputGen::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(|i| lower_invoke_input(i, input_slots, tool_slots))
+                .collect(),
+        ),
         InvokeInputGen::Object(entries) => {
             let mut map = serde_json::Map::with_capacity(entries.len());
             for (k, v) in entries {
-                map.insert(k, lower_invoke_input(v, input_slots));
+                map.insert(k, lower_invoke_input(v, input_slots, tool_slots));
             }
             serde_json::Value::Object(map)
+        }
+        InvokeInputGen::AgentTool(tool) => {
+            let slot = tool_slots.len();
+            tool_slots.push(tool);
+            serde_json::json!({
+                INVOKE_TOOL_SLOT_KEY: starlark_tool_slot_name(slot),
+            })
         }
     }
 }
@@ -1262,11 +1476,12 @@ fn lower_invoke<'v>(
     reducer_slots: &mut Vec<Value<'v>>,
     delay_slots: &mut Vec<Value<'v>>,
     input_slots: &mut Vec<Value<'v>>,
+    tool_slots: &mut Vec<AgentToolDataGen<Value<'v>>>,
 ) -> InvokeDef {
     InvokeDef {
         id: inv.id,
         src: inv.src,
-        input: lower_invoke_input(inv.input, input_slots),
+        input: lower_invoke_input(inv.input, input_slots, tool_slots),
         on_done: inv
             .on_done
             .into_iter()
@@ -1295,12 +1510,14 @@ fn lower_after<'v>(
     AfterDef { delay, outcomes }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_node<'v>(
     node: StateNodeDataGen<Value<'v>>,
     guard_slots: &mut Vec<Value<'v>>,
     reducer_slots: &mut Vec<Value<'v>>,
     delay_slots: &mut Vec<Value<'v>>,
     input_slots: &mut Vec<Value<'v>>,
+    tool_slots: &mut Vec<AgentToolDataGen<Value<'v>>>,
 ) -> StateNodeDef {
     let kind = match node.kind {
         NodeKindDataGen::Atomic => StateKind::Atomic,
@@ -1315,6 +1532,7 @@ fn lower_node<'v>(
                         reducer_slots,
                         delay_slots,
                         input_slots,
+                        tool_slots,
                     ),
                 );
             }
@@ -1334,6 +1552,7 @@ fn lower_node<'v>(
                         reducer_slots,
                         delay_slots,
                         input_slots,
+                        tool_slots,
                     ),
                 );
             }
@@ -1377,7 +1596,7 @@ fn lower_node<'v>(
     let invoke = node
         .invoke
         .into_iter()
-        .map(|inv| lower_invoke(inv, guard_slots, reducer_slots, delay_slots, input_slots))
+        .map(|inv| lower_invoke(inv, guard_slots, reducer_slots, delay_slots, input_slots, tool_slots))
         .collect();
     let on_done = node
         .on_done

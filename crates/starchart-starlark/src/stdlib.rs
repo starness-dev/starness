@@ -131,6 +131,12 @@ def invoke_cmd(
 pub const ACP_MODULE_ID: &str = "@starchart/acp.star";
 pub const ACP_MODULE_SOURCE: &str = r#"
 AgentProtocol = enum("ACP", "CLAUDE_CLI", "CODEX_CLI")
+ArtifactMode = enum("replace", "append", "once")
+
+artifact_tool = __starchart_artifact_tool__
+read_tool = __starchart_read_tool__
+artifact = __starchart_artifact__
+artifact_list = __starchart_artifact_list__
 
 AcpAgent = record(
     id = str,
@@ -282,16 +288,25 @@ def invoke_agent(
     *,
     agent: AcpAgent,
     prompt: str | typing.Callable,
+    context = None,
+    tools: list[AgentTool] = [],
     id: str | None = None,
     on_done = None,
     on_error = None,
 ) -> Invoke:
+    seen_tools = {}
+    for t in tools:
+        if t.name in seen_tools:
+            fail("duplicate MCP tool name `" + t.name + "` in invoke_agent(...)")
+        seen_tools[t.name] = True
     return invoke(
         src = "__starchart_builtin_acp__",
         id = id if id != None else agent.id,
         input = {
             "agent": agent,
             "prompt": prompt,
+            "context": context,
+            "tools": tools,
         },
         on_done = on_done,
         on_error = on_error,

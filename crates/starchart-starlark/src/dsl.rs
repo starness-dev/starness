@@ -4,24 +4,100 @@ use anyhow::bail;
 use indexmap::IndexSet;
 use starchart_ir::StateId;
 use starlark::environment::{Globals, GlobalsBuilder, LibraryExtension};
+use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::syntax::{Dialect, DialectTypes};
-use starlark::values::Value;
 use starlark::values::dict::UnpackDictEntries;
-use starlark::values::list::UnpackList;
+use starlark::values::list::{AllocList, UnpackList};
 use starlark::values::none::NoneOr;
 use starlark::values::record::Record;
 use starlark::values::tuple::UnpackTuple;
+use starlark::values::typing::{StarlarkCallable, StarlarkCallableParamAny};
+use starlark::values::{FrozenValue, Value};
 
+use crate::schema::{
+    instantiate_record_in_eval, parse_record_schema_value, update_record_or_dict,
+};
 use crate::types::{
-    ActionDataGen, ActionInput, AfterDataGen, AssignCallable, DelayInput, GuardExprGen, GuardInput,
-    InvokeDataGen, InvokeInputGen, InvokeOutcomesInput, JsonHolder, NodeKindDataGen,
-    OneOrManyAfter, OneOrManyInvoke, OutcomeDataGen, StarlarkAction, StarlarkAfter, StarlarkGuard,
-    StarlarkInvoke, StarlarkMachine, StarlarkOutcome, StarlarkStateId, StarlarkStateNode,
-    StarlarkStateSpace, StarlarkTransition, StateNodeDataGen, SymbolOrEnum, TransitionDataGen,
+    ActionDataGen, ActionInput, AfterDataGen, AgentToolDataGen, ArtifactMode, AssignCallable,
+    DelayInput, GuardExprGen, GuardInput, InvokeDataGen, InvokeInputGen, InvokeOutcomesInput,
+    JsonHolder, NodeKindDataGen, OneOrManyAfter, OneOrManyInvoke, OutcomeDataGen, StarlarkAction,
+    StarlarkAfter, StarlarkAgentTool, StarlarkGuard, StarlarkInvoke, StarlarkMachine,
+    StarlarkOutcome, StarlarkStateId, StarlarkStateNode, StarlarkStateSpace, StarlarkTransition,
+    StateNodeDataGen, SymbolOrEnum, TransitionDataGen, TypeShapeHolder,
     build_and_validate_machine, clone_node_to_value, clone_transition_to_value,
     unpack_invoke_input_value,
 };
+
+fn validate_mcp_tool_name(name: &str, fn_label: &str) -> anyhow::Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        bail!("{fn_label} `name` must not be empty");
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        bail!(
+            "{fn_label} `name` `{trimmed}` must contain only ASCII letters, digits, `_`, or `-`"
+        );
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn build_artifact_tool<'v>(
+    name: &str,
+    schema: Value<'v>,
+    description: &str,
+    mode: Option<SymbolOrEnum>,
+    required: bool,
+    validate: NoneOr<StarlarkCallable<'v, (FrozenValue, FrozenValue), NoneOr<String>>>,
+    eval: &mut Evaluator<'v, '_, '_>,
+) -> anyhow::Result<StarlarkAgentTool<'v>> {
+    let tool_name = validate_mcp_tool_name(name, "artifact_tool")?;
+    let shape = parse_record_schema_value(schema, eval.heap())?;
+    let resolved_mode = match mode {
+        Some(m) => ArtifactMode::parse(&m.0)?,
+        None => ArtifactMode::Replace,
+    };
+    Ok(StarlarkAgentTool {
+        data: AgentToolDataGen::Artifact {
+            name: tool_name,
+            description: description.to_owned(),
+            shape: TypeShapeHolder(shape),
+            schema_ctor: schema,
+            mode: resolved_mode,
+            required,
+            validate: validate.into_option().map(|c| c.0),
+        },
+    })
+}
+
+fn build_read_tool<'v>(
+    name: &str,
+    handler: StarlarkCallable<'v, StarlarkCallableParamAny, FrozenValue>,
+    description: &str,
+    schema: NoneOr<Value<'v>>,
+    eval: &mut Evaluator<'v, '_, '_>,
+) -> anyhow::Result<StarlarkAgentTool<'v>> {
+    let tool_name = validate_mcp_tool_name(name, "read_tool")?;
+    let (shape_opt, ctor_opt) = match schema.into_option() {
+        Some(s) if !s.is_none() => {
+            let parsed = parse_record_schema_value(s, eval.heap())?;
+            (Some(TypeShapeHolder(parsed)), Some(s))
+        }
+        _ => (None, None),
+    };
+    Ok(StarlarkAgentTool {
+        data: AgentToolDataGen::Read {
+            name: tool_name,
+            description: description.to_owned(),
+            shape: shape_opt,
+            schema_ctor: ctor_opt,
+            handler: handler.0,
+        },
+    })
+}
 
 fn unpack_optional_json(val: Option<Value<'_>>) -> anyhow::Result<Option<JsonHolder>> {
     match val {
@@ -52,6 +128,7 @@ fn unpack_optional_meta(val: Option<Value<'_>>) -> anyhow::Result<Option<JsonHol
     StarlarkTransition as Transition,
     StarlarkOutcome as Outcome,
     StarlarkAfter as After,
+    StarlarkAgentTool as AgentTool,
     StarlarkInvoke as Invoke,
     StarlarkStateNode as StateNode,
     StarlarkMachine as StateMachine
@@ -712,6 +789,162 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
             }
         }
     }
+
+    /// Declares a turn-scoped MCP artifact/write tool validated against a Starlark `record(...)`.
+    fn artifact_tool<'v>(
+        name: &str,
+        #[starlark(require = named)] schema: Value<'v>,
+        #[starlark(require = named, default = "")] description: &str,
+        #[starlark(require = named)] mode: Option<SymbolOrEnum>,
+        #[starlark(require = named, default = true)] required: bool,
+        #[starlark(require = named, default = NoneOr::None)] validate: NoneOr<
+            StarlarkCallable<'v, (FrozenValue, FrozenValue), NoneOr<String>>,
+        >,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<StarlarkAgentTool<'v>> {
+        build_artifact_tool(name, schema, description, mode, required, validate, eval)
+    }
+
+    /// Internal alias used by `@starchart/acp` to re-export `artifact_tool` without local shadowing.
+    fn __starchart_artifact_tool__<'v>(
+        name: &str,
+        #[starlark(require = named)] schema: Value<'v>,
+        #[starlark(require = named, default = "")] description: &str,
+        #[starlark(require = named)] mode: Option<SymbolOrEnum>,
+        #[starlark(require = named, default = true)] required: bool,
+        #[starlark(require = named, default = NoneOr::None)] validate: NoneOr<
+            StarlarkCallable<'v, (FrozenValue, FrozenValue), NoneOr<String>>,
+        >,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<StarlarkAgentTool<'v>> {
+        build_artifact_tool(name, schema, description, mode, required, validate, eval)
+    }
+
+    /// Declares a turn-scoped MCP read-only query tool backed by a pure Starlark function.
+    fn read_tool<'v>(
+        name: &str,
+        #[starlark(require = named)] handler: StarlarkCallable<
+            'v,
+            StarlarkCallableParamAny,
+            FrozenValue,
+        >,
+        #[starlark(require = named, default = "")] description: &str,
+        #[starlark(require = named, default = NoneOr::None)] schema: NoneOr<Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<StarlarkAgentTool<'v>> {
+        build_read_tool(name, handler, description, schema, eval)
+    }
+
+    /// Internal alias used by `@starchart/acp` to re-export `read_tool` without local shadowing.
+    fn __starchart_read_tool__<'v>(
+        name: &str,
+        #[starlark(require = named)] handler: StarlarkCallable<
+            'v,
+            StarlarkCallableParamAny,
+            FrozenValue,
+        >,
+        #[starlark(require = named, default = "")] description: &str,
+        #[starlark(require = named, default = NoneOr::None)] schema: NoneOr<Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<StarlarkAgentTool<'v>> {
+        build_read_tool(name, handler, description, schema, eval)
+    }
+
+    /// Returns a shallow-updated copy of a `record` or `dict` with only the specified fields changed
+    /// (similar to Python's `dataclasses.replace(ctx, field = val)`).
+    fn update<'v>(
+        #[starlark(require = pos)] target: Value<'v>,
+        #[starlark(kwargs)] kwargs: UnpackDictEntries<&'v str, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        update_record_or_dict(target, kwargs.entries, eval)
+    }
+
+    /// Extracts a validated turn artifact from an `on_done` event (`event["output"]["artifacts"][name]`)
+    /// and instantiates it as `schema` (`record(...)`).
+    fn artifact<'v>(
+        event: Value<'v>,
+        name: &str,
+        schema: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        extract_single_artifact(event, name, schema, eval)
+    }
+
+    /// Internal alias used by `@starchart/acp` to re-export `artifact`.
+    fn __starchart_artifact__<'v>(
+        event: Value<'v>,
+        name: &str,
+        schema: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        extract_single_artifact(event, name, schema, eval)
+    }
+
+    /// Extracts an `append`-mode list of turn artifacts (`event["output"]["artifacts"][name]`)
+    /// and instantiates each item as `schema` (`record(...)`).
+    fn artifact_list<'v>(
+        event: Value<'v>,
+        name: &str,
+        schema: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        extract_artifact_list(event, name, schema, eval)
+    }
+
+    /// Internal alias used by `@starchart/acp` to re-export `artifact_list`.
+    fn __starchart_artifact_list__<'v>(
+        event: Value<'v>,
+        name: &str,
+        schema: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        extract_artifact_list(event, name, schema, eval)
+    }
+}
+
+fn lookup_artifacts_map(
+    event_json: &serde_json::Value,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    event_json
+        .get("output")
+        .and_then(|o| o.get("artifacts"))
+        .and_then(serde_json::Value::as_object)
+        .or_else(|| event_json.get("artifacts").and_then(serde_json::Value::as_object))
+        .or_else(|| event_json.as_object())
+}
+
+fn extract_single_artifact<'v>(
+    event: Value<'v>,
+    name: &str,
+    schema: Value<'v>,
+    eval: &mut Evaluator<'v, '_, '_>,
+) -> anyhow::Result<Value<'v>> {
+    let ev_json = event.to_json_value()?;
+    let raw = lookup_artifacts_map(&ev_json)
+        .and_then(|m| m.get(name))
+        .ok_or_else(|| anyhow::anyhow!("missing artifact `{name}` in event output"))?;
+    instantiate_record_in_eval(schema, raw, eval)
+}
+
+fn extract_artifact_list<'v>(
+    event: Value<'v>,
+    name: &str,
+    schema: Value<'v>,
+    eval: &mut Evaluator<'v, '_, '_>,
+) -> anyhow::Result<Value<'v>> {
+    let ev_json = event.to_json_value()?;
+    let Some(raw) = lookup_artifacts_map(&ev_json).and_then(|m| m.get(name)) else {
+        return Ok(eval.heap().alloc(AllocList(Vec::<Value<'v>>::new())));
+    };
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("artifact `{name}` is not a list, got `{raw}`"))?;
+    let mut items = Vec::with_capacity(arr.len());
+    for item in arr {
+        items.push(instantiate_record_in_eval(schema, item, eval)?);
+    }
+    Ok(eval.heap().alloc(AllocList(items)))
 }
 
 /// Builds the pure Starlark globals with `EnumType`, `RecordType`, `Typing`, and the Starchart DSL.
