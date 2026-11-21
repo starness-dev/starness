@@ -381,6 +381,7 @@ Every example in `examples/` is pure Starlark (no custom Rust required) and pass
 
 | Example | Modules Used | Highlights |
 | :--- | :--- | :--- |
+| [`examples/bluesky_radar.star`](examples/bluesky_radar.star) + [`bluesky_radar.ui.json`](examples/bluesky_radar.ui.json) | `http`, `--ui` | **Live zero-auth showcase**: samples Bluesky's public API for `"ai harness"` across parallel `latest` + `top` regions with exponential backoff, deduplication, `paused` / `auto_polling` toggle, and `MarkdownReview` digest curation in Web Studio & Ratatui TUI |
 | [`examples/coding_session_llm.star`](examples/coding_session_llm.star) | `llm`, `exec`, `secrets` | Interactive multi-turn coding REPL (`working { thinking <-> acting }`), native `bash` tool calling, `assistant_msg(ev)` lossless round-tripping, and `INTERRUPT` cancellation |
 | [`examples/plan_review.star`](examples/plan_review.star) + [`plan_review.ui.json`](examples/plan_review.ui.json) | `ui` | Pure headless Markdown plan review statechart paired with an external `*.ui.json` view-sheet (`MarkdownReview`, per-line comments, `REQUEST_CHANGES` / `APPROVE` loop) in Web Studio (`starness serve --ui`) and Ratatui TUI (`starness run -i --ui`) |
 | [`examples/release_notes_llm.star`](examples/release_notes_llm.star) | `llm`, `exec`, `secrets` | Constrained-decoding Starlark `Record` + nested `Enum` extraction (`ReleaseSummary`), SSE streaming, and breaking-change approval gate |

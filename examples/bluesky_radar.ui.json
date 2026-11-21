@@ -1,0 +1,185 @@
+{
+  "machine": "bluesky_radar",
+  "views": {
+    "paused": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["status_card", "controls_card", "posts_table"]
+        },
+        "status_card": {
+          "type": "Card",
+          "props": { "title": "Bluesky Radar (Manual)" },
+          "children": ["status_badge", "summary_kv", "status_alert"]
+        },
+        "status_badge": {
+          "type": "Badge",
+          "props": { "label": { "$state": "/status_label" }, "variant": "info" }
+        },
+        "summary_kv": {
+          "type": "KeyValue",
+          "props": { "items": { "$state": "/summary_kv" } }
+        },
+        "status_alert": {
+          "type": "Alert",
+          "props": {
+            "title": { "$state": "/alert_title" },
+            "message": { "$state": "/alert_message" },
+            "variant": "info"
+          }
+        },
+        "controls_card": {
+          "type": "Card",
+          "props": { "title": "Topic Controls" },
+          "children": ["query_input", "btn_row"]
+        },
+        "query_input": {
+          "type": "TextInput",
+          "props": {
+            "label": "Search Query",
+            "bind": "/query",
+            "placeholder": "e.g. ai harness"
+          }
+        },
+        "btn_row": {
+          "type": "Stack",
+          "props": { "direction": "horizontal", "gap": "sm" },
+          "children": ["btn_update", "btn_sample", "btn_poll", "btn_curate", "btn_stop"]
+        },
+        "btn_update": {
+          "type": "Button",
+          "props": { "label": "Update Query", "event": "UPDATE_QUERY", "variant": "primary" }
+        },
+        "btn_sample": {
+          "type": "Button",
+          "props": { "label": "Sample Now", "event": "SAMPLE_NOW", "variant": "secondary" }
+        },
+        "btn_poll": {
+          "type": "Button",
+          "props": { "label": "Enable Auto-Poll (30s)", "event": "START_POLLING", "variant": "secondary" }
+        },
+        "btn_curate": {
+          "type": "Button",
+          "props": { "label": "Curate Digest", "event": "CURATE_DIGEST", "variant": "secondary" }
+        },
+        "btn_stop": {
+          "type": "Button",
+          "props": { "label": "Stop", "event": "STOP", "variant": "danger" }
+        },
+        "posts_table": {
+          "type": "Table",
+          "props": {
+            "title": "Sampled Posts (Top + Latest)",
+            "columns": ["Author", "Likes", "Reposts", "Post"],
+            "rows": { "$state": "/posts_rows" }
+          }
+        }
+      }
+    },
+    "auto_polling": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["status_card", "controls_card", "posts_table"]
+        },
+        "status_card": {
+          "type": "Card",
+          "props": { "title": "Bluesky Radar (Auto-Polling every 30s)" },
+          "children": ["status_badge", "summary_kv", "status_alert"]
+        },
+        "status_badge": {
+          "type": "Badge",
+          "props": { "label": { "$state": "/status_label" }, "variant": "success" }
+        },
+        "summary_kv": {
+          "type": "KeyValue",
+          "props": { "items": { "$state": "/summary_kv" } }
+        },
+        "status_alert": {
+          "type": "Alert",
+          "props": {
+            "title": { "$state": "/alert_title" },
+            "message": { "$state": "/alert_message" },
+            "variant": "success"
+          }
+        },
+        "controls_card": {
+          "type": "Card",
+          "props": { "title": "Topic Controls" },
+          "children": ["query_input", "btn_row"]
+        },
+        "query_input": {
+          "type": "TextInput",
+          "props": {
+            "label": "Search Query",
+            "bind": "/query",
+            "placeholder": "e.g. ai harness"
+          }
+        },
+        "btn_row": {
+          "type": "Stack",
+          "props": { "direction": "horizontal", "gap": "sm" },
+          "children": ["btn_update", "btn_sample", "btn_pause", "btn_curate", "btn_stop"]
+        },
+        "btn_update": {
+          "type": "Button",
+          "props": { "label": "Update Query", "event": "UPDATE_QUERY", "variant": "primary" }
+        },
+        "btn_sample": {
+          "type": "Button",
+          "props": { "label": "Sample Now", "event": "SAMPLE_NOW", "variant": "secondary" }
+        },
+        "btn_pause": {
+          "type": "Button",
+          "props": { "label": "Pause Auto-Poll", "event": "PAUSE_POLLING", "variant": "secondary" }
+        },
+        "btn_curate": {
+          "type": "Button",
+          "props": { "label": "Curate Digest", "event": "CURATE_DIGEST", "variant": "secondary" }
+        },
+        "btn_stop": {
+          "type": "Button",
+          "props": { "label": "Stop", "event": "STOP", "variant": "danger" }
+        },
+        "posts_table": {
+          "type": "Table",
+          "props": {
+            "title": "Sampled Posts (Top + Latest)",
+            "columns": ["Author", "Likes", "Reposts", "Post"],
+            "rows": { "$state": "/posts_rows" }
+          }
+        }
+      }
+    },
+    "curating": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["digest_review", "btn_stop"]
+        },
+        "digest_review": {
+          "type": "MarkdownReview",
+          "props": {
+            "title": "Curate Bluesky Digest",
+            "markdown": { "$state": "/digest_md" },
+            "comments_path": "/curated_notes",
+            "approve_event": "EXPORT_DIGEST",
+            "revise_event": "BACK_TO_WATCH",
+            "approve_label": "Export Digest",
+            "revise_label": "Back to Radar"
+          }
+        },
+        "btn_stop": {
+          "type": "Button",
+          "props": { "label": "Stop", "event": "STOP", "variant": "danger" }
+        }
+      }
+    }
+  }
+}

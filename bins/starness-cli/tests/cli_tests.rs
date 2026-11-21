@@ -2519,3 +2519,226 @@ fn serve_exposes_active_ui_allowed_events_and_embedded_web_studio() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+fn bluesky_radar_parallel_http_sampling_query_update_and_digest_curation() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
+    // 1. Validate `bluesky_radar.star` + `bluesky_radar.ui.json` via `starness check --ui`
+    let chk = Command::new(bin_path())
+        .arg("check")
+        .arg(workspace_file("examples/bluesky_radar.star"))
+        .arg("--ui")
+        .arg(workspace_file("examples/bluesky_radar.ui.json"))
+        .output()
+        .expect("check bluesky_radar");
+    assert!(
+        chk.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&chk.stdout),
+        String::from_utf8_lossy(&chk.stderr)
+    );
+
+    // 2. Start a deterministic offline mock Bluesky AppView HTTP server
+    let mock_listener = TcpListener::bind("127.0.0.1:0").expect("bind mock bsky");
+    let mock_addr = mock_listener.local_addr().unwrap();
+    let seen_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_clone = Arc::clone(&seen_paths);
+
+    std::thread::spawn(move || {
+        for stream in mock_listener.incoming().flatten() {
+            let mut s = stream;
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let path = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("")
+                .to_owned();
+            seen_clone.lock().unwrap().push(path.clone());
+
+            let body = if path.contains("rust%20statecharts") {
+                serde_json::json!({
+                    "posts": [{
+                        "uri": "at://did:plc:rust/app.bsky.feed.post/3",
+                        "author": { "handle": "statechart.bsky.social" },
+                        "record": { "text": "Harel statecharts in Rust + Starlark!", "createdAt": "2026-11-21T12:00:00Z" },
+                        "likeCount": 42,
+                        "repostCount": 9,
+                        "replyCount": 3
+                    }]
+                })
+            } else if path.contains("sort=top") {
+                serde_json::json!({
+                    "posts": [
+                        {
+                            "uri": "at://did:plc:top/app.bsky.feed.post/1",
+                            "author": { "handle": "alice.bsky.social" },
+                            "record": { "text": "Building a deterministic AI harness with statecharts.", "createdAt": "2026-11-21T10:00:00Z" },
+                            "likeCount": 88,
+                            "repostCount": 21,
+                            "replyCount": 7
+                        },
+                        {
+                            "uri": "at://did:plc:shared/app.bsky.feed.post/2",
+                            "author": { "handle": "bob.bsky.social" },
+                            "record": { "text": "AI harness eval loops should never lose state.", "createdAt": "2026-11-21T11:00:00Z" },
+                            "likeCount": 19,
+                            "repostCount": 4,
+                            "replyCount": 2
+                        }
+                    ]
+                })
+            } else {
+                // `sort=latest` shares post #2 with `sort=top` to test deduplication
+                serde_json::json!({
+                    "posts": [
+                        {
+                            "uri": "at://did:plc:shared/app.bsky.feed.post/2",
+                            "author": { "handle": "bob.bsky.social" },
+                            "record": { "text": "AI harness eval loops should never lose state.", "createdAt": "2026-11-21T11:00:00Z" },
+                            "likeCount": 19,
+                            "repostCount": 4,
+                            "replyCount": 2
+                        }
+                    ]
+                })
+            }
+            .to_string();
+
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = s.write_all(resp.as_bytes());
+        }
+    });
+
+    // 3. Serve `bluesky_radar.star` + `bluesky_radar.ui.json` via `starness serve`
+    let mut child = Command::new(bin_path())
+        .arg("serve")
+        .arg(workspace_file("examples/bluesky_radar.star"))
+        .arg("--ui")
+        .arg(workspace_file("examples/bluesky_radar.ui.json"))
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn starness serve for bluesky_radar");
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut first_line = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut first_line).unwrap();
+    let addr = first_line
+        .split("http://")
+        .nth(1)
+        .expect("listening url")
+        .trim()
+        .to_owned();
+
+    let send_raw = |req: &str| -> String {
+        let mut stream = TcpStream::connect(&addr).unwrap();
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        resp
+    };
+
+    let poll_until = |id: &str, pred: &dyn Fn(&serde_json::Value) -> bool| -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        loop {
+            let resp = send_raw(&format!(
+                "GET /machines/bluesky_radar/instances/{id} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            ));
+            let body = resp.split("\r\n\r\n").nth(1).unwrap();
+            let snap: serde_json::Value = serde_json::from_str(body).unwrap();
+            if pred(&snap) || std::time::Instant::now() >= deadline {
+                return snap;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(80));
+        }
+    };
+
+    // Start instance pointed at local mock Bluesky server
+    let init_payload = serde_json::json!({
+        "context": { "api_base": format!("http://{mock_addr}") }
+    })
+    .to_string();
+    let create_resp = send_raw(&format!(
+        "POST /machines/bluesky_radar/instances HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{init_payload}",
+        init_payload.len()
+    ));
+    let created: serde_json::Value =
+        serde_json::from_str(create_resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    // Wait for parallel `latest` + `top` sample to converge into `watching.paused`
+    let sampled = poll_until(&id, &|s| s["status"] == "waiting");
+    assert_eq!(sampled["status"], "waiting");
+    assert_eq!(sampled["context"]["sample_count"], 1);
+    assert_eq!(sampled["context"]["summary_kv"]["unique_posts"], 2); // deduplicated!
+    assert_eq!(sampled["ui"]["root"], "root");
+    assert!(
+        sampled["context"]["digest_md"]
+            .as_str()
+            .unwrap()
+            .contains("@alice.bsky.social")
+    );
+
+    // Send UPDATE_QUERY -> re-samples with URL-encoded new query
+    let upd = r#"{"type":"UPDATE_QUERY","query":"rust statecharts"}"#;
+    let _ = send_raw(&format!(
+        "POST /machines/bluesky_radar/instances/{id}/events HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{upd}",
+        upd.len()
+    ));
+    let updated = poll_until(&id, &|s| {
+        s["status"] == "waiting" && s["context"]["query"] == "rust statecharts"
+    });
+    assert_eq!(updated["context"]["summary_kv"]["unique_posts"], 1);
+    assert!(
+        updated["context"]["digest_md"]
+            .as_str()
+            .unwrap()
+            .contains("@statechart.bsky.social")
+    );
+
+    // CURATE_DIGEST -> switches view to `curating` (`MarkdownReview`)
+    let curate = r#"{"type":"CURATE_DIGEST"}"#;
+    let cur_resp = send_raw(&format!(
+        "POST /machines/bluesky_radar/instances/{id}/events HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{curate}",
+        curate.len()
+    ));
+    let curated: serde_json::Value =
+        serde_json::from_str(cur_resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(curated["ui"]["elements"]["digest_review"]["type"], "MarkdownReview");
+
+    // EXPORT_DIGEST -> completes cleanly with curated notes saved
+    let export = r#"{"type":"EXPORT_DIGEST","comments":[{"line":1,"heading":"Top Posts","quote":"","comment":"Highlight this thread"}]}"#;
+    let exp_resp = send_raw(&format!(
+        "POST /machines/bluesky_radar/instances/{id}/events HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{export}",
+        export.len()
+    ));
+    let exported: serde_json::Value =
+        serde_json::from_str(exp_resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(exported["status"], "completed");
+    assert_eq!(exported["output"], serde_json::json!({"status": "exported"}));
+    assert_eq!(
+        exported["context"]["curated_notes"][0]["comment"],
+        "Highlight this thread"
+    );
+
+    // Verify both `sort=latest` and `sort=top` were fetched with URL-encoded queries
+    let paths = seen_paths.lock().unwrap();
+    assert!(paths.iter().any(|p| p.contains("q=ai%20harness") && p.contains("sort=latest")));
+    assert!(paths.iter().any(|p| p.contains("q=ai%20harness") && p.contains("sort=top")));
+    assert!(paths.iter().any(|p| p.contains("q=rust%20statecharts")));
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
