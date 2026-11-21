@@ -2141,3 +2141,146 @@ chart = machine(
     assert_eq!(final_tr["to"], serde_json::json!(["done"]));
     assert_eq!(final_tr["context"]["reply"], "Hello from mock LLM!");
 }
+
+#[test]
+fn coding_session_llm_example_runs_multiturn_tool_loop_and_exits() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Stdio;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    std::thread::spawn(move || {
+        // Turn 1: stream a `bash` tool call
+        if let Ok((mut s1, _)) = listener.accept() {
+            let mut buf = [0_u8; 16384];
+            let n1 = s1.read(&mut buf).unwrap_or(0);
+            let req1 = String::from_utf8_lossy(&buf[..n1]);
+            assert!(
+                req1.contains("\"bash\"") && req1.contains("starness_repl_ok"),
+                "expected bash tool and user prompt in turn 1:\n{req1}"
+            );
+
+            let f1 = serde_json::json!({
+                "id": "chatcmpl-repl-1",
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_repl_bash_1",
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": "{\"command\":\"echo starness_repl_ok\"}"
+                            }
+                        }]
+                    }
+                }]
+            });
+            let f2 = serde_json::json!({
+                "id": "chatcmpl-repl-1",
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": { "prompt_tokens": 40, "completion_tokens": 12, "total_tokens": 52 }
+            });
+            let sse1 = format!("data: {f1}\n\ndata: {f2}\n\ndata: [DONE]\n\n");
+            let resp1 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse1}",
+                sse1.len()
+            );
+            let _ = s1.write_all(resp1.as_bytes());
+        }
+
+        // Turn 2: verify round-tripped tool call + real `bash` stdout, then stream final reply
+        if let Ok((mut s2, _)) = listener.accept() {
+            let mut buf = [0_u8; 16384];
+            let n2 = s2.read(&mut buf).unwrap_or(0);
+            let req2 = String::from_utf8_lossy(&buf[..n2]);
+            assert!(
+                req2.contains("call_repl_bash_1") && req2.contains("starness_repl_ok"),
+                "expected round-tripped tool call + bash stdout in turn 2:\n{req2}"
+            );
+
+            let f1 = serde_json::json!({
+                "id": "chatcmpl-repl-2",
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "content": "Observed " }
+                }]
+            });
+            let f2 = serde_json::json!({
+                "id": "chatcmpl-repl-2",
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "starness_repl_ok" },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 70, "completion_tokens": 8, "total_tokens": 78 }
+            });
+            let sse2 = format!("data: {f1}\n\ndata: {f2}\n\ndata: [DONE]\n\n");
+            let resp2 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse2}",
+                sse2.len()
+            );
+            let _ = s2.write_all(resp2.as_bytes());
+        }
+    });
+
+    let ctx_patch = serde_json::json!({
+        "llm_endpoint": format!("http://127.0.0.1:{port}/v1"),
+    })
+    .to_string();
+
+    let mut child = Command::new(bin_path())
+        .arg("run")
+        .arg(workspace_file("examples/coding_session_llm.star"))
+        .arg("--context")
+        .arg(&ctx_patch)
+        .arg("--events-stdin")
+        .arg("--trace")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn coding_session_llm");
+
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, r#"{{"type":"PROMPT","text":"Run echo starness_repl_ok"}}"#).unwrap();
+        writeln!(stdin, "sleep:300").unwrap();
+        writeln!(stdin, r#"{{"type":"PROMPT","text":"/exit"}}"#).unwrap();
+    }
+
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let recs = parse_jsonl(&stdout);
+    assert!(
+        recs.iter()
+            .any(|r| r["kind"] == "transition" && r["to"] == serde_json::json!(["working.acting"])),
+        "expected transition into `working.acting`:\n{stdout}"
+    );
+    assert!(
+        recs.iter()
+            .any(|r| r["kind"] == "service_progress" && r["stream"] == "tool_call"),
+        "expected streamed `tool_call` progress event:\n{stdout}"
+    );
+    let final_tr = recs.iter().rfind(|r| r["kind"] == "transition").unwrap();
+    assert_eq!(final_tr["to"], serde_json::json!(["done"]));
+    assert_eq!(final_tr["context"]["tool_runs"], 1);
+    assert_eq!(final_tr["context"]["turns"], 1);
+    assert_eq!(final_tr["context"]["last_reply"], "Observed starness_repl_ok");
+}
