@@ -664,6 +664,20 @@ async fn handle_http_connection(
     let seg_refs: Vec<&str> = segments.iter().map(String::as_str).collect();
 
     match (method.as_str(), seg_refs.as_slice()) {
+        // GET /ui or GET /ui/* — embedded / static Web Studio
+        ("GET", ["ui"]) => {
+            serve_web_ui(&mut write_half, "").await?;
+        }
+        ("GET", ["ui", rest @ ..]) => {
+            let sub = rest.join("/");
+            serve_web_ui(&mut write_half, &sub).await?;
+        }
+
+        // GET / (HTML browsers get Web Studio; API clients get JSON health)
+        ("GET", []) if accept_header.contains("text/html") => {
+            serve_web_ui(&mut write_half, "").await?;
+        }
+
         // GET / or GET /health
         ("GET", [] | ["health"]) => {
             let machine_ids: Vec<&String> = state.machines.keys().collect();
@@ -810,13 +824,13 @@ async fn handle_http_connection(
                     "409 Conflict"
                 };
                 let body = if idempotent {
-                    serde_json::to_value(&existing)?
+                    enriched_instance_json(&reg, &existing)?
                 } else {
                     json!({
                         "error": format!(
                             "instance `{instance_id}` already exists for machine `{machine_id}`"
                         ),
-                        "instance": existing,
+                        "instance": enriched_instance_json(&reg, &existing)?,
                     })
                 };
                 return write_json_response(&mut write_half, status_line, &body).await;
@@ -845,7 +859,7 @@ async fn handle_http_connection(
             write_json_response(
                 &mut write_half,
                 "201 Created",
-                &serde_json::to_value(&created)?,
+                &enriched_instance_json(&reg, &created)?,
             )
             .await?;
         }
@@ -894,13 +908,13 @@ async fn handle_http_connection(
 
         // GET /machines/:machine/instances/:id — inspect instance snapshot
         ("GET", ["machines", machine_id, "instances", instance_id]) => {
-            if !state.machines.contains_key(*machine_id) {
+            let Some(reg) = state.machines.get(*machine_id).cloned() else {
                 return write_not_found(
                     &mut write_half,
                     format!("machine `{machine_id}` is not registered"),
                 )
                 .await;
-            }
+            };
             if let Some(live) = state.get_live(machine_id, instance_id)
                 && !live.finalized.load(Ordering::SeqCst)
             {
@@ -908,14 +922,18 @@ async fn handle_http_connection(
                 return write_json_response(
                     &mut write_half,
                     "200 OK",
-                    &serde_json::to_value(&snap)?,
+                    &enriched_instance_json(&reg, &snap)?,
                 )
                 .await;
             }
             match state.store.get_instance(machine_id, instance_id)? {
                 Some(snap) => {
-                    write_json_response(&mut write_half, "200 OK", &serde_json::to_value(&snap)?)
-                        .await?;
+                    write_json_response(
+                        &mut write_half,
+                        "200 OK",
+                        &enriched_instance_json(&reg, &snap)?,
+                    )
+                    .await?;
                 }
                 None => {
                     write_not_found(
@@ -999,7 +1017,8 @@ async fn handle_http_connection(
             }
 
             let snap = sync_and_maybe_finalize(&state, &live, None).await?;
-            write_json_response(&mut write_half, "200 OK", &serde_json::to_value(&snap)?).await?;
+            write_json_response(&mut write_half, "200 OK", &enriched_instance_json(&reg, &snap)?)
+                .await?;
         }
 
         // DELETE /machines/:machine/instances/:id (or POST .../cancel)
@@ -1197,10 +1216,122 @@ async fn ensure_live_instance(
     }
 }
 
+/// Embedded single-file Web Studio HTML built from `ui/` (`npm run build`).
+const EMBEDDED_UI_HTML: &str = include_str!("../ui_dist/index.html");
+
+/// Serves a static UI asset from `STARNESS_UI_DIR` (if set) or falls back to the embedded Web Studio.
+async fn serve_web_ui<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    sub_path: &str,
+) -> anyhow::Result<()> {
+    if let Ok(ui_dir) = std::env::var("STARNESS_UI_DIR")
+        && !ui_dir.trim().is_empty()
+    {
+        let rel = sub_path.trim_start_matches('/');
+        let rel = if rel.is_empty() { "index.html" } else { rel };
+        if !rel.contains("..") {
+            let candidate = std::path::Path::new(ui_dir.trim()).join(rel);
+            let target = if candidate.is_file() {
+                candidate
+            } else {
+                std::path::Path::new(ui_dir.trim()).join("index.html")
+            };
+            if let Ok(bytes) = tokio::fs::read(&target).await {
+                let ct = guess_content_type(&target);
+                return write_bytes_response(writer, "200 OK", ct, &bytes).await;
+            }
+        }
+    }
+    write_text_response(writer, "200 OK", "text/html; charset=utf-8", EMBEDDED_UI_HTML).await
+}
+
+fn guess_content_type(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|s| s.to_str()).unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "json" => "application/json; charset=utf-8",
+        "png" => "image/png",
+        "ico" => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn write_bytes_response<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> anyhow::Result<()> {
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        body.len()
+    );
+    writer.write_all(header.as_bytes()).await?;
+    writer.write_all(body).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Enriches an [`InstanceSnapshot`] JSON object with active `allowed_events` and resolved `ui` spec.
+fn enriched_instance_json(
+    reg: &RegisteredMachine,
+    snap: &InstanceSnapshot,
+) -> anyhow::Result<Value> {
+    let mut val = serde_json::to_value(snap)?;
+    if let Some(obj) = val.as_object_mut() {
+        let (allowed_events, active_ui) = if snap.status.is_terminal() {
+            (Vec::new(), None)
+        } else {
+            let events = reg
+                .chart
+                .ir
+                .allowed_events_for_active_states(&snap.active_states);
+            let ui = reg
+                .chart
+                .ir
+                .resolve_ui_for_active_states(&snap.active_states, &snap.context);
+            (events, ui)
+        };
+        obj.insert("allowed_events".to_owned(), json!(allowed_events));
+        obj.insert("ui".to_owned(), active_ui.unwrap_or(Value::Null));
+    }
+    Ok(val)
+}
+
+fn collect_states_with_ui(
+    states: &indexmap::IndexMap<StateId, starness_ir::StateNodeDef>,
+    out: &mut Vec<String>,
+) {
+    for (sid, node) in states {
+        if node.meta.as_ref().and_then(|m| m.get("ui")).is_some() {
+            out.push(sid.as_str().to_owned());
+        }
+        match &node.kind {
+            StateKind::Compound { states: kids, .. } | StateKind::Parallel { states: kids } => {
+                collect_states_with_ui(kids, out);
+            }
+            StateKind::Atomic | StateKind::Final | StateKind::History { .. } => {}
+        }
+    }
+}
+
 fn machine_summary_json(
     reg: &RegisteredMachine,
     counts: &HashMap<String, usize>,
 ) -> Value {
+    let mut states_with_ui = Vec::new();
+    collect_states_with_ui(&reg.chart.ir.states, &mut states_with_ui);
+    let initial_active = vec![reg.chart.ir.initial.as_str().to_owned()];
+    let initial_ui = reg
+        .chart
+        .ir
+        .resolve_ui_for_active_states(&initial_active, &reg.chart.ir.context);
+    let initial_allowed_events = reg
+        .chart
+        .ir
+        .allowed_events_for_active_states(&initial_active);
     json!({
         "id": reg.chart.ir.id,
         "description": reg.chart.ir.description,
@@ -1208,6 +1339,9 @@ fn machine_summary_json(
         "completable": reg.completable,
         "default_context": reg.chart.ir.context,
         "instance_counts": counts,
+        "states_with_ui": states_with_ui,
+        "initial_ui": initial_ui,
+        "initial_allowed_events": initial_allowed_events,
     })
 }
 
