@@ -29,7 +29,7 @@ use starness_ir::{
 };
 use starness_starlark::{
     BUILTIN_ACP_SERVICE, BUILTIN_DECIDE_SERVICE, BUILTIN_EXEC_SERVICE, BUILTIN_HTTP_SERVICE,
-    BUILTIN_MCP_SERVICE, CompiledChart, INVOKE_INPUT_SLOT_KEY,
+    BUILTIN_LLM_SERVICE, BUILTIN_MCP_SERVICE, CompiledChart, INVOKE_INPUT_SLOT_KEY,
 };
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
@@ -682,6 +682,8 @@ fn format_invoke_id_label(inv: &InvokeDef) -> &str {
         BUILTIN_EXEC_SERVICE => "exec",
         BUILTIN_ACP_SERVICE => "acp",
         BUILTIN_MCP_SERVICE => "mcp",
+        BUILTIN_DECIDE_SERVICE => "decide",
+        BUILTIN_LLM_SERVICE => "llm",
         other => other,
     }
 }
@@ -745,6 +747,17 @@ fn format_invoke_src_label(inv: &InvokeDef) -> String {
                 return format!("decide {p}");
             }
             "decide".to_owned()
+        }
+        BUILTIN_LLM_SERVICE => {
+            if let Some(m) = inv
+                .input
+                .get("model")
+                .and_then(|v| v.as_str().or_else(|| v.get("model").and_then(Value::as_str)))
+                && !m.is_empty()
+            {
+                return format!("llm {}", m.replace("::", "/"));
+            }
+            "llm".to_owned()
         }
         other => other.to_owned(),
     }
