@@ -35,7 +35,7 @@ const STATUS_BADGE: Record<string, string> = {
   cancelled: "bg-zinc-700/40 text-zinc-400 border-zinc-700",
 };
 
-type CenterTab = "ui" | "diagram" | "context";
+type InspectorTab = "diagram" | "trace" | "context";
 
 export function App() {
   const [machines, setMachines] = useState<MachineSummary[]>([]);
@@ -45,7 +45,7 @@ export function App() {
   const [selectedInstanceId, setSelectedInstanceId] = useState<string>("");
   const [snapshot, setSnapshot] = useState<InstanceSnapshot | null>(null);
   const [traces, setTraces] = useState<TraceRecord[]>([]);
-  const [tab, setTab] = useState<CenterTab>("ui");
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("diagram");
   const [error, setError] = useState<string | null>(null);
   const [newCtxJson, setNewCtxJson] = useState("{}");
   const [showNewForm, setShowNewForm] = useState(false);
@@ -221,7 +221,7 @@ export function App() {
 
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 min-h-0">
         {/* Left Sidebar: Machines & Instances */}
-        <aside className="lg:col-span-3 border-r border-zinc-800 bg-zinc-900/40 p-4 space-y-5 overflow-y-auto">
+        <aside className="lg:col-span-2 border-r border-zinc-800 bg-zinc-900/40 p-4 space-y-5 overflow-y-auto">
           <section className="space-y-2">
             <h2 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
               Machines ({machines.length})
@@ -342,7 +342,7 @@ export function App() {
           )}
         </aside>
 
-        {/* Center Pane: Interactive UI / Diagram / Context */}
+        {/* Center Pane: Always Interactive UI (matches TUI main pane) */}
         <main className="lg:col-span-6 p-5 space-y-4 overflow-y-auto">
           {snapshot ? (
             <>
@@ -360,54 +360,20 @@ export function App() {
                   </span>
                 </div>
 
-                <div className="flex items-center gap-2">
-                  <div className="inline-flex rounded-lg border border-zinc-800 bg-zinc-900 p-0.5 text-xs">
-                    <button
-                      type="button"
-                      onClick={() => setTab("ui")}
-                      className={`rounded-md px-2.5 py-1 cursor-pointer ${
-                        tab === "ui" ? "bg-zinc-800 text-zinc-100" : "text-zinc-400 hover:text-zinc-200"
-                      }`}
-                    >
-                      Interactive UI
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setTab("diagram")}
-                      className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 cursor-pointer ${
-                        tab === "diagram" ? "bg-zinc-800 text-zinc-100" : "text-zinc-400 hover:text-zinc-200"
-                      }`}
-                    >
-                      <GitBranch className="h-3 w-3" />
-                      Diagram
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setTab("context")}
-                      className={`rounded-md px-2.5 py-1 cursor-pointer ${
-                        tab === "context" ? "bg-zinc-800 text-zinc-100" : "text-zinc-400 hover:text-zinc-200"
-                      }`}
-                    >
-                      Context
-                    </button>
-                  </div>
-
-                  {!snapshot.done && snapshot.status !== "cancelled" && snapshot.status !== "failed" && (
-                    <button
-                      type="button"
-                      onClick={() => void handleCancel()}
-                      title="Stop this running instance"
-                      className="inline-flex items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-800/80 px-2.5 py-1.5 text-xs text-zinc-300 hover:border-rose-500/40 hover:text-rose-300 cursor-pointer"
-                    >
-                      <Square className="h-3 w-3" />
-                      Stop
-                    </button>
-                  )}
-                </div>
+                {!snapshot.done && snapshot.status !== "cancelled" && snapshot.status !== "failed" && (
+                  <button
+                    type="button"
+                    onClick={() => void handleCancel()}
+                    title="Stop this running instance"
+                    className="inline-flex items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-800/80 px-2.5 py-1.5 text-xs text-zinc-300 hover:border-rose-500/40 hover:text-rose-300 cursor-pointer"
+                  >
+                    <Square className="h-3 w-3" />
+                    Stop
+                  </button>
+                )}
               </div>
 
-              {tab === "ui" && (
-                <div className="space-y-4">
+              <div className="space-y-4">
                   {snapshot.status === "completed" && (
                     <div className="rounded-xl border border-emerald-500/40 bg-emerald-950/25 p-4 text-sm text-emerald-200">
                       <div className="font-semibold">Workflow Completed</div>
@@ -474,18 +440,7 @@ export function App() {
                       </div>
                     </div>
                   ) : null}
-                </div>
-              )}
-
-              {tab === "diagram" && (
-                <MermaidDiagram source={diagram} activeStates={snapshot.active_states} />
-              )}
-
-              {tab === "context" && (
-                <pre className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-4 text-xs text-zinc-200 whitespace-pre-wrap break-words overflow-x-auto">
-                  {JSON.stringify(snapshot.context, null, 2)}
-                </pre>
-              )}
+              </div>
             </>
           ) : (
             <div className="space-y-4">
@@ -500,48 +455,111 @@ export function App() {
                   </p>
                 </div>
               )}
-              {diagram && <MermaidDiagram source={diagram} />}
             </div>
           )}
         </main>
 
-        {/* Right Pane: Live SSE Trace Stream */}
-        <aside className="lg:col-span-3 border-l border-zinc-800 bg-zinc-950/80 p-4 flex flex-col min-h-0">
-          <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-zinc-400 mb-3">
-            <Terminal className="h-3.5 w-3.5" />
-            Live Trace ({traces.length})
-          </div>
-          <div className="flex-1 space-y-2 overflow-y-auto pr-1 text-xs">
-            {traces.map((rec) => (
-              <div
-                key={rec.seq}
-                className="rounded-lg border border-zinc-800/80 bg-zinc-900/60 px-2.5 py-2 space-y-1"
+        {/* Right Inspector Pane: Live Diagram / Trace / Context (consistent with TUI right drawer) */}
+        <aside className="lg:col-span-4 border-l border-zinc-800 bg-zinc-950/80 p-4 flex flex-col min-h-0">
+          <div className="flex items-center justify-between gap-2 mb-3">
+            <div className="inline-flex rounded-lg border border-zinc-800 bg-zinc-900 p-0.5 text-xs">
+              <button
+                type="button"
+                onClick={() => setInspectorTab("diagram")}
+                className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 cursor-pointer ${
+                  inspectorTab === "diagram"
+                    ? "bg-sky-500/15 text-sky-200 font-medium"
+                    : "text-zinc-400 hover:text-zinc-200"
+                }`}
               >
-                <div className="flex items-center justify-between text-[10px] font-mono text-zinc-400">
-                  <span className="text-sky-400">{rec.kind}</span>
-                  <span>#{rec.seq}</span>
-                </div>
-                {rec.kind === "transition" && (
-                  <div className="font-mono text-[11px] text-zinc-200">
-                    {Array.isArray(rec.from) ? rec.from.join(",") : ""} →{" "}
-                    <span className="text-emerald-300">
-                      {Array.isArray(rec.to) ? rec.to.join(",") : ""}
-                    </span>
-                  </div>
-                )}
-                {rec.kind === "service_progress" && (
-                  <div className="text-[11px] text-zinc-300 whitespace-pre-wrap break-words">
-                    <span className="text-indigo-400 mr-1">[{String(rec.stream ?? "log")}]</span>
-                    {String(rec.chunk ?? "")}
-                  </div>
-                )}
-                {rec.kind === "error" && (
-                  <div className="text-[11px] text-rose-300">{String(rec.message ?? "")}</div>
-                )}
-              </div>
-            ))}
-            <div ref={traceEndRef} />
+                <GitBranch className="h-3 w-3" />
+                Diagram
+              </button>
+              <button
+                type="button"
+                onClick={() => setInspectorTab("trace")}
+                className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 cursor-pointer ${
+                  inspectorTab === "trace"
+                    ? "bg-sky-500/15 text-sky-200 font-medium"
+                    : "text-zinc-400 hover:text-zinc-200"
+                }`}
+              >
+                <Terminal className="h-3 w-3" />
+                Trace ({traces.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setInspectorTab("context")}
+                className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 cursor-pointer ${
+                  inspectorTab === "context"
+                    ? "bg-sky-500/15 text-sky-200 font-medium"
+                    : "text-zinc-400 hover:text-zinc-200"
+                }`}
+              >
+                <Braces className="h-3 w-3" />
+                Context
+              </button>
+            </div>
           </div>
+
+          {inspectorTab === "diagram" && (
+            <div className="flex-1 overflow-y-auto pr-1">
+              {diagram ? (
+                <MermaidDiagram source={diagram} activeStates={snapshot?.active_states} />
+              ) : (
+                <p className="text-xs text-zinc-500">No diagram loaded.</p>
+              )}
+            </div>
+          )}
+
+          {inspectorTab === "trace" && (
+            <div className="flex-1 space-y-2 overflow-y-auto pr-1 text-xs">
+              {traces.map((rec) => (
+                <div
+                  key={rec.seq}
+                  className="rounded-lg border border-zinc-800/80 bg-zinc-900/60 px-2.5 py-2 space-y-1"
+                >
+                  <div className="flex items-center justify-between text-[10px] font-mono text-zinc-400">
+                    <span className="text-sky-400">{rec.kind}</span>
+                    <span>#{rec.seq}</span>
+                  </div>
+                  {rec.kind === "transition" && (
+                    <div className="font-mono text-[11px] text-zinc-200">
+                      {Array.isArray(rec.from) ? rec.from.join(",") : ""} →{" "}
+                      <span className="text-emerald-300">
+                        {Array.isArray(rec.to) ? rec.to.join(",") : ""}
+                      </span>
+                    </div>
+                  )}
+                  {rec.kind === "service_progress" && (
+                    <div className="text-[11px] text-zinc-300 whitespace-pre-wrap break-words">
+                      <span className="text-indigo-400 mr-1">[{String(rec.stream ?? "log")}]</span>
+                      {String(rec.chunk ?? "")}
+                    </div>
+                  )}
+                  {rec.kind === "error" && (
+                    <div className="text-[11px] text-rose-300">{String(rec.message ?? "")}</div>
+                  )}
+                </div>
+              ))}
+              {traces.length === 0 && (
+                <p className="text-xs text-zinc-500">No trace events yet.</p>
+              )}
+              <div ref={traceEndRef} />
+            </div>
+          )}
+
+          {inspectorTab === "context" && (
+            <div className="flex-1 overflow-y-auto pr-1">
+              {snapshot ? (
+                <pre className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-3.5 text-xs text-zinc-200 whitespace-pre-wrap break-words overflow-x-auto">
+                  {JSON.stringify(snapshot.context, null, 2)}
+                </pre>
+              ) : (
+                <p className="text-xs text-zinc-500">Select or start an instance to inspect context.</p>
+              )}
+            </div>
+          )}
         </aside>
       </div>
     </div>
