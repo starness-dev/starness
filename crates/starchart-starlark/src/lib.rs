@@ -16,9 +16,9 @@ pub use schema::{
     parse_type_expr, with_active_type_registry,
 };
 pub use stdlib::{
-    ACP_MODULE_ID, BUILTIN_ACP_SERVICE, BUILTIN_EXEC_SERVICE, BUILTIN_HTTP_SERVICE,
-    BUILTIN_MCP_SERVICE, EXEC_MODULE_ID, HTTP_MODULE_ID, MCP_MODULE_ID, SECRETS_MODULE_ID,
-    is_builtin_service, resolve_builtin_module,
+    ACP_MODULE_ID, BUILTIN_ACP_SERVICE, BUILTIN_DECIDE_SERVICE, BUILTIN_EXEC_SERVICE,
+    BUILTIN_HTTP_SERVICE, BUILTIN_MCP_SERVICE, DECIDE_MODULE_ID, EXEC_MODULE_ID, HTTP_MODULE_ID,
+    MCP_MODULE_ID, SECRETS_MODULE_ID, is_builtin_service, resolve_builtin_module,
 };
 pub use types::{
     ArtifactMode, FrozenStarlarkMachine, INVOKE_INPUT_SLOT_KEY, INVOKE_TOOL_SLOT_KEY,
@@ -545,6 +545,131 @@ chart = machine(
         assert!(
             msg.contains("context.api_key") && msg.contains("cannot be stored in machine `context`"),
             "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn decide_module_typechecks_noul_choice_enum_score_providers_and_helpers() {
+        let src = r#"
+load(
+    "@starchart/decide",
+    "answer",
+    "choice",
+    "cloudflare_decision",
+    "confidence",
+    "gemini_decision",
+    "invoke_decision",
+    "is_yes",
+    "jev",
+    "level",
+    "noul",
+    "openai_decision",
+    "openrouter_decision",
+    "prob",
+    "refused",
+    "score",
+    "score_value",
+    "selected",
+)
+
+Team = enum("BILLING", "TECHNICAL", "SECURITY")
+
+Ctx = record(
+    ticket = field(str, "Double charged on invoice #42"),
+    team = field(str, ""),
+    urgency = field(str, ""),
+    urgency_raw = field(float, 0.0),
+)
+
+_gemini = gemini_decision()
+_openai = openai_decision()
+_openrouter = openrouter_decision()
+_cf = cloudflare_decision()
+
+def high_confidence_refund(ctx: Ctx, ev: dict) -> bool:
+    conf = confidence(ev, "team")
+    return (
+        not refused(ev, "refund")
+        and is_yes(ev, "refund")
+        and prob(ev, "team") >= 0.8
+        and (conf == None or conf >= 0.7)
+    )
+
+def save_decision(ctx: Ctx, ev: dict) -> Ctx:
+    _raw = answer(ev, "urgency")
+    return update(
+        ctx,
+        team = selected(ev, "team") or "GENERAL",
+        urgency = level(ev, "urgency") or "routine",
+        urgency_raw = score_value(ev, "urgency") or 0.0,
+    )
+
+S = state_space("triaging", "auto_refund", "human_review", "failed")
+
+chart = machine(
+    id = "decide_check",
+    initial = S.triaging,
+    context = Ctx(),
+    states = {
+        S.triaging: state(
+            invoke = invoke_decision(
+                provider = jev(),
+                evidence = lambda ctx: {"ticket": ctx.ticket},
+                questions = {
+                    "refund": noul(
+                        "Does the customer request a refund?",
+                        yes = "Customer explicitly asks for money back.",
+                        no = "No refund requested.",
+                        threshold = 0.85,
+                    ),
+                    "team": choice(
+                        "Which team owns this ticket?",
+                        options = {
+                            Team.BILLING: "Invoices, charges, and refunds.",
+                            Team.TECHNICAL: "Product bugs and outages.",
+                            Team.SECURITY: "Account compromise or vulnerabilities.",
+                        },
+                    ),
+                    "urgency": score(
+                        "How urgent is this issue?",
+                        levels = ["routine", "today", "urgent", "critical"],
+                    ),
+                },
+                on_done = [
+                    outcome(
+                        target = S.auto_refund,
+                        guard = high_confidence_refund,
+                        assign = save_decision,
+                    ),
+                    outcome(target = S.human_review, assign = save_decision),
+                ],
+                on_error = S.failed,
+            ),
+        ),
+        S.auto_refund: final_state(),
+        S.human_review: final_state(),
+        S.failed: final_state(),
+    },
+)
+"#;
+
+        let compiled = compile_starlark_str("decide_check.star", src, None)
+            .expect("@starchart/decide should statically typecheck and compile");
+        let inv = &compiled.ir.states[&starchart_ir::StateId::from("triaging")].invoke[0];
+        assert_eq!(inv.src, BUILTIN_DECIDE_SERVICE);
+        assert_eq!(inv.id.as_deref(), Some("typesafe_decision"));
+        assert_eq!(
+            inv.input["provider"]["api_key"]["$starchart_secret"]["name"],
+            "TYPESAFE_API_KEY"
+        );
+        assert_eq!(inv.input["questions"]["refund"]["kind"], "noul");
+        assert_eq!(
+            inv.input["questions"]["team"]["options"][0][0],
+            "BILLING"
+        );
+        assert_eq!(
+            inv.input["questions"]["urgency"]["levels"][3][0],
+            "critical"
         );
     }
 }

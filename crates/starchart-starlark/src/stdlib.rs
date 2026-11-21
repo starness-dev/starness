@@ -12,6 +12,9 @@ pub const BUILTIN_ACP_SERVICE: &str = "__starchart_builtin_acp__";
 /// Built-in runtime service identifier for `@starchart/mcp` (client).
 pub const BUILTIN_MCP_SERVICE: &str = "__starchart_builtin_mcp__";
 
+/// Built-in runtime service identifier for `@starchart/decide` (`decision-rs`).
+pub const BUILTIN_DECIDE_SERVICE: &str = "__starchart_builtin_decide__";
+
 /// Virtual Starlark module source for `@starchart/secrets`.
 pub const SECRETS_MODULE_ID: &str = "@starchart/secrets.star";
 pub const SECRETS_MODULE_SOURCE: &str = r#"
@@ -442,6 +445,346 @@ def invoke_mcp(
     )
 "#;
 
+/// Virtual Starlark module source for `@starchart/decide` (typed LLM / System One decisions via `decision-rs`).
+pub const DECIDE_MODULE_ID: &str = "@starchart/decide.star";
+pub const DECIDE_MODULE_SOURCE: &str = r#"
+DecisionProviderKind = enum("typesafe", "gemini", "openai", "openrouter", "cloudflare")
+ImageDetail = enum("auto", "low", "high")
+
+DecisionProvider = record(
+    provider = str,
+    model = str,
+    api_key = field(str | Secret | None, None),
+    account_id = field(str | Secret | None, None),
+    endpoint = field(str | None, None),
+)
+
+DecisionQuestion = record(
+    kind = str,
+    instructions = str,
+    yes = field(str | None, None),
+    no = field(str | None, None),
+    threshold = field(float, 0.5),
+    options = field(list[list[str]], []),
+    levels = field(list[list[str]], []),
+    optional = field(bool, False),
+)
+
+DecisionImage = record(
+    path = field(str | None, None),
+    base64 = field(str | None, None),
+    detail = field(str, "auto"),
+)
+
+def _unwrap_key(k) -> str:
+    s = str(k.value) if type(k) == "enum" else str(k)
+    if s == "":
+        fail("decision option/level key must not be empty")
+    return s
+
+def _normalize_pairs(items, label: str, allow_bare_items: bool) -> list[list[str]]:
+    out = []
+    seen = {}
+    if type(items) == "dict":
+        for k, v in items.items():
+            key_str = _unwrap_key(k)
+            desc_str = _unwrap_key(v) if type(v) == "enum" else str(v)
+            if desc_str == "":
+                fail(label + " description for `" + key_str + "` must not be empty")
+            if key_str in seen:
+                fail("duplicate " + label + " key `" + key_str + "`")
+            seen[key_str] = True
+            out.append([key_str, desc_str])
+    elif type(items) == "list" or type(items) == "tuple":
+        for elem in items:
+            if type(elem) == "tuple" or type(elem) == "list":
+                if len(elem) != 2:
+                    fail(label + " pair must have length 2 `(key, description)`")
+                key_str = _unwrap_key(elem[0])
+                desc_str = _unwrap_key(elem[1]) if type(elem[1]) == "enum" else str(elem[1])
+            elif allow_bare_items and (type(elem) == "string" or type(elem) == "enum"):
+                key_str = _unwrap_key(elem)
+                desc_str = key_str
+            else:
+                fail(label + " list item must be a `(key, description)` pair or string/enum")
+            if desc_str == "":
+                fail(label + " description for `" + key_str + "` must not be empty")
+            if key_str in seen:
+                fail("duplicate " + label + " key `" + key_str + "`")
+            seen[key_str] = True
+            out.append([key_str, desc_str])
+    else:
+        fail(label + " must be a dict or list, got `" + type(items) + "`")
+    if len(out) < 2:
+        fail(label + " requires at least 2 entries")
+    return out
+
+def noul(
+    instructions: str,
+    *,
+    yes: str | None = None,
+    no: str | None = None,
+    threshold: float | int = 0.5,
+    optional: bool = False,
+) -> DecisionQuestion:
+    if instructions == "":
+        fail("noul `instructions` must not be empty")
+    if (yes == None) != (no == None):
+        fail("noul requires both `yes` and `no` criteria when either is specified")
+    if yes != None and yes == "":
+        fail("noul `yes` criteria must not be empty")
+    if no != None and no == "":
+        fail("noul `no` criteria must not be empty")
+    thresh_f = float(threshold)
+    if thresh_f < 0.0 or thresh_f > 1.0:
+        fail("noul `threshold` must be between 0.0 and 1.0")
+    return DecisionQuestion(
+        kind = "noul",
+        instructions = instructions,
+        yes = yes,
+        no = no,
+        threshold = thresh_f,
+        optional = optional,
+    )
+
+def choice(
+    instructions: str,
+    *,
+    options,
+    optional: bool = False,
+) -> DecisionQuestion:
+    if instructions == "":
+        fail("choice `instructions` must not be empty")
+    pairs = _normalize_pairs(options, "choice `options`", True)
+    return DecisionQuestion(
+        kind = "choice",
+        instructions = instructions,
+        options = pairs,
+        optional = optional,
+    )
+
+def score(
+    instructions: str,
+    *,
+    levels,
+    optional: bool = False,
+) -> DecisionQuestion:
+    if instructions == "":
+        fail("score `instructions` must not be empty")
+    pairs = _normalize_pairs(levels, "score `levels`", True)
+    return DecisionQuestion(
+        kind = "score",
+        instructions = instructions,
+        levels = pairs,
+        optional = optional,
+    )
+
+def decision_image(
+    *,
+    path: str | None = None,
+    base64: str | None = None,
+    detail: ImageDetail | str = "auto",
+) -> DecisionImage:
+    if (path == None) == (base64 == None):
+        fail("decision_image requires exactly one of `path` or `base64`")
+    detail_str = str(detail.value) if type(detail) == "enum" else str(detail)
+    if detail_str not in ["auto", "low", "high"]:
+        fail("decision_image `detail` must be `auto`, `low`, or `high`")
+    return DecisionImage(
+        path = path,
+        base64 = base64,
+        detail = detail_str,
+    )
+
+def jev(
+    model: str = "jev-1.14.0",
+    *,
+    api_key: str | Secret | None = None,
+    endpoint: str | None = None,
+) -> DecisionProvider:
+    if model == "":
+        fail("jev `model` must not be empty")
+    resolved_key = api_key
+    if resolved_key == None and endpoint == None:
+        resolved_key = __starchart_secret__("TYPESAFE_API_KEY")
+    return DecisionProvider(
+        provider = "typesafe",
+        model = model,
+        api_key = resolved_key,
+        endpoint = endpoint,
+    )
+
+def gemini_decision(
+    model: str = "gemini-decision-1",
+    *,
+    api_key: str | Secret | None = None,
+    endpoint: str | None = None,
+) -> DecisionProvider:
+    if model == "":
+        fail("gemini_decision `model` must not be empty")
+    resolved_key = api_key
+    if resolved_key == None and endpoint == None:
+        resolved_key = __starchart_secret__("GEMINI_API_KEY")
+    return DecisionProvider(
+        provider = "gemini",
+        model = model,
+        api_key = resolved_key,
+        endpoint = endpoint,
+    )
+
+def openai_decision(
+    model: str = "gpt-6-luna",
+    *,
+    api_key: str | Secret | None = None,
+    endpoint: str | None = None,
+) -> DecisionProvider:
+    if model == "":
+        fail("openai_decision `model` must not be empty")
+    resolved_key = api_key
+    if resolved_key == None and endpoint == None:
+        resolved_key = __starchart_secret__("OPENAI_API_KEY")
+    return DecisionProvider(
+        provider = "openai",
+        model = model,
+        api_key = resolved_key,
+        endpoint = endpoint,
+    )
+
+def openrouter_decision(
+    model: str = "typesafe/jev-1.14",
+    *,
+    api_key: str | Secret | None = None,
+    endpoint: str | None = None,
+) -> DecisionProvider:
+    if model == "":
+        fail("openrouter_decision `model` must not be empty")
+    resolved_key = api_key
+    if resolved_key == None and endpoint == None:
+        resolved_key = __starchart_secret__("OPENROUTER_API_KEY")
+    return DecisionProvider(
+        provider = "openrouter",
+        model = model,
+        api_key = resolved_key,
+        endpoint = endpoint,
+    )
+
+def cloudflare_decision(
+    model: str = "clef",
+    *,
+    account_id: str | Secret | None = None,
+    api_key: str | Secret | None = None,
+    endpoint: str | None = None,
+) -> DecisionProvider:
+    if model == "":
+        fail("cloudflare_decision `model` must not be empty")
+    resolved_acct = account_id
+    resolved_key = api_key
+    if endpoint == None:
+        if resolved_acct == None:
+            resolved_acct = __starchart_secret__("CLOUDFLARE_ACCOUNT_ID")
+        if resolved_key == None:
+            resolved_key = __starchart_secret__("CLOUDFLARE_API_TOKEN")
+    return DecisionProvider(
+        provider = "cloudflare",
+        model = model,
+        api_key = resolved_key,
+        account_id = resolved_acct,
+        endpoint = endpoint,
+    )
+
+def invoke_decision(
+    *,
+    provider: DecisionProvider | typing.Callable,
+    evidence,
+    questions: dict[str, DecisionQuestion],
+    images = None,
+    timeout_ms: int = 15000,
+    id: str | None = None,
+    on_done = None,
+    on_error = None,
+) -> Invoke:
+    if len(questions) == 0:
+        fail("invoke_decision `questions` must contain at least one question")
+    if timeout_ms <= 0 or timeout_ms > 120000:
+        fail("invoke_decision `timeout_ms` must be in 1..=120000")
+    resolved_id = id
+    if resolved_id == None and type(provider) == "record":
+        resolved_id = provider.provider + "_decision"
+    return invoke(
+        src = "__starchart_builtin_decide__",
+        id = resolved_id,
+        input = {
+            "provider": provider,
+            "evidence": evidence,
+            "questions": questions,
+            "images": images,
+            "timeout_ms": timeout_ms,
+        },
+        on_done = on_done,
+        on_error = on_error,
+    )
+
+def answer(event: dict, name: str) -> dict:
+    out = event.get("output") if "output" in event else event
+    if type(out) != "dict":
+        fail("decision `answer`: event missing `output` dict")
+    answers = out.get("answers") if "answers" in out else out
+    if type(answers) != "dict" or name not in answers:
+        fail("decision answer `" + name + "` not found in event")
+    ans = answers[name]
+    if type(ans) != "dict":
+        fail("decision answer `" + name + "` is not a dict")
+    return ans
+
+def refused(event: dict, name: str) -> bool:
+    return bool(answer(event, name).get("refused", False))
+
+def prob(event: dict, name: str) -> float:
+    ans = answer(event, name)
+    if bool(ans.get("refused", False)):
+        return 0.0
+    p = ans.get("probability")
+    return float(p) if p != None else 0.0
+
+def is_yes(event: dict, name: str, threshold: float | int | None = None) -> bool:
+    ans = answer(event, name)
+    if bool(ans.get("refused", False)):
+        return False
+    p = ans.get("probability")
+    if p == None:
+        return False
+    gate = float(threshold) if threshold != None else float(ans.get("threshold", 0.5))
+    return float(p) >= gate
+
+def selected(event: dict, name: str) -> str | None:
+    ans = answer(event, name)
+    if bool(ans.get("refused", False)):
+        return None
+    val = ans.get("selected")
+    return str(val) if val != None else None
+
+def level(event: dict, name: str) -> str | None:
+    ans = answer(event, name)
+    if bool(ans.get("refused", False)):
+        return None
+    val = ans.get("level")
+    return str(val) if val != None else None
+
+def score_value(event: dict, name: str) -> float | None:
+    ans = answer(event, name)
+    if bool(ans.get("refused", False)):
+        return None
+    val = ans.get("score")
+    return float(val) if val != None else None
+
+def confidence(event: dict, name: str) -> float | None:
+    ans = answer(event, name)
+    if bool(ans.get("refused", False)):
+        return None
+    val = ans.get("confidence")
+    return float(val) if val != None else None
+"#;
+
 /// Resolves a `@starchart/*` virtual module path to `(canonical_module_id, source_code)`.
 pub fn resolve_builtin_module(load_path: &str) -> Option<(&'static str, &'static str)> {
     match load_path {
@@ -463,6 +806,9 @@ pub fn resolve_builtin_module(load_path: &str) -> Option<(&'static str, &'static
         "@starchart/secrets" | "@starchart/secrets.star" | "/@starchart/secrets.star" => {
             Some((SECRETS_MODULE_ID, SECRETS_MODULE_SOURCE))
         }
+        "@starchart/decide" | "@starchart/decide.star" | "/@starchart/decide.star" => {
+            Some((DECIDE_MODULE_ID, DECIDE_MODULE_SOURCE))
+        }
         _ => None,
     }
 }
@@ -471,6 +817,10 @@ pub fn resolve_builtin_module(load_path: &str) -> Option<(&'static str, &'static
 pub fn is_builtin_service(service_name: &str) -> bool {
     matches!(
         service_name,
-        BUILTIN_HTTP_SERVICE | BUILTIN_EXEC_SERVICE | BUILTIN_ACP_SERVICE | BUILTIN_MCP_SERVICE
+        BUILTIN_HTTP_SERVICE
+            | BUILTIN_EXEC_SERVICE
+            | BUILTIN_ACP_SERVICE
+            | BUILTIN_MCP_SERVICE
+            | BUILTIN_DECIDE_SERVICE
     )
 }
