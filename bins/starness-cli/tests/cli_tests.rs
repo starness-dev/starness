@@ -1845,3 +1845,299 @@ chart = machine(
     assert_eq!(final_tr["context"]["dest"], "inbox");
     assert_eq!(final_tr["context"]["risk"], "low");
 }
+
+#[test]
+fn release_notes_llm_example_streams_structured_record_and_gates_breaking_changes() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Stdio;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let breaking_mode = Arc::new(AtomicBool::new(false));
+    let breaking_clone = Arc::clone(&breaking_mode);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    std::thread::spawn(move || {
+        for _ in 0..2 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = [0_u8; 16384];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.starts_with("POST /v1/chat/completions "),
+                "expected OpenAI chat completions path:\n{req}"
+            );
+            assert!(
+                req.contains("\"ReleaseSummary\""),
+                "expected derived ReleaseSummary JsonSpec:\n{req}"
+            );
+
+            let structured_json = if breaking_clone.load(Ordering::SeqCst) {
+                serde_json::json!({
+                    "headline": "v0.4.0 — Rename crates to starness",
+                    "breaking": true,
+                    "highlights": [
+                        {
+                            "area": "workspace",
+                            "summary": "Renamed crates and @starness/* module namespace",
+                            "risk": "HIGH"
+                        }
+                    ],
+                    "migration_note": "Update load(\"@starness/...\") imports."
+                })
+                .to_string()
+            } else {
+                serde_json::json!({
+                    "headline": "v0.4.0 — Add @starness/llm",
+                    "breaking": false,
+                    "highlights": [
+                        {
+                            "area": "llm",
+                            "summary": "Added single-shot genai driver with Record schemas",
+                            "risk": "LOW"
+                        }
+                    ],
+                    "migration_note": ""
+                })
+                .to_string()
+            };
+
+            let mid = structured_json.len() / 2;
+            let (part1, part2) = structured_json.split_at(mid);
+            let frame1 = serde_json::json!({
+                "id": "chatcmpl-rn-1",
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "reasoning_content": "Synthesizing commits..." }
+                }]
+            });
+            let frame2 = serde_json::json!({
+                "id": "chatcmpl-rn-1",
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": part1 }
+                }]
+            });
+            let frame3 = serde_json::json!({
+                "id": "chatcmpl-rn-1",
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": part2 },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 80, "completion_tokens": 35, "total_tokens": 115 }
+            });
+            let sse_body = format!("data: {frame1}\n\ndata: {frame2}\n\ndata: {frame3}\n\ndata: [DONE]\n\n");
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse_body}",
+                sse_body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+
+    let ctx_patch = serde_json::json!({
+        "llm_endpoint": format!("http://127.0.0.1:{port}/v1"),
+    })
+    .to_string();
+
+    // Case 1: Routine non-breaking release -> streams chunks, rehydrates Record, auto-publishes!
+    let out1 = Command::new(bin_path())
+        .arg("run")
+        .arg(workspace_file("examples/release_notes_llm.star"))
+        .arg("--context")
+        .arg(&ctx_patch)
+        .arg("--trace")
+        .arg("-")
+        .output()
+        .expect("run release_notes_llm routine");
+    let stdout1 = String::from_utf8_lossy(&out1.stdout);
+    let stderr1 = String::from_utf8_lossy(&out1.stderr);
+    assert!(out1.status.success(), "stdout:\n{stdout1}\nstderr:\n{stderr1}");
+
+    let recs1 = parse_jsonl(&stdout1);
+    assert!(
+        recs1
+            .iter()
+            .any(|r| r["kind"] == "service_progress" && r["stream"] == "agent_thought"),
+        "expected streamed reasoning progress event:\n{stdout1}"
+    );
+    assert!(
+        recs1
+            .iter()
+            .any(|r| r["kind"] == "service_progress" && r["stream"] == "agent_text"),
+        "expected streamed token chunk event:\n{stdout1}"
+    );
+    let final1 = recs1.iter().rfind(|r| r["kind"] == "transition").unwrap();
+    assert_eq!(final1["to"], serde_json::json!(["published"]));
+    assert_eq!(final1["context"]["headline"], "v0.4.0 — Add @starness/llm");
+    assert_eq!(final1["context"]["breaking"], false);
+    assert_eq!(final1["context"]["high_risk_count"], 0);
+    assert_eq!(final1["context"]["approved_by"], "auto");
+
+    // Case 2: Breaking + HIGH-risk release -> gates in `awaiting_release_approval` until approved!
+    breaking_mode.store(true, Ordering::SeqCst);
+    let mut child2 = Command::new(bin_path())
+        .arg("run")
+        .arg(workspace_file("examples/release_notes_llm.star"))
+        .arg("--context")
+        .arg(&ctx_patch)
+        .arg("--events-stdin")
+        .arg("--trace")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn release_notes_llm breaking");
+
+    {
+        let mut stdin = child2.stdin.take().unwrap();
+        writeln!(stdin, "sleep:80").unwrap();
+        writeln!(stdin, r#"{{"type":"APPROVE_RELEASE","reviewer":"donnie"}}"#).unwrap();
+    }
+    let out2 = child2.wait_with_output().unwrap();
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
+    assert!(out2.status.success(), "stdout:\n{stdout2}\nstderr:\n{stderr2}");
+
+    let recs2 = parse_jsonl(&stdout2);
+    assert!(
+        recs2.iter().any(|r| {
+            r["kind"] == "transition"
+                && r["to"] == serde_json::json!(["awaiting_release_approval"])
+        }),
+        "expected breaking release to pause in `awaiting_release_approval`:\n{stdout2}"
+    );
+    let final2 = recs2.iter().rfind(|r| r["kind"] == "transition").unwrap();
+    assert_eq!(final2["to"], serde_json::json!(["published"]));
+    assert_eq!(final2["context"]["breaking"], true);
+    assert_eq!(final2["context"]["high_risk_count"], 1);
+    assert_eq!(final2["context"]["approved_by"], "donnie");
+}
+
+#[test]
+fn llm_secret_api_key_resolves_on_wire_and_redacts_trace() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    let dir = std::env::temp_dir().join(format!(
+        "starness_llm_secret_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let seen_req = Arc::new(Mutex::new(String::new()));
+    let seen_req_clone = Arc::clone(&seen_req);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0_u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            *seen_req_clone.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+
+            let body = serde_json::json!({
+                "id": "chatcmpl-sec-1",
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "Hello from mock LLM!" },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+
+    let chart_path = dir.join("llm_secret.star");
+    std::fs::write(
+        &chart_path,
+        format!(
+            r#"
+load("@starness/secrets", "secret")
+load("@starness/llm", "invoke_llm", "llm_model", "llm_text")
+
+Ctx = record(reply = field(str, ""))
+S = state_space("asking", "done", "failed")
+
+chart = machine(
+    id = "llm_secret",
+    initial = S.asking,
+    context = Ctx(),
+    states = {{
+        S.asking: state(
+            invoke = invoke_llm(
+                model = llm_model(
+                    "openai::gpt-4o-mini",
+                    api_key = secret("STARNESS_TEST_LLM_SECRET_KEY"),
+                    endpoint = "http://127.0.0.1:{port}/v1",
+                ),
+                prompt = "Say hello",
+                stream = False,
+                on_done = outcome(
+                    target = S.done,
+                    assign = lambda ctx, ev: update(ctx, reply = llm_text(ev)),
+                ),
+                on_error = S.failed,
+            ),
+        ),
+        S.done: final_state(),
+        S.failed: final_state(),
+    }},
+)
+"#
+        ),
+    )
+    .unwrap();
+
+    let out = Command::new(bin_path())
+        .arg("run")
+        .arg(&chart_path)
+        .arg("--trace")
+        .arg("-")
+        .env("STARNESS_TEST_LLM_SECRET_KEY", "sk_llm_super_secret_777")
+        .output()
+        .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(!stdout.contains("sk_llm_super_secret_777"));
+    assert!(!stderr.contains("sk_llm_super_secret_777"));
+    assert!(stdout.contains("<secret:STARNESS_TEST_LLM_SECRET_KEY>"));
+
+    let wire = seen_req.lock().unwrap().to_ascii_lowercase();
+    assert!(
+        wire.contains("authorization: bearer sk_llm_super_secret_777"),
+        "expected Bearer header on wire:\n{wire}"
+    );
+
+    let recs = parse_jsonl(&stdout);
+    let final_tr = recs.iter().rfind(|r| r["kind"] == "transition").unwrap();
+    assert_eq!(final_tr["to"], serde_json::json!(["done"]));
+    assert_eq!(final_tr["context"]["reply"], "Hello from mock LLM!");
+}
