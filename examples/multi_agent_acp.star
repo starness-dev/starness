@@ -5,7 +5,7 @@
 # without renaming states, context fields, or reducers.
 
 load(
-    "@starchart/agents",
+    "@starness/agents",
     "ArtifactMode",
     "agy_agent",
     "artifact",
@@ -15,7 +15,7 @@ load(
     "codex_agent",
     "invoke_agent",
 )
-load("@starchart/exec", "invoke_cmd")
+load("@starness/exec", "invoke_cmd")
 
 PlanArtifact = record(
     markdown = str,

@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/starchart-ir",
-    "crates/starchart-starlark",
-    "crates/starchart-runtime",
-    "bins/starchart-cli",
+    "crates/starness-ir",
+    "crates/starness-starlark",
+    "crates/starness-runtime",
+    "bins/starness-cli",
 ]
 
 [workspace.package]
@@ -13,9 +13,9 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-starchart-ir = { path = "crates/starchart-ir" }
-starchart-starlark = { path = "crates/starchart-starlark" }
-starchart-runtime = { path = "crates/starchart-runtime" }
+starness-ir = { path = "crates/starness-ir" }
+starness-starlark = { path = "crates/starness-starlark" }
+starness-runtime = { path = "crates/starness-runtime" }
 
 starlark = "0.14.2"
 starlark_map = "0.14.2"

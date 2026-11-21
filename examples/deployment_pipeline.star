@@ -1,4 +1,4 @@
-# Zero-compile progressive deployment workflow using `@starchart/exec` + optional `@starchart/http`:
+# Zero-compile progressive deployment workflow using `@starness/exec` + optional `@starness/http`:
 # - Runs standalone out of the box (`control_api = ""`), or connects to a live deploy control plane
 #   when `control_api` is set via `--context '{"control_api": "http://127.0.0.1:9090"}'`
 # - `awaiting_approval`: collects live `APPROVE` events until quorum, then starts on `START_ROLLOUT`
@@ -10,8 +10,8 @@
 #     * parallel `smoke_tests` + `security_scan` (`parallel_state` + `invoke_cmd`) -> `promoting`
 # - `rolling_back`: executes rollback command and optionally posts an incident alert webhook
 
-load("@starchart/exec", "invoke_cmd")
-load("@starchart/http", "HttpMethod", "HttpRequest", "http_request", "invoke_http")
+load("@starness/exec", "invoke_cmd")
+load("@starness/http", "HttpMethod", "HttpRequest", "http_request", "invoke_http")
 
 DeployEvent = enum(
     "APPROVE",

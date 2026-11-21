@@ -1,0 +1,25 @@
+[package]
+name = "starness-cli"
+description = "CLI and Language Server for starness typed Starlark statecharts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "starness"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+starness-ir.workspace = true
+starness-runtime.workspace = true
+starness-starlark.workspace = true
+clap.workspace = true
+indexmap.workspace = true
+secrecy.workspace = true
+serde_json.workspace = true
+starlark.workspace = true
+starlark_lsp.workspace = true
+starlark_syntax.workspace = true
+tokio.workspace = true
+xstate-statemachine.workspace = true

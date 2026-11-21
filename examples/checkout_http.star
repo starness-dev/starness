@@ -1,11 +1,11 @@
-# Zero-compile HTTP checkout workflow using `@starchart/http`:
+# Zero-compile HTTP checkout workflow using `@starness/http`:
 # - Dynamically builds POST requests from typed `CheckoutCtx`
 # - Retries `429`/`5xx` and transient network failures via `S.retry_backoff`
 #   using a dynamic Starlark `after(delay = backoff_ms)` exponential timer
 # - Supports `CANCEL` while in-flight or waiting in backoff
 # - Branches on `200` + `paid == True` to fire a follow-up webhook POST
 
-load("@starchart/http", "HttpMethod", "HttpRequest", "http_request", "invoke_http")
+load("@starness/http", "HttpMethod", "HttpRequest", "http_request", "invoke_http")
 
 CheckoutEvent = enum("CANCEL")
 

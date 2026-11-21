@@ -1,10 +1,10 @@
-# Lightweight single-agent CI test & autofix loop (`@starchart/exec` + `@starchart/agents`):
+# Lightweight single-agent CI test & autofix loop (`@starness/exec` + `@starness/agents`):
 # - `testing`: runs `ctx.test_cmd` (`cargo test --workspace --offline` by default)
 # - `fixing`: on test failure, pushes the error output to an ACP coding agent, collects a
 #             structured `FixReport` artifact, and re-runs `testing` up to `max_attempts`
 
-load("@starchart/agents", "agy_agent", "artifact", "artifact_tool", "invoke_agent")
-load("@starchart/exec", "invoke_cmd")
+load("@starness/agents", "agy_agent", "artifact", "artifact_tool", "invoke_agent")
+load("@starness/exec", "invoke_cmd")
 
 FixReport = record(
     root_cause = str,

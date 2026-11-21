@@ -1,4 +1,4 @@
-# Zero-compile customer support triage & auto-remediation statechart using `@starchart/decide`:
+# Zero-compile customer support triage & auto-remediation statechart using `@starness/decide`:
 # - Evaluates structured `noul` (yes/no), `choice` (typed `SupportTeam` enum), and `score` (`urgency`)
 #   questions in one provider-neutral `decision-rs` call (`jev` by default, or self-hosted via
 #   `--context '{"decision_endpoint": "http://127.0.0.1:9091/v1/systemone"}'`).
@@ -7,7 +7,7 @@
 #   whenever a question is refused or below `min_route_prob`.
 
 load(
-    "@starchart/decide",
+    "@starness/decide",
     "DecisionProvider",
     "choice",
     "confidence",
@@ -22,7 +22,7 @@ load(
     "score_value",
     "selected",
 )
-load("@starchart/exec", "invoke_cmd")
+load("@starness/exec", "invoke_cmd")
 
 SupportTeam = enum("BILLING", "TECHNICAL", "SECURITY", "ACCOUNT")
 
@@ -94,7 +94,7 @@ def is_auto_refundable(ctx: TriageCtx, ev: dict) -> bool:
 
 chart: StateMachine = machine(
     id = "support_triage_decide",
-    description = "Confidence-gated support ticket triage and remediation powered by @starchart/decide",
+    description = "Confidence-gated support ticket triage and remediation powered by @starness/decide",
     initial = S.classifying,
     context = TriageCtx(),
     states = {

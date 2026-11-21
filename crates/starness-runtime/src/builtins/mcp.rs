@@ -1,0 +1,1270 @@
+//! Ephemeral turn-scoped MCP server (`artifact_tool` + `read_tool`) and `stdio` bridge.
+//!
+//! When an `invoke_agent(...)` state declares `tools = [...]`, the runtime spins up an isolated,
+//! turn-scoped local listener backed by the compiled Starlark `CompiledAgentTool` definitions and
+//! the machine's state-entry context snapshot. Subprocess agents connect via a lightweight `stdio`
+//! MCP bridge (`starness mcp-bridge --addr ... --token ...`, with a stdlib Python fallback when
+//! `starness-runtime` is embedded outside `starness-cli`).
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, bail};
+use serde_json::{Map, Value, json};
+use starness_starlark::{
+    ArtifactMode, CompiledAgentTool, INVOKE_TOOL_SLOT_KEY, TypeRegistry,
+    instantiate_record_with_registry,
+};
+use starlark::environment::Module;
+use starlark::eval::Evaluator;
+use starlark::values::OwnedFrozenValue;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
+
+use crate::trace::{self, ProgressKind, ServiceScope, report_progress};
+
+static BRIDGE_TOKEN_SEQ: AtomicU64 = AtomicU64::new(1);
+
+const HANDSHAKE_TOKEN_KEY: &str = "__starness_bridge_token__";
+const DEFAULT_MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Minimal stdlib-only Python TCP <-> stdio line relay used only when `starness-runtime` is
+/// embedded in a host binary (such as `cargo test -p starness-runtime`) where the `starness`
+/// CLI executable is not available on disk.
+const PYTHON_STDIO_RELAY: &str = r#"
+import json, socket, sys, threading
+addr, token = sys.argv[1], sys.argv[2]
+host, port = addr.rsplit(":", 1)
+sock = socket.create_connection((host, int(port)))
+sock.sendall((json.dumps({"__starness_bridge_token__": token}) + "\n").encode("utf-8"))
+def pump_out():
+    f = sock.makefile("rb")
+    for line in f:
+        sys.stdout.buffer.write(line)
+        sys.stdout.buffer.flush()
+t = threading.Thread(target=pump_out, daemon=True)
+t.start()
+for line in sys.stdin.buffer:
+    sock.sendall(line)
+try:
+    sock.shutdown(socket.SHUT_WR)
+except OSError:
+    pass
+t.join(timeout=2.0)
+"#;
+
+/// Per-invocation Starlark tool evaluation context bound via `tokio::task_local!`.
+#[derive(Clone)]
+pub(crate) struct ToolRuntimeScope {
+    pub tools: Arc<HashMap<String, CompiledAgentTool>>,
+    pub type_registry: Arc<TypeRegistry>,
+    pub context_record_type: Option<OwnedFrozenValue>,
+    pub ctx_snapshot: Value,
+}
+
+tokio::task_local! {
+    static TOOL_RUNTIME_SCOPE: ToolRuntimeScope;
+}
+
+pub(crate) async fn with_tool_runtime_scope<F: std::future::Future>(
+    scope: ToolRuntimeScope,
+    fut: F,
+) -> F::Output {
+    TOOL_RUNTIME_SCOPE.scope(scope, fut).await
+}
+
+pub(crate) fn current_tool_runtime_scope() -> Option<ToolRuntimeScope> {
+    TOOL_RUNTIME_SCOPE.try_with(Clone::clone).ok()
+}
+
+/// Command + arguments for launching a `stdio` MCP bridge pointing at a [`TurnMcpServer`].
+#[derive(Debug, Clone)]
+pub struct BridgeLaunchSpec {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+impl BridgeLaunchSpec {
+    /// Formats an ACP v1 `session/new` `mcpServers` entry (`McpServerStdio`).
+    pub fn to_acp_mcp_server(&self) -> Value {
+        json!({
+            "name": "starness",
+            "command": self.command,
+            "args": self.args,
+            "env": [],
+        })
+    }
+
+    /// Formats a Claude CLI `--mcp-config` inline JSON string.
+    pub fn to_claude_mcp_config_json(&self) -> String {
+        json!({
+            "mcpServers": {
+                "starness": {
+                    "type": "stdio",
+                    "command": self.command,
+                    "args": self.args,
+                }
+            }
+        })
+        .to_string()
+    }
+
+    /// Formats Codex CLI `-c mcp_servers.starness...` override flags.
+    pub fn to_codex_cli_args(&self) -> Vec<String> {
+        let cmd_lit = serde_json::to_string(&self.command).unwrap_or_default();
+        let args_lit = serde_json::to_string(&self.args).unwrap_or_else(|_| "[]".to_owned());
+        vec![
+            "-c".to_owned(),
+            format!("mcp_servers.starness.command={cmd_lit}"),
+            "-c".to_owned(),
+            format!("mcp_servers.starness.args={args_lit}"),
+        ]
+    }
+}
+
+struct TurnState {
+    artifacts: Map<String, Value>,
+    submitted: HashSet<String>,
+}
+
+struct ServerContext {
+    ordered_tools: Vec<CompiledAgentTool>,
+    tools_by_name: HashMap<String, CompiledAgentTool>,
+    runtime_scope: ToolRuntimeScope,
+    trace_scope: Option<ServiceScope>,
+    token: String,
+    state: Mutex<TurnState>,
+}
+
+/// Active turn-scoped MCP server bound on `127.0.0.1:<ephemeral_port>`.
+pub struct TurnMcpServer {
+    launch_spec: BridgeLaunchSpec,
+    ctx: Arc<ServerContext>,
+    accept_handle: JoinHandle<()>,
+}
+
+impl Drop for TurnMcpServer {
+    fn drop(&mut self) {
+        self.accept_handle.abort();
+    }
+}
+
+impl TurnMcpServer {
+    /// Starts an ephemeral turn MCP server if `input` declares non-empty `tools`.
+    pub async fn start_if_configured(input: &Value) -> anyhow::Result<Option<Self>> {
+        let Some(tool_refs) = input.get("tools").and_then(Value::as_array) else {
+            return Ok(None);
+        };
+        if tool_refs.is_empty() {
+            return Ok(None);
+        }
+
+        let runtime_scope = current_tool_runtime_scope().ok_or_else(|| {
+            anyhow::anyhow!(
+                "`invoke_agent` declared MCP `tools`, but no compiled Starlark tool scope is active"
+            )
+        })?;
+
+        let mut ordered_tools = Vec::with_capacity(tool_refs.len());
+        let mut tools_by_name = HashMap::with_capacity(tool_refs.len());
+        let mut initial_artifacts = Map::new();
+
+        for item in tool_refs {
+            let slot_name = item
+                .get(INVOKE_TOOL_SLOT_KEY)
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("invalid tool entry in `invoke_agent`: expected tool slot ref, got {item}")
+                })?;
+            let compiled = runtime_scope
+                .tools
+                .get(slot_name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing compiled MCP tool slot `{slot_name}`"))?;
+            let tool_name = compiled.name().to_owned();
+            if tools_by_name.contains_key(&tool_name) {
+                bail!("duplicate MCP tool name `{tool_name}` in `invoke_agent`");
+            }
+            if let CompiledAgentTool::Artifact {
+                mode: ArtifactMode::Append,
+                ..
+            } = &compiled
+            {
+                initial_artifacts.insert(tool_name.clone(), Value::Array(Vec::new()));
+            }
+            tools_by_name.insert(tool_name, compiled.clone());
+            ordered_tools.push(compiled);
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("failed to bind ephemeral localhost listener for turn MCP server")?;
+        let local_addr = listener
+            .local_addr()
+            .context("failed to query local MCP listener address")?;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let seq = BRIDGE_TOKEN_SEQ.fetch_add(1, Ordering::Relaxed);
+        let token = format!("sc-{}-{nanos:x}-{seq}", std::process::id());
+
+        let launch_spec = resolve_bridge_launch_spec(&local_addr.to_string(), &token);
+        let trace_scope = trace::current_scope();
+
+        let server_ctx = Arc::new(ServerContext {
+            ordered_tools,
+            tools_by_name,
+            runtime_scope,
+            trace_scope,
+            token,
+            state: Mutex::new(TurnState {
+                artifacts: initial_artifacts,
+                submitted: HashSet::new(),
+            }),
+        });
+
+        let accept_ctx = Arc::clone(&server_ctx);
+        let accept_handle = tokio::spawn(async move {
+            while let Ok((stream, _peer)) = listener.accept().await {
+                let conn_ctx = Arc::clone(&accept_ctx);
+                tokio::spawn(async move {
+                    let fut = handle_bridge_connection(stream, Arc::clone(&conn_ctx));
+                    match conn_ctx.trace_scope.clone() {
+                        Some(scope) => {
+                            let _ = trace::with_async_scope(scope, fut).await;
+                        }
+                        None => {
+                            let _ = fut.await;
+                        }
+                    }
+                });
+            }
+        });
+
+        Ok(Some(Self {
+            launch_spec,
+            ctx: server_ctx,
+            accept_handle,
+        }))
+    }
+
+    pub fn launch_spec(&self) -> &BridgeLaunchSpec {
+        &self.launch_spec
+    }
+
+    /// Returns formatted names (`\`submit_plan\``) of `required = True` artifact tools not yet submitted.
+    pub fn missing_required_tools(&self) -> Vec<String> {
+        let guard = self
+            .ctx
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut missing = Vec::new();
+        for tool in &self.ctx.ordered_tools {
+            if let CompiledAgentTool::Artifact {
+                name,
+                required: true,
+                ..
+            } = tool
+                && !guard.submitted.contains(name)
+            {
+                missing.push(format!("`{name}`"));
+            }
+        }
+        missing
+    }
+
+    /// Shuts down the listener, verifies all `required = True` artifact tools were submitted,
+    /// and returns the collected `artifacts` object for `event["output"]["artifacts"]`.
+    pub fn finalize(self) -> anyhow::Result<Map<String, Value>> {
+        self.accept_handle.abort();
+        let missing = self.missing_required_tools();
+        if !missing.is_empty() {
+            bail!(
+                "agent finished turn without calling required artifact tool(s): {}",
+                missing.join(", ")
+            );
+        }
+        let guard = self
+            .ctx
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(guard.artifacts.clone())
+    }
+}
+
+fn resolve_bridge_launch_spec(addr: &str, token: &str) -> BridgeLaunchSpec {
+    if let Ok(explicit) = std::env::var("STARNESS_MCP_BRIDGE_BIN") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            return BridgeLaunchSpec {
+                command: trimmed.to_owned(),
+                args: vec![
+                    "mcp-bridge".to_owned(),
+                    "--addr".to_owned(),
+                    addr.to_owned(),
+                    "--token".to_owned(),
+                    token.to_owned(),
+                ],
+            };
+        }
+    }
+
+    if let Some(starness_bin) = discover_starness_cli_binary() {
+        return BridgeLaunchSpec {
+            command: starness_bin.to_string_lossy().into_owned(),
+            args: vec![
+                "mcp-bridge".to_owned(),
+                "--addr".to_owned(),
+                addr.to_owned(),
+                "--token".to_owned(),
+                token.to_owned(),
+            ],
+        };
+    }
+
+    BridgeLaunchSpec {
+        command: "python3".to_owned(),
+        args: vec![
+            "-u".to_owned(),
+            "-c".to_owned(),
+            PYTHON_STDIO_RELAY.to_owned(),
+            addr.to_owned(),
+            token.to_owned(),
+        ],
+    }
+}
+
+fn discover_starness_cli_binary() -> Option<PathBuf> {
+    let current = std::env::current_exe().ok()?;
+    let bin_name = if cfg!(windows) {
+        "starness.exe"
+    } else {
+        "starness"
+    };
+    if current.file_name().and_then(|n| n.to_str()) == Some(bin_name) {
+        return Some(current);
+    }
+    // Check sibling (e.g. `target/debug/starness`) or parent dir (when running inside `target/debug/deps/...`).
+    let dir = current.parent()?;
+    let sibling = dir.join(bin_name);
+    if sibling.is_file() {
+        return Some(sibling);
+    }
+    let parent_sibling = dir.parent()?.join(bin_name);
+    if parent_sibling.is_file() {
+        return Some(parent_sibling);
+    }
+    None
+}
+
+async fn handle_bridge_connection(stream: TcpStream, ctx: Arc<ServerContext>) -> anyhow::Result<()> {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // 1. Authenticate handshake line.
+    let mut handshake_line = String::new();
+    let n = reader.read_line(&mut handshake_line).await?;
+    if n == 0 {
+        return Ok(());
+    }
+    let handshake: Value = serde_json::from_str(handshake_line.trim())
+        .context("invalid MCP bridge handshake JSON")?;
+    let provided = handshake
+        .get(HANDSHAKE_TOKEN_KEY)
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if provided != ctx.token {
+        bail!("MCP bridge token mismatch");
+    }
+
+    // 2. Process newline-delimited MCP JSON-RPC 2.0 messages.
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line).await?;
+        if bytes == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let msg: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(err) => {
+                let err_resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": {
+                        "code": -32700,
+                        "message": format!("Parse error: {err}"),
+                    }
+                });
+                write_json_line(&mut write_half, &err_resp).await?;
+                continue;
+            }
+        };
+
+        if let Some(resp) = dispatch_mcp_jsonrpc(&msg, &ctx) {
+            write_json_line(&mut write_half, &resp).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn write_json_line<W: AsyncWriteExt + Unpin>(writer: &mut W, val: &Value) -> anyhow::Result<()> {
+    let mut encoded = serde_json::to_string(val)?;
+    encoded.push('\n');
+    writer.write_all(encoded.as_bytes()).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+fn dispatch_mcp_jsonrpc(msg: &Value, ctx: &ServerContext) -> Option<Value> {
+    let id = msg.get("id").cloned();
+    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+    let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
+
+    // Notifications (no `id`) never produce a JSON-RPC response.
+    let req_id = id?;
+
+    match method {
+        "initialize" => {
+            let client_ver = params
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .unwrap_or(DEFAULT_MCP_PROTOCOL_VERSION);
+            let negotiated = match client_ver {
+                "2024-11-05" | "2025-03-26" | "2025-06-18" => client_ver,
+                _ => DEFAULT_MCP_PROTOCOL_VERSION,
+            };
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "protocolVersion": negotiated,
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": {
+                        "name": "starness",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    }
+                }
+            }))
+        }
+        "ping" => Some(json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {}
+        })),
+        "tools/list" => {
+            let tools: Vec<Value> = ctx
+                .ordered_tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name(),
+                        "description": t.description(),
+                        "inputSchema": t.input_schema(),
+                    })
+                })
+                .collect();
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "tools": tools
+                }
+            }))
+        }
+        "tools/call" => {
+            let Some(tool_name) = params.get("name").and_then(Value::as_str) else {
+                return Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32602,
+                        "message": "tools/call missing string `name` parameter",
+                    }
+                }));
+            };
+            let raw_args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let args = if raw_args.is_null() {
+                json!({})
+            } else {
+                raw_args
+            };
+            let call_result = execute_mcp_tool_call(tool_name, &args, ctx);
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": call_result,
+            }))
+        }
+        other => Some(json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {
+                "code": -32601,
+                "message": format!("Method not found: `{other}`"),
+            }
+        })),
+    }
+}
+
+fn execute_mcp_tool_call(tool_name: &str, args: &Value, ctx: &ServerContext) -> Value {
+    let Some(tool) = ctx.tools_by_name.get(tool_name) else {
+        let msg = format!("Unknown tool `{tool_name}`.");
+        report_progress(ProgressKind::ToolCall, format!("mcp `{tool_name}` -> {msg}"));
+        return mcp_tool_text_result(msg, true);
+    };
+
+    match tool {
+        CompiledAgentTool::Read {
+            name,
+            shape,
+            schema_ctor,
+            handler,
+            ..
+        } => match eval_read_tool(
+            name,
+            shape.as_ref(),
+            schema_ctor.as_ref(),
+            handler,
+            args,
+            &ctx.runtime_scope,
+        ) {
+            Ok(text) => {
+                report_progress(
+                    ProgressKind::ToolCall,
+                    format!("mcp read `{name}` -> ok ({} bytes)", text.len()),
+                );
+                mcp_tool_text_result(text, false)
+            }
+            Err(err) => {
+                let msg = format!("Read tool `{name}` failed: {err:#}");
+                report_progress(
+                    ProgressKind::ToolCall,
+                    format!("mcp read `{name}` -> error: {msg}"),
+                );
+                mcp_tool_text_result(msg, true)
+            }
+        },
+        CompiledAgentTool::Artifact {
+            name,
+            shape,
+            schema_ctor,
+            mode,
+            validate,
+            ..
+        } => {
+            if *mode == ArtifactMode::Once {
+                let already = ctx
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .submitted
+                    .contains(name);
+                if already {
+                    let msg = format!(
+                        "Artifact `{name}` has `mode = \"once\"` and was already submitted in this turn."
+                    );
+                    report_progress(
+                        ProgressKind::ToolCall,
+                        format!("mcp artifact `{name}` rejected: {msg}"),
+                    );
+                    return mcp_tool_text_result(msg, true);
+                }
+            }
+
+            match eval_and_validate_artifact(
+                name,
+                shape,
+                schema_ctor,
+                validate.as_ref(),
+                args,
+                &ctx.runtime_scope,
+            ) {
+                Ok(artifact_json) => {
+                    {
+                        let mut guard = ctx.state.lock().unwrap_or_else(|p| p.into_inner());
+                        guard.submitted.insert(name.clone());
+                        match mode {
+                            ArtifactMode::Replace | ArtifactMode::Once => {
+                                guard.artifacts.insert(name.clone(), artifact_json.clone());
+                            }
+                            ArtifactMode::Append => {
+                                let entry = guard
+                                    .artifacts
+                                    .entry(name.clone())
+                                    .or_insert_with(|| Value::Array(Vec::new()));
+                                if let Value::Array(items) = entry {
+                                    items.push(artifact_json.clone());
+                                }
+                            }
+                        }
+                    }
+                    report_progress(
+                        ProgressKind::Artifact,
+                        json!({
+                            "tool": name,
+                            "mode": mode.as_str(),
+                            "artifact": artifact_json,
+                        })
+                        .to_string(),
+                    );
+                    mcp_tool_text_result(format!("Artifact `{name}` validated and recorded."), false)
+                }
+                Err(err) => {
+                    let msg = format!("Validation failed for `{name}`: {err:#}");
+                    report_progress(
+                        ProgressKind::ToolCall,
+                        format!("mcp artifact `{name}` rejected: {msg}"),
+                    );
+                    mcp_tool_text_result(msg, true)
+                }
+            }
+        }
+    }
+}
+
+fn eval_read_tool(
+    tool_name: &str,
+    shape: Option<&starness_starlark::TypeShape>,
+    schema_ctor: Option<&OwnedFrozenValue>,
+    handler: &OwnedFrozenValue,
+    args: &Value,
+    scope: &ToolRuntimeScope,
+) -> anyhow::Result<String> {
+    starness_starlark::with_active_type_registry(&scope.type_registry, || {
+        Module::with_temp_heap(|module| {
+            let ctx_val = crate::alloc_context_on_heap(
+                &module,
+                scope.context_record_type.as_ref(),
+                Some(&scope.type_registry),
+                &scope.ctx_snapshot,
+            )
+            .map_err(|e| anyhow::anyhow!("context error in `{tool_name}`: {e}"))?;
+
+            let call_args = match (schema_ctor, shape) {
+                (Some(ctor), Some(s)) => {
+                    let args_rec = instantiate_record_with_registry(
+                        &module,
+                        ctor,
+                        s,
+                        &scope.type_registry,
+                        args,
+                    )?;
+                    vec![ctx_val, args_rec]
+                }
+                _ => vec![ctx_val],
+            };
+
+            // SAFETY: `module.frozen_heap()` retains a reference to `handler.owner()` for `'v`.
+            let fn_val = unsafe { handler.owned_frozen_value(module.frozen_heap()) }.to_value();
+            let mut eval = Evaluator::new(&module);
+            let result = eval
+                .eval_function(fn_val, &call_args, &[])
+                .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+
+            if let Some(s) = result.unpack_str() {
+                return Ok(s.to_owned());
+            }
+            let json_val = result
+                .to_json_value()
+                .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+            serde_json::to_string_pretty(&json_val).map_err(Into::into)
+        })
+    })
+}
+
+fn eval_and_validate_artifact(
+    tool_name: &str,
+    shape: &starness_starlark::TypeShape,
+    schema_ctor: &OwnedFrozenValue,
+    validate: Option<&OwnedFrozenValue>,
+    args: &Value,
+    scope: &ToolRuntimeScope,
+) -> anyhow::Result<Value> {
+    starness_starlark::with_active_type_registry(&scope.type_registry, || {
+        Module::with_temp_heap(|module| {
+            let artifact_rec = instantiate_record_with_registry(
+                &module,
+                schema_ctor,
+                shape,
+                &scope.type_registry,
+                args,
+            )?;
+
+            if let Some(validator_fn) = validate {
+                let ctx_val = crate::alloc_context_on_heap(
+                    &module,
+                    scope.context_record_type.as_ref(),
+                    Some(&scope.type_registry),
+                    &scope.ctx_snapshot,
+                )
+                .map_err(|e| anyhow::anyhow!("context error in validator for `{tool_name}`: {e}"))?;
+
+                // SAFETY: `module.frozen_heap()` retains a reference to `validator_fn.owner()` for `'v`.
+                let fn_val =
+                    unsafe { validator_fn.owned_frozen_value(module.frozen_heap()) }.to_value();
+                let mut eval = Evaluator::new(&module);
+                let verdict = eval
+                    .eval_function(fn_val, &[ctx_val, artifact_rec], &[])
+                    .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+
+                if !verdict.is_none() {
+                    if let Some(err_msg) = verdict.unpack_str() {
+                        if !err_msg.trim().is_empty() {
+                            bail!("{err_msg}");
+                        }
+                    } else {
+                        bail!(
+                            "validator for `{tool_name}` must return `str | None`, got `{}`",
+                            verdict.get_type()
+                        );
+                    }
+                }
+            }
+
+            artifact_rec
+                .to_json_value()
+                .map_err(|e| anyhow::anyhow!("{e:#}"))
+        })
+    })
+}
+
+fn mcp_tool_text_result(text: String, is_error: bool) -> Value {
+    json!({
+        "content": [
+            {
+                "type": "text",
+                "text": text,
+            }
+        ],
+        "isError": is_error,
+    })
+}
+
+/// Runs the `starness mcp-bridge --addr <ADDR> --token <TOKEN>` stdio <-> TCP relay.
+pub async fn run_stdio_bridge(addr: &str, token: &str) -> anyhow::Result<()> {
+    let stream = TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("failed to connect MCP bridge to `{addr}`"))?;
+    let (tcp_read, mut tcp_write) = stream.into_split();
+
+    let handshake = json!({ HANDSHAKE_TOKEN_KEY: token });
+    write_json_line(&mut tcp_write, &handshake).await?;
+
+    let mut stdin_reader = BufReader::new(tokio::io::stdin());
+    let mut tcp_reader = BufReader::new(tcp_read);
+    let mut stdout = tokio::io::stdout();
+
+    let stdin_to_tcp = async move {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = stdin_reader.read_line(&mut line).await?;
+            if n == 0 {
+                break;
+            }
+            tcp_write.write_all(line.as_bytes()).await?;
+            tcp_write.flush().await?;
+        }
+        let _ = tcp_write.shutdown().await;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let tcp_to_stdout = async move {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = tcp_reader.read_line(&mut line).await?;
+            if n == 0 {
+                break;
+            }
+            stdout.write_all(line.as_bytes()).await?;
+            stdout.flush().await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    tokio::select! {
+        res = stdin_to_tcp => res?,
+        res = tcp_to_stdout => res?,
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// `@starness/mcp` Client Driver (`invoke_mcp` — STDIO & Streamable HTTP)
+// ============================================================================
+
+/// Executes a deterministic MCP `tools/call` invocation declared via `invoke_mcp(...)`.
+pub async fn execute_mcp_client_call(_ctx: Value, input: Value) -> anyhow::Result<Value> {
+    let mut scrubber = crate::builtins::secrets::SecretScrubber::new();
+    let res = execute_mcp_client_call_inner(&input, &mut scrubber).await;
+    scrubber.scrub_result(res)
+}
+
+async fn execute_mcp_client_call_inner(
+    input: &Value,
+    scrubber: &mut crate::builtins::secrets::SecretScrubber,
+) -> anyhow::Result<Value> {
+    let obj = input
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("`@starness/mcp` input must be an object"))?;
+
+    let server = obj
+        .get("server")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("`@starness/mcp` input missing `server` record"))?;
+
+    let server_id = server.get("id").and_then(Value::as_str).unwrap_or("mcp");
+    let transport = server
+        .get("transport")
+        .and_then(Value::as_str)
+        .unwrap_or("STDIO");
+    let timeout_ms = server
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(30_000);
+
+    let tool_name = obj
+        .get("tool")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("`invoke_mcp` `tool` must resolve to a non-empty `str`"))?;
+    if tool_name.trim().is_empty() {
+        bail!("`invoke_mcp` `tool` must not be empty");
+    }
+
+    let raw_args = obj.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let resolved_args = match raw_args {
+        Value::Null => json!({}),
+        Value::Object(_) => {
+            crate::builtins::secrets::resolve_secrets_in_value(&raw_args, scrubber)?
+        }
+        other => bail!("`invoke_mcp` `arguments` must resolve to a dict/record, got `{other}`"),
+    };
+
+    let check_tool_error = obj
+        .get("check_tool_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    report_progress(
+        ProgressKind::ToolCall,
+        format!("mcp `{server_id}.{tool_name}` starting ({transport})"),
+    );
+
+    let raw_result = match transport.to_ascii_uppercase().as_str() {
+        "STDIO" => {
+            let resolved_envs = crate::builtins::secrets::resolve_secret_string_map(
+                server.get("env").and_then(Value::as_object),
+                scrubber,
+            )?;
+            tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                call_stdio_mcp_server(server, &resolved_envs, tool_name, &resolved_args),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "MCP server `{server_id}` (`{tool_name}`) timed out after {timeout_ms}ms"
+                )
+            })??
+        }
+        "HTTP" => {
+            let resolved_headers = crate::builtins::secrets::resolve_secret_string_map(
+                server.get("headers").and_then(Value::as_object),
+                scrubber,
+            )?;
+            tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                call_http_mcp_server(
+                    server,
+                    &resolved_headers,
+                    tool_name,
+                    &resolved_args,
+                    timeout_ms,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "HTTP MCP server `{server_id}` (`{tool_name}`) timed out after {timeout_ms}ms"
+                )
+            })??
+        }
+        other => bail!("unsupported MCP transport `{other}` (expected `STDIO` or `HTTP`)"),
+    };
+
+    let normalized = normalize_mcp_call_result(tool_name, &raw_result);
+    let is_error = normalized["is_error"].as_bool().unwrap_or(false);
+
+    if is_error {
+        let err_text = normalized["text"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("MCP tool returned `isError: true`");
+        report_progress(
+            ProgressKind::ToolCall,
+            format!("mcp `{server_id}.{tool_name}` -> error: {err_text}"),
+        );
+        if check_tool_error {
+            bail!("MCP tool `{server_id}.{tool_name}` failed: {err_text}");
+        }
+    } else {
+        report_progress(
+            ProgressKind::ToolCall,
+            format!("mcp `{server_id}.{tool_name}` -> ok"),
+        );
+    }
+
+    Ok(normalized)
+}
+
+async fn call_stdio_mcp_server(
+    server: &Map<String, Value>,
+    resolved_envs: &indexmap::IndexMap<String, secrecy::SecretString>,
+    tool_name: &str,
+    arguments: &Value,
+) -> anyhow::Result<Value> {
+    use secrecy::ExposeSecret;
+    let command_prog = server
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("STDIO McpServer missing `command`"))?;
+
+    let args: Vec<String> = server
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut cmd = tokio::process::Command::new(command_prog);
+    cmd.args(&args)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    if let Some(cwd) = server
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        cmd.current_dir(cwd);
+    }
+    for (k, vs) in resolved_envs {
+        cmd.env(k, vs.expose_secret());
+    }
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn MCP server `{command_prog}`"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open stdin to MCP server"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open stdout from MCP server"))?;
+    let mut reader = BufReader::new(stdout).lines();
+
+    // 1. `initialize`
+    write_json_line(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": DEFAULT_MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "starness",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            }
+        }),
+    )
+    .await?;
+    let _init = await_mcp_stdio_response(&mut reader, 1)
+        .await
+        .context("MCP `initialize` failed")?;
+
+    // 2. `notifications/initialized`
+    write_json_line(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        }),
+    )
+    .await?;
+
+    // 3. `tools/call`
+    write_json_line(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments,
+            }
+        }),
+    )
+    .await?;
+    let call_res = await_mcp_stdio_response(&mut reader, 2)
+        .await
+        .with_context(|| format!("MCP `tools/call` (`{tool_name}`) failed"))?;
+
+    drop(stdin);
+    let _ = child.kill().await;
+    Ok(call_res)
+}
+
+async fn await_mcp_stdio_response(
+    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    expected_id: u64,
+) -> anyhow::Result<Value> {
+    while let Some(line) = reader.next_line().await? {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(msg) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if let Some(method) = msg.get("method").and_then(Value::as_str)
+            && msg.get("id").is_none()
+        {
+            if matches!(method, "notifications/message" | "notifications/progress")
+                && let Some(params) = msg.get("params")
+            {
+                report_progress(ProgressKind::Log, params.to_string());
+            }
+            continue;
+        }
+        if msg.get("id").and_then(Value::as_u64) == Some(expected_id) {
+            if let Some(err) = msg.get("error") {
+                bail!("MCP JSON-RPC error: {err}");
+            }
+            return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
+        }
+    }
+    bail!("MCP server closed stdout before replying to request id {expected_id}")
+}
+
+async fn call_http_mcp_server(
+    server: &Map<String, Value>,
+    custom_headers: &indexmap::IndexMap<String, secrecy::SecretString>,
+    tool_name: &str,
+    arguments: &Value,
+    timeout_ms: u64,
+) -> anyhow::Result<Value> {
+    let url = server
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("HTTP McpServer missing `url`"))?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .build()
+        .context("failed building HTTP MCP client")?;
+
+    // 1. `initialize`
+    let (init_msg, session_id) = send_http_mcp_rpc(
+        &client,
+        url,
+        custom_headers,
+        None,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "starness",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            }
+        }),
+        Some(1),
+    )
+    .await
+    .context("HTTP MCP `initialize` failed")?;
+    let _ = init_msg;
+
+    // 2. `notifications/initialized` (202 Accepted or empty 200 OK)
+    let _ = send_http_mcp_rpc(
+        &client,
+        url,
+        custom_headers,
+        session_id.as_deref(),
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        }),
+        None,
+    )
+    .await;
+
+    // 3. `tools/call`
+    let (call_res, _) = send_http_mcp_rpc(
+        &client,
+        url,
+        custom_headers,
+        session_id.as_deref(),
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments,
+            }
+        }),
+        Some(2),
+    )
+    .await
+    .with_context(|| format!("HTTP MCP `tools/call` (`{tool_name}`) failed"))?;
+
+    Ok(call_res)
+}
+
+async fn send_http_mcp_rpc(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &indexmap::IndexMap<String, secrecy::SecretString>,
+    session_id: Option<&str>,
+    body: &Value,
+    expected_id: Option<u64>,
+) -> anyhow::Result<(Value, Option<String>)> {
+    use secrecy::ExposeSecret;
+    let mut req = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .json(body);
+
+    if let Some(sid) = session_id {
+        req = req.header("Mcp-Session-Id", sid);
+    }
+    for (k, vs) in headers {
+        req = req.header(k.as_str(), vs.expose_secret());
+    }
+
+    let resp = req.send().await?;
+    let status = resp.status();
+    let returned_sid = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| session_id.map(str::to_owned));
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let text = resp.text().await?;
+
+    if !status.is_success() {
+        bail!("HTTP MCP server returned {status}: {text}");
+    }
+
+    let Some(req_id) = expected_id else {
+        return Ok((Value::Null, returned_sid));
+    };
+
+    if content_type.contains("text/event-stream") {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if let Some(data) = trimmed.strip_prefix("data:")
+                && let Ok(msg) = serde_json::from_str::<Value>(data.trim())
+                && msg.get("id").and_then(Value::as_u64) == Some(req_id)
+            {
+                if let Some(err) = msg.get("error") {
+                    bail!("HTTP MCP JSON-RPC error: {err}");
+                }
+                return Ok((msg.get("result").cloned().unwrap_or(Value::Null), returned_sid));
+            }
+        }
+        bail!("HTTP MCP SSE stream did not contain response for id {req_id}");
+    }
+
+    let msg: Value =
+        serde_json::from_str(text.trim()).context("invalid JSON response from HTTP MCP server")?;
+    if let Some(err) = msg.get("error") {
+        bail!("HTTP MCP JSON-RPC error: {err}");
+    }
+    Ok((msg.get("result").cloned().unwrap_or(Value::Null), returned_sid))
+}
+
+fn normalize_mcp_call_result(tool_name: &str, result: &Value) -> Value {
+    let is_error = result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let content = result
+        .get("content")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let structured = result
+        .get("structuredContent")
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    let mut text_parts = Vec::new();
+    for item in &content {
+        if let Some(t) = item.get("text").and_then(Value::as_str) {
+            text_parts.push(t);
+        }
+    }
+    let joined_text = text_parts.join("\n");
+
+    let data = if !structured.is_null() {
+        structured.clone()
+    } else if !joined_text.trim().is_empty() {
+        serde_json::from_str::<Value>(joined_text.trim())
+            .unwrap_or_else(|_| Value::String(joined_text.clone()))
+    } else {
+        Value::Null
+    };
+
+    json!({
+        "tool": tool_name,
+        "is_error": is_error,
+        "text": joined_text,
+        "data": data,
+        "content": content,
+        "structured_content": structured,
+    })
+}

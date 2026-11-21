@@ -2971,75 +2971,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
-name = "starchart-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "indexmap",
- "secrecy",
- "serde_json",
- "starchart-ir",
- "starchart-runtime",
- "starchart-starlark",
- "starlark",
- "starlark_lsp",
- "starlark_syntax",
- "tokio",
- "xstate-statemachine",
-]
-
-[[package]]
-name = "starchart-ir"
-version = "0.1.0"
-dependencies = [
- "indexmap",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "starchart-runtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.23.1",
- "decision-rs",
- "dupe",
- "indexmap",
- "keyring",
- "reqwest 0.12.28",
- "rusqlite",
- "secrecy",
- "serde",
- "serde_json",
- "starchart-ir",
- "starchart-starlark",
- "starlark",
- "thiserror",
- "tokio",
- "xstate-statemachine",
-]
-
-[[package]]
-name = "starchart-starlark"
-version = "0.1.0"
-dependencies = [
- "allocative",
- "anyhow",
- "dupe",
- "indexmap",
- "serde",
- "serde_json",
- "starchart-ir",
- "starlark",
- "starlark_map",
- "starlark_syntax",
- "thiserror",
-]
-
-[[package]]
 name = "starlark"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3153,6 +3084,75 @@ dependencies = [
  "once_cell",
  "pagable",
  "starlark_map",
+ "thiserror",
+]
+
+[[package]]
+name = "starness-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "indexmap",
+ "secrecy",
+ "serde_json",
+ "starlark",
+ "starlark_lsp",
+ "starlark_syntax",
+ "starness-ir",
+ "starness-runtime",
+ "starness-starlark",
+ "tokio",
+ "xstate-statemachine",
+]
+
+[[package]]
+name = "starness-ir"
+version = "0.1.0"
+dependencies = [
+ "indexmap",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "starness-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "decision-rs",
+ "dupe",
+ "indexmap",
+ "keyring",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "starlark",
+ "starness-ir",
+ "starness-starlark",
+ "thiserror",
+ "tokio",
+ "xstate-statemachine",
+]
+
+[[package]]
+name = "starness-starlark"
+version = "0.1.0"
+dependencies = [
+ "allocative",
+ "anyhow",
+ "dupe",
+ "indexmap",
+ "serde",
+ "serde_json",
+ "starlark",
+ "starlark_map",
+ "starlark_syntax",
+ "starness-ir",
  "thiserror",
 ]
 
