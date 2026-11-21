@@ -1075,6 +1075,8 @@ fn build_builtin_lsp_interfaces(
         "@starness/secrets.star",
         "@starness/decide",
         "@starness/decide.star",
+        "@starness/llm",
+        "@starness/llm.star",
     ] {
         if let Some((canon_id, src)) = resolve_builtin_module(alias)
             && let Ok(ast) = AstModule::parse(canon_id, src.to_owned(), &dialect)

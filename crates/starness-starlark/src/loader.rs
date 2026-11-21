@@ -13,7 +13,7 @@ use starlark::values::{FrozenValue, OwnedFrozenValue, ValueLike};
 use thiserror::Error;
 
 use crate::dsl::{chart_dialect, chart_globals};
-use crate::schema::{TypeRegistry, TypeShape};
+use crate::schema::{TypeRegistry, TypeShape, with_active_type_registry};
 use crate::stdlib::resolve_builtin_module;
 use crate::types::{
     AgentToolDataGen, ArtifactMode, FrozenStarlarkMachine, starlark_input_slot_name,
@@ -334,17 +334,19 @@ fn compile_module_recursive(
     }
 
     // Pass 2: Evaluate in a temporary heap and freeze into an immutable FrozenModule.
+    let dep_frozen: Vec<FrozenModule> = load_modules.values().cloned().collect();
+    let dep_registry = TypeRegistry::from_frozen_modules(&dep_frozen);
     let file_loader = MapFileLoader {
         modules: Arc::new(load_modules),
     };
 
     let frozen = Module::with_temp_heap(|module| {
-        {
+        with_active_type_registry(&dep_registry, || {
             let mut eval = Evaluator::new(&module);
             eval.set_loader(&file_loader);
             eval.eval_module(ast, &globals)
-                .map_err(ChartCompileError::from_starlark_eval)?;
-        }
+                .map_err(ChartCompileError::from_starlark_eval)
+        })?;
         module
             .freeze()
             .map_err(|e| ChartCompileError::Freeze(format!("{e:?}")))

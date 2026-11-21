@@ -185,11 +185,11 @@ pub fn parse_record_schema_value<'v>(
     heap: Heap<'v>,
 ) -> anyhow::Result<TypeShape> {
     let _compiled = TypeCompiled::new(schema_val, heap)
-        .map_err(|e| anyhow::anyhow!("invalid tool `schema`: {e:#}"))?;
+        .map_err(|e| anyhow::anyhow!("invalid `schema`: {e:#}"))?;
     let rendered = schema_val.to_string();
     if !rendered.starts_with("record(") {
         bail!(
-            "tool `schema` must be a `record(...)` type constructor, got `{}`",
+            "`schema` must be a `record(...)` type constructor, got `{}`",
             schema_val.get_type()
         );
     }
@@ -646,6 +646,111 @@ fn find_record_ctor_for_instance<'v>(
     None
 }
 
+/// Compiles an optional `@starness/llm` `schema` (`None`, raw JSON Schema `dict`, or Starlark
+/// `record(...)` type constructor) into `None` or `{"name": str, "schema": dict}`.
+pub fn derive_llm_schema_in_eval<'v>(
+    schema_val: Value<'v>,
+    eval: &mut Evaluator<'v, '_, '_>,
+) -> anyhow::Result<Value<'v>> {
+    if schema_val.is_none() {
+        return Ok(Value::new_none());
+    }
+    if DictRef::from_value(schema_val).is_some() {
+        let json_val = schema_val.to_json_value()?;
+        let Some(map) = json_val.as_object() else {
+            bail!("invoke_llm `schema` dict must serialize to a JSON object");
+        };
+        if map.is_empty() {
+            bail!("invoke_llm `schema` dict must not be empty");
+        }
+        let schema_name = map
+            .get("title")
+            .and_then(JsonValue::as_str)
+            .and_then(sanitize_json_spec_name)
+            .unwrap_or_else(|| "structured_output".to_owned());
+        return Ok(alloc_plain_json(
+            &json!({
+                "name": schema_name,
+                "schema": json_val,
+            }),
+            eval.heap(),
+        ));
+    }
+
+    let shape = parse_record_schema_value(schema_val, eval.heap())?;
+    let (defs, matched_name) = collect_active_shapes_and_name(schema_val, eval);
+    let schema_name = matched_name
+        .as_deref()
+        .and_then(sanitize_json_spec_name)
+        .unwrap_or_else(|| "structured_output".to_owned());
+    let json_schema = shape.to_json_schema(&defs);
+    Ok(alloc_plain_json(
+        &json!({
+            "name": schema_name,
+            "schema": json_schema,
+        }),
+        eval.heap(),
+    ))
+}
+
+fn sanitize_json_spec_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('_');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+fn collect_active_shapes_and_name<'v>(
+    target_ctor: Value<'v>,
+    eval: &Evaluator<'v, '_, '_>,
+) -> (HashMap<String, TypeShape>, Option<String>) {
+    let mut defs: HashMap<String, TypeShape> = HashMap::new();
+    let mut matched_name: Option<String> = None;
+
+    ACTIVE_TYPE_REGISTRY.with(|slot| {
+        if let Some(reg) = slot.borrow().as_ref() {
+            defs.extend(reg.shapes.clone());
+            for (name, ctor) in &reg.ctors {
+                // SAFETY: `eval.frozen_heap()` retains a reference to `ctor.owner()` for `'v`.
+                let candidate = unsafe { ctor.owned_frozen_value(eval.frozen_heap()) }.to_value();
+                if target_ctor.ptr_eq(candidate) {
+                    matched_name = Some(name.clone());
+                }
+            }
+        }
+    });
+
+    for sym in eval.module().names() {
+        let name = sym.as_str();
+        if let Some(candidate) = eval.module().get(name) {
+            if target_ctor.ptr_eq(candidate) {
+                matched_name = Some(name.to_owned());
+            }
+            let rendered = candidate.to_string();
+            if (rendered.starts_with("record(") || rendered.starts_with("enum("))
+                && let Ok(shape) = parse_type_expr(&rendered)
+            {
+                defs.insert(name.to_owned(), shape);
+            }
+        }
+    }
+
+    (defs, matched_name)
+}
+
 /// Instantiates a typed Starlark `Record` from a JSON object inside an active `Evaluator`,
 /// coercing nested `record` and `enum` fields when an active [`TypeRegistry`] is available.
 pub fn instantiate_record_in_eval<'v>(
@@ -656,7 +761,7 @@ pub fn instantiate_record_in_eval<'v>(
     let shape = parse_record_schema_value(ctor_val, eval.heap())?;
     let obj = obj_json
         .as_object()
-        .context("artifact payload must be a JSON object")?;
+        .context("structured payload must be a JSON object")?;
     let TypeShape::Record(fields) = &shape else {
         bail!("expected `record(...)` schema");
     };

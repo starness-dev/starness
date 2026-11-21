@@ -16,7 +16,8 @@ use starlark::values::typing::{StarlarkCallable, StarlarkCallableParamAny};
 use starlark::values::{FrozenValue, Value};
 
 use crate::schema::{
-    instantiate_record_in_eval, parse_record_schema_value, update_record_or_dict,
+    alloc_plain_json, derive_llm_schema_in_eval, instantiate_record_in_eval,
+    parse_record_schema_value, update_record_or_dict,
 };
 use crate::types::{
     ActionDataGen, ActionInput, AfterDataGen, AgentToolDataGen, ArtifactMode, AssignCallable,
@@ -940,6 +941,47 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
             prefix: prefix.to_owned(),
             optional,
         })
+    }
+
+    /// Internal helper used by `@starness/llm` to derive a `{"name": str, "schema": dict}` descriptor
+    /// from an optional Starlark `record(...)` type constructor or JSON Schema `dict`.
+    fn __starness_derive_llm_schema__<'v>(
+        #[starlark(require = pos)] schema: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        derive_llm_schema_in_eval(schema, eval)
+    }
+
+    /// Extracts `event["output"]["structured"]` from an `@starness/llm` `on_done` event,
+    /// optionally instantiating it as a validated Starlark `record(...)` when `schema` is provided.
+    fn __starness_llm_structured__<'v>(
+        #[starlark(require = pos)] event: Value<'v>,
+        #[starlark(require = pos, default = NoneOr::None)] schema: NoneOr<Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        extract_llm_structured(event, schema.into_option(), eval)
+    }
+}
+
+fn extract_llm_structured<'v>(
+    event: Value<'v>,
+    schema: Option<Value<'v>>,
+    eval: &mut Evaluator<'v, '_, '_>,
+) -> anyhow::Result<Value<'v>> {
+    let ev_json = event.to_json_value()?;
+    let raw_opt = ev_json
+        .get("output")
+        .and_then(|o| o.get("structured"))
+        .or_else(|| ev_json.get("structured"));
+    let schema_ctor = schema.filter(|s| !s.is_none());
+
+    match (raw_opt, schema_ctor) {
+        (None | Some(serde_json::Value::Null), Some(_)) => {
+            bail!("missing `structured` JSON output in LLM event")
+        }
+        (Some(raw), Some(ctor)) => instantiate_record_in_eval(ctor, raw, eval),
+        (Some(raw), None) => Ok(alloc_plain_json(raw, eval.heap())),
+        (None, None) => Ok(Value::new_none()),
     }
 }
 

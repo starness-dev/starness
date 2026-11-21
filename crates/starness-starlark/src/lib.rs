@@ -17,8 +17,9 @@ pub use schema::{
 };
 pub use stdlib::{
     ACP_MODULE_ID, BUILTIN_ACP_SERVICE, BUILTIN_DECIDE_SERVICE, BUILTIN_EXEC_SERVICE,
-    BUILTIN_HTTP_SERVICE, BUILTIN_MCP_SERVICE, DECIDE_MODULE_ID, EXEC_MODULE_ID, HTTP_MODULE_ID,
-    MCP_MODULE_ID, SECRETS_MODULE_ID, is_builtin_service, resolve_builtin_module,
+    BUILTIN_HTTP_SERVICE, BUILTIN_LLM_SERVICE, BUILTIN_MCP_SERVICE, DECIDE_MODULE_ID,
+    EXEC_MODULE_ID, HTTP_MODULE_ID, LLM_MODULE_ID, MCP_MODULE_ID, SECRETS_MODULE_ID,
+    is_builtin_service, resolve_builtin_module,
 };
 pub use types::{
     ArtifactMode, FrozenStarlarkMachine, INVOKE_INPUT_SLOT_KEY, INVOKE_TOOL_SLOT_KEY,
@@ -671,5 +672,120 @@ chart = machine(
             inv.input["questions"]["urgency"]["levels"][3][0],
             "critical"
         );
+    }
+
+    #[test]
+    fn llm_module_typechecks_record_schema_derivation_and_rehydration() {
+        let src = r#"
+load(
+    "@starness/llm",
+    "LlmModel",
+    "ReasoningEffort",
+    "invoke_llm",
+    "llm_model",
+    "llm_structured",
+    "llm_text",
+)
+load("@starness/secrets", "secret")
+
+RiskLevel = enum("LOW", "MEDIUM", "HIGH")
+ChangeItem = record(
+    component = str,
+    summary = str,
+    risk = RiskLevel,
+)
+ReleaseSummary = record(
+    headline = str,
+    breaking = bool,
+    changes = list[ChangeItem],
+    notes = field(str, ""),
+)
+
+Ctx = record(
+    diff = field(str, "feat: add @starness/llm"),
+    headline = field(str, ""),
+    high_risk_count = field(int, 0),
+    plain_text = field(str, ""),
+)
+
+writer: LlmModel = llm_model(
+    "openai::gpt-4o-mini",
+    api_key = secret("OPENAI_API_KEY", optional = True),
+    temperature = 0.2,
+    max_tokens = 1024,
+    top_p = 0.95,
+    reasoning_effort = ReasoningEffort.low,
+)
+
+def store_structured(ctx: Ctx, ev: dict) -> Ctx:
+    parsed = llm_structured(ev, ReleaseSummary)
+    risky = [c for c in parsed.changes if c.risk == RiskLevel.HIGH]
+    return update(
+        ctx,
+        headline = parsed.headline,
+        high_risk_count = len(risky),
+        plain_text = llm_text(ev),
+    )
+
+S = state_space("drafting", "summarizing", "done", "failed")
+
+chart = machine(
+    id = "llm_compile_check",
+    initial = S.drafting,
+    context = Ctx(),
+    states = {
+        S.drafting: state(
+            invoke = invoke_llm(
+                model = writer,
+                system = "Extract structured release notes.",
+                prompt = lambda ctx: "Summarize:\n" + ctx.diff,
+                context = lambda ctx: {"diff": ctx.diff},
+                schema = ReleaseSummary,
+                stream = True,
+                timeout_ms = 30000,
+                on_done = outcome(target = S.summarizing, assign = store_structured),
+                on_error = S.failed,
+            ),
+        ),
+        S.summarizing: state(
+            invoke = invoke_llm(
+                model = "gemini-2.5-flash",
+                prompt = lambda ctx: "Write a tweet for: " + ctx.headline,
+                schema = {"title": "TweetBox", "type": "object", "properties": {"tweet": {"type": "string"}}},
+                stream = False,
+                on_done = S.done,
+                on_error = S.failed,
+            ),
+        ),
+        S.done: final_state(),
+        S.failed: final_state(),
+    },
+)
+"#;
+
+        let compiled = compile_starlark_str("llm_compile_check.star", src, None)
+            .expect("@starness/llm should statically typecheck and compile");
+        let inv = &compiled.ir.states[&starness_ir::StateId::from("drafting")].invoke[0];
+        assert_eq!(inv.src, BUILTIN_LLM_SERVICE);
+        assert_eq!(inv.input["model"]["model"], "openai::gpt-4o-mini");
+        assert_eq!(inv.input["model"]["reasoning_effort"], "low");
+        assert_eq!(
+            inv.input["model"]["api_key"]["$starness_secret"]["name"],
+            "OPENAI_API_KEY"
+        );
+        assert_eq!(inv.input["schema"]["name"], "ReleaseSummary");
+        assert_eq!(
+            inv.input["schema"]["schema"]["properties"]["changes"]["items"]["properties"]["risk"]["enum"],
+            serde_json::json!(["LOW", "MEDIUM", "HIGH"])
+        );
+        assert_eq!(
+            inv.input["schema"]["schema"]["additionalProperties"],
+            serde_json::json!(false)
+        );
+
+        let inv2 = &compiled.ir.states[&starness_ir::StateId::from("summarizing")].invoke[0];
+        assert_eq!(inv2.input["model"]["model"], "gemini-2.5-flash");
+        assert_eq!(inv2.input["schema"]["name"], "TweetBox");
+        assert_eq!(inv2.input["stream"], false);
     }
 }

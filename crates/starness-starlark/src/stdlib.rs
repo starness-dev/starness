@@ -15,6 +15,9 @@ pub const BUILTIN_MCP_SERVICE: &str = "__starness_builtin_mcp__";
 /// Built-in runtime service identifier for `@starness/decide` (`decision-rs`).
 pub const BUILTIN_DECIDE_SERVICE: &str = "__starness_builtin_decide__";
 
+/// Built-in runtime service identifier for `@starness/llm` (`genai`).
+pub const BUILTIN_LLM_SERVICE: &str = "__starness_builtin_llm__";
+
 /// Virtual Starlark module source for `@starness/secrets`.
 pub const SECRETS_MODULE_ID: &str = "@starness/secrets.star";
 pub const SECRETS_MODULE_SOURCE: &str = r#"
@@ -785,6 +788,104 @@ def confidence(event: dict, name: str) -> float | None:
     return float(val) if val != None else None
 "#;
 
+/// Virtual Starlark module source for `@starness/llm` (single-shot text & structured `Record` generation via `genai`).
+pub const LLM_MODULE_ID: &str = "@starness/llm.star";
+pub const LLM_MODULE_SOURCE: &str = r#"
+ReasoningEffort = enum("zero", "minimal", "low", "medium", "high", "xhigh", "max")
+
+llm_structured = __starness_llm_structured__
+
+LlmModel = record(
+    model = str,
+    api_key = field(str | Secret | None, None),
+    endpoint = field(str | None, None),
+    temperature = field(float | None, None),
+    max_tokens = field(int | None, None),
+    top_p = field(float | None, None),
+    reasoning_effort = field(str | None, None),
+)
+
+def llm_model(
+    model: str,
+    *,
+    api_key: str | Secret | None = None,
+    endpoint: str | None = None,
+    temperature: float | int | None = None,
+    max_tokens: int | None = None,
+    top_p: float | int | None = None,
+    reasoning_effort: ReasoningEffort | str | None = None,
+) -> LlmModel:
+    if model == "":
+        fail("llm_model `model` must not be empty")
+    temp_f = float(temperature) if temperature != None else None
+    if temp_f != None and temp_f < 0.0:
+        fail("llm_model `temperature` must be >= 0.0")
+    if max_tokens != None and max_tokens <= 0:
+        fail("llm_model `max_tokens` must be > 0")
+    top_p_f = float(top_p) if top_p != None else None
+    if top_p_f != None and (top_p_f <= 0.0 or top_p_f > 1.0):
+        fail("llm_model `top_p` must be in (0.0, 1.0]")
+    effort_str = None
+    if reasoning_effort != None:
+        raw_effort = str(reasoning_effort.value) if type(reasoning_effort) == "enum" else str(reasoning_effort).lower()
+        if raw_effort == "none":
+            raw_effort = "zero"
+        if raw_effort not in ["zero", "minimal", "low", "medium", "high", "xhigh", "max"]:
+            fail("llm_model `reasoning_effort` must be one of `zero`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`")
+        effort_str = raw_effort
+    return LlmModel(
+        model = model,
+        api_key = api_key,
+        endpoint = endpoint,
+        temperature = temp_f,
+        max_tokens = max_tokens,
+        top_p = top_p_f,
+        reasoning_effort = effort_str,
+    )
+
+def invoke_llm(
+    *,
+    model: LlmModel | str | typing.Callable,
+    prompt: str | typing.Callable,
+    system: str | typing.Callable | None = None,
+    context = None,
+    schema = None,
+    stream: bool = True,
+    timeout_ms: int = 60000,
+    id: str | None = None,
+    on_done = None,
+    on_error = None,
+) -> Invoke:
+    if type(prompt) == "string" and prompt == "":
+        fail("invoke_llm `prompt` must not be empty")
+    if timeout_ms <= 0:
+        fail("invoke_llm `timeout_ms` must be > 0")
+    model_or_fn = llm_model(model) if type(model) == "string" else model
+    compiled_schema = __starness_derive_llm_schema__(schema)
+    return invoke(
+        src = "__starness_builtin_llm__",
+        id = id,
+        input = {
+            "model": model_or_fn,
+            "prompt": prompt,
+            "system": system,
+            "context": context,
+            "schema": compiled_schema,
+            "stream": stream,
+            "timeout_ms": timeout_ms,
+        },
+        on_done = on_done,
+        on_error = on_error,
+    )
+
+def llm_text(event: dict) -> str:
+    out = event.get("output") if "output" in event else event
+    if type(out) != "dict":
+        fail("llm_text: event missing `output` dict")
+    txt = out.get("text")
+    return str(txt) if txt != None else ""
+"#;
+
 /// Resolves a `@starness/*` virtual module path to `(canonical_module_id, source_code)`.
 pub fn resolve_builtin_module(load_path: &str) -> Option<(&'static str, &'static str)> {
     match load_path {
@@ -809,6 +910,9 @@ pub fn resolve_builtin_module(load_path: &str) -> Option<(&'static str, &'static
         "@starness/decide" | "@starness/decide.star" | "/@starness/decide.star" => {
             Some((DECIDE_MODULE_ID, DECIDE_MODULE_SOURCE))
         }
+        "@starness/llm" | "@starness/llm.star" | "/@starness/llm.star" => {
+            Some((LLM_MODULE_ID, LLM_MODULE_SOURCE))
+        }
         _ => None,
     }
 }
@@ -822,5 +926,6 @@ pub fn is_builtin_service(service_name: &str) -> bool {
             | BUILTIN_ACP_SERVICE
             | BUILTIN_MCP_SERVICE
             | BUILTIN_DECIDE_SERVICE
+            | BUILTIN_LLM_SERVICE
     )
 }
