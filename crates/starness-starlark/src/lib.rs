@@ -788,4 +788,110 @@ chart = machine(
         assert_eq!(inv2.input["schema"]["name"], "TweetBox");
         assert_eq!(inv2.input["stream"], false);
     }
+
+    #[test]
+    fn llm_module_typechecks_messages_tools_attachments_and_cache_policies() {
+        let src = r#"
+load(
+    "@starness/llm",
+    "CachePolicy",
+    "ToolChoice",
+    "assistant_msg",
+    "attachment",
+    "has_tool_calls",
+    "invoke_llm",
+    "llm_model",
+    "llm_text",
+    "llm_tool_call",
+    "llm_tool_calls",
+    "system_msg",
+    "tool_def",
+    "tool_result",
+    "tool_results_msg",
+    "user_msg",
+)
+
+BashArgs = record(command = str)
+
+Ctx = record(
+    messages = field(list[dict], []),
+    pending_call = field(dict | None, None),
+    reply = field(str, ""),
+)
+
+_sys = system_msg("Be concise.", cache = CachePolicy.ephemeral)
+_img = attachment(base64 = "AAAA", mime = "image/png", name = "screen.png")
+_u = user_msg("Inspect this", attachments = [_img], cache = "5m")
+_a = assistant_msg("Sure")
+_tr = tool_result({"id": "call_1", "name": "bash"}, {"stdout": "ok"}, cache = CachePolicy.memory)
+_batch = tool_results_msg([_tr], cache = "1h")
+
+def record_turn(ctx: Ctx, ev: dict) -> Ctx:
+    calls = llm_tool_calls(ev)
+    first = llm_tool_call(ev)
+    return update(
+        ctx,
+        messages = ctx.messages + [assistant_msg(ev)],
+        pending_call = first if len(calls) > 0 else None,
+        reply = llm_text(ev),
+    )
+
+S = state_space("thinking", "acting", "done", "failed")
+
+chart = machine(
+    id = "llm_multiturn_check",
+    initial = S.thinking,
+    context = Ctx(messages = [_sys, _u, _a, _batch]),
+    states = {
+        S.thinking: state(
+            invoke = invoke_llm(
+                model = llm_model("openai::gpt-4o-mini"),
+                system = "You are a coding assistant.",
+                system_cache = CachePolicy.ephemeral,
+                messages = lambda ctx: ctx.messages,
+                tools = [
+                    tool_def(
+                        "bash",
+                        description = "Run a shell command",
+                        schema = BashArgs,
+                        strict = True,
+                        cache = "5m",
+                    ),
+                ],
+                tool_choice = ToolChoice.auto,
+                on_done = [
+                    outcome(
+                        target = S.acting,
+                        guard = lambda _ctx, ev: has_tool_calls(ev),
+                        assign = record_turn,
+                    ),
+                    outcome(
+                        target = S.done,
+                        assign = record_turn,
+                    ),
+                ],
+                on_error = S.failed,
+            ),
+        ),
+        S.acting: final_state(),
+        S.done: final_state(),
+        S.failed: final_state(),
+    },
+)
+"#;
+
+        let compiled = compile_starlark_str("llm_multiturn_check.star", src, None)
+            .expect("@starness/llm multi-turn messages, tools, attachments, and cache should compile");
+        let inv = &compiled.ir.states[&starness_ir::StateId::from("thinking")].invoke[0];
+        assert_eq!(inv.src, BUILTIN_LLM_SERVICE);
+        assert_eq!(inv.input["system_cache"], "ephemeral");
+        assert_eq!(inv.input["tool_choice"], "auto");
+        assert_eq!(inv.input["tools"][0]["name"], "bash");
+        assert_eq!(inv.input["tools"][0]["strict"], true);
+        assert_eq!(inv.input["tools"][0]["cache"], "5m");
+        assert_eq!(
+            inv.input["tools"][0]["schema"]["schema"]["properties"]["command"]["type"],
+            "string"
+        );
+    }
 }

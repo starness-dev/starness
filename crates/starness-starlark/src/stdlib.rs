@@ -788,10 +788,12 @@ def confidence(event: dict, name: str) -> float | None:
     return float(val) if val != None else None
 "#;
 
-/// Virtual Starlark module source for `@starness/llm` (single-shot text & structured `Record` generation via `genai`).
+/// Virtual Starlark module source for `@starness/llm` (chat, tool calling, structured `Record` extraction, attachments, and caching via `genai`).
 pub const LLM_MODULE_ID: &str = "@starness/llm.star";
 pub const LLM_MODULE_SOURCE: &str = r#"
 ReasoningEffort = enum("zero", "minimal", "low", "medium", "high", "xhigh", "max")
+CachePolicy = enum("ephemeral", "memory", "5m", "1h", "24h")
+ToolChoice = enum("auto", "none", "required")
 
 llm_structured = __starness_llm_structured__
 
@@ -804,6 +806,14 @@ LlmModel = record(
     top_p = field(float | None, None),
     reasoning_effort = field(str | None, None),
 )
+
+def _normalize_cache(cache: CachePolicy | str | None) -> str | None:
+    if cache == None:
+        return None
+    raw = str(cache.value) if type(cache) == "enum" else str(cache).lower()
+    if raw not in ["ephemeral", "memory", "5m", "1h", "24h"]:
+        fail("`cache` must be one of `ephemeral`, `memory`, `5m`, `1h`, or `24h`, got `" + raw + "`")
+    return raw
 
 def llm_model(
     model: str,
@@ -843,12 +853,170 @@ def llm_model(
         reasoning_effort = effort_str,
     )
 
+def attachment(
+    *,
+    path: str | None = None,
+    base64: str | None = None,
+    url: str | None = None,
+    mime: str | None = None,
+    name: str | None = None,
+) -> dict:
+    sources = (1 if path != None else 0) + (1 if base64 != None else 0) + (1 if url != None else 0)
+    if sources != 1:
+        fail("attachment requires exactly one of `path`, `base64`, or `url`")
+    if path != None and path == "":
+        fail("attachment `path` must not be empty")
+    if base64 != None:
+        if base64 == "":
+            fail("attachment `base64` must not be empty")
+        if mime == None or mime == "":
+            fail("attachment with `base64` requires `mime` (e.g. `image/png`)")
+    if url != None:
+        if url == "":
+            fail("attachment `url` must not be empty")
+        if mime == None or mime == "":
+            fail("attachment with `url` requires `mime` (e.g. `image/png`)")
+    return {
+        "path": path,
+        "base64": base64,
+        "url": url,
+        "mime": mime,
+        "name": name,
+    }
+
+def system_msg(
+    text: str,
+    *,
+    cache: CachePolicy | str | None = None,
+) -> dict:
+    if text == "":
+        fail("system_msg `text` must not be empty")
+    return {
+        "role": "system",
+        "text": text,
+        "cache": _normalize_cache(cache),
+    }
+
+def user_msg(
+    text: str = "",
+    *,
+    attachments: list = [],
+    cache: CachePolicy | str | None = None,
+) -> dict:
+    if text == "" and len(attachments) == 0:
+        fail("user_msg requires non-empty `text` or at least one `attachment(...)`")
+    return {
+        "role": "user",
+        "text": text,
+        "attachments": attachments,
+        "cache": _normalize_cache(cache),
+    }
+
+def assistant_msg(
+    event_or_text,
+    *,
+    cache: CachePolicy | str | None = None,
+) -> dict:
+    cache_str = _normalize_cache(cache)
+    if type(event_or_text) == "string":
+        return {
+            "role": "assistant",
+            "text": event_or_text,
+            "cache": cache_str,
+        }
+    if type(event_or_text) == "dict":
+        out = event_or_text.get("output") if "output" in event_or_text else event_or_text
+        if type(out) == "dict":
+            if "$starness_llm_msg" in out:
+                msg = dict(out)
+                if cache_str != None:
+                    msg["cache"] = cache_str
+                return msg
+            if "message" in out and type(out["message"]) == "dict":
+                msg = dict(out["message"])
+                if cache_str != None:
+                    msg["cache"] = cache_str
+                return msg
+            if "text" in out:
+                return {
+                    "role": "assistant",
+                    "text": str(out["text"]),
+                    "cache": cache_str,
+                }
+    fail("assistant_msg expects a string or an @starness/llm `on_done` event dict")
+
+def tool_result(
+    call_or_id,
+    content,
+    *,
+    fn_name: str | None = None,
+    cache: CachePolicy | str | None = None,
+) -> dict:
+    call_id = ""
+    resolved_fn = fn_name
+    if type(call_or_id) == "dict":
+        raw_id = call_or_id.get("id")
+        call_id = str(raw_id) if raw_id != None else ""
+        if resolved_fn == None:
+            raw_name = call_or_id.get("name")
+            resolved_fn = str(raw_name) if raw_name != None else None
+    else:
+        call_id = str(call_or_id) if call_or_id != None else ""
+    if call_id == "":
+        fail("tool_result requires a non-empty tool call `id` or tool-call dict")
+    return {
+        "role": "tool",
+        "call_id": call_id,
+        "fn_name": resolved_fn,
+        "content": content,
+        "cache": _normalize_cache(cache),
+    }
+
+def tool_results_msg(
+    results: list,
+    *,
+    cache: CachePolicy | str | None = None,
+) -> dict:
+    if len(results) == 0:
+        fail("tool_results_msg requires at least one tool_result(...)")
+    for item in results:
+        if type(item) != "dict" or item.get("role") != "tool" or not item.get("call_id"):
+            fail("tool_results_msg items must be created with tool_result(...)")
+    return {
+        "role": "tool",
+        "results": results,
+        "cache": _normalize_cache(cache),
+    }
+
+def tool_def(
+    name: str,
+    *,
+    description: str = "",
+    schema = None,
+    strict: bool | None = None,
+    cache: CachePolicy | str | None = None,
+) -> dict:
+    if name == "":
+        fail("tool_def `name` must not be empty")
+    compiled_schema = __starness_derive_llm_schema__(schema)
+    return {
+        "name": name,
+        "description": description,
+        "schema": compiled_schema,
+        "strict": strict,
+        "cache": _normalize_cache(cache),
+    }
+
 def invoke_llm(
     *,
     model: LlmModel | str | typing.Callable,
-    prompt: str | typing.Callable,
+    prompt: str | typing.Callable | None = None,
+    messages: list | typing.Callable | None = None,
     system: str | typing.Callable | None = None,
+    system_cache: CachePolicy | str | None = None,
     context = None,
+    tools: list = [],
+    tool_choice: ToolChoice | str | None = None,
     schema = None,
     stream: bool = True,
     timeout_ms: int = 60000,
@@ -856,20 +1024,31 @@ def invoke_llm(
     on_done = None,
     on_error = None,
 ) -> Invoke:
-    if type(prompt) == "string" and prompt == "":
+    if prompt == None and messages == None:
+        fail("invoke_llm requires `prompt` or `messages`")
+    if type(prompt) == "string" and prompt == "" and messages == None:
         fail("invoke_llm `prompt` must not be empty")
     if timeout_ms <= 0:
         fail("invoke_llm `timeout_ms` must be > 0")
     model_or_fn = llm_model(model) if type(model) == "string" else model
     compiled_schema = __starness_derive_llm_schema__(schema)
+    choice_str = None
+    if tool_choice != None:
+        choice_str = str(tool_choice.value) if type(tool_choice) == "enum" else str(tool_choice)
+        if choice_str == "":
+            fail("invoke_llm `tool_choice` must not be empty")
     return invoke(
         src = "__starness_builtin_llm__",
         id = id,
         input = {
             "model": model_or_fn,
             "prompt": prompt,
+            "messages": messages,
             "system": system,
+            "system_cache": _normalize_cache(system_cache),
             "context": context,
+            "tools": tools,
+            "tool_choice": choice_str,
             "schema": compiled_schema,
             "stream": stream,
             "timeout_ms": timeout_ms,
@@ -884,6 +1063,20 @@ def llm_text(event: dict) -> str:
         fail("llm_text: event missing `output` dict")
     txt = out.get("text")
     return str(txt) if txt != None else ""
+
+def llm_tool_calls(event: dict) -> list[dict]:
+    out = event.get("output") if "output" in event else event
+    if type(out) != "dict":
+        fail("llm_tool_calls: event missing `output` dict")
+    calls = out.get("tool_calls")
+    return calls if calls != None else []
+
+def has_tool_calls(event: dict) -> bool:
+    return len(llm_tool_calls(event)) > 0
+
+def llm_tool_call(event: dict) -> dict | None:
+    calls = llm_tool_calls(event)
+    return calls[0] if len(calls) > 0 else None
 "#;
 
 /// Resolves a `@starness/*` virtual module path to `(canonical_module_id, source_code)`.
