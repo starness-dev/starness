@@ -1544,3 +1544,304 @@ chart = machine(
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn decide_support_triage_example_auto_refund_and_refusal_escalation() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Stdio;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let refuse_team = Arc::new(AtomicBool::new(false));
+    let refuse_flag = Arc::clone(&refuse_team);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Jev server");
+    let port = listener.local_addr().unwrap().port();
+
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0_u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            let body = if refuse_flag.load(Ordering::SeqCst) {
+                serde_json::json!({
+                    "id": "dec_refused_1",
+                    "model": "jev-1.14.0",
+                    "answers": {
+                        "refund_requested": { "type": "noul", "noul": 0.12 },
+                        "team": { "type": "refusal" },
+                        "urgency": {
+                            "type": "score",
+                            "score": 1.15,
+                            "confidence": 0.88,
+                            "probabilities": { "0": 0.10, "1": 0.70, "2": 0.15, "3": 0.05 }
+                        }
+                    },
+                    "usage": { "input_tokens": 92, "output_tokens": 24, "total_tokens": 116 }
+                })
+                .to_string()
+            } else {
+                serde_json::json!({
+                    "id": "dec_billing_1",
+                    "model": "jev-1.14.0",
+                    "answers": {
+                        "refund_requested": { "type": "noul", "noul": 0.96 },
+                        "team": {
+                            "type": "choice",
+                            "choice": "BILLING",
+                            "confidence": 0.94,
+                            "probabilities": {
+                                "BILLING": 0.93,
+                                "TECHNICAL": 0.04,
+                                "SECURITY": 0.02,
+                                "ACCOUNT": 0.01
+                            }
+                        },
+                        "urgency": {
+                            "type": "score",
+                            "score": 1.78,
+                            "confidence": 0.90,
+                            "probabilities": { "0": 0.02, "1": 0.23, "2": 0.70, "3": 0.05 }
+                        }
+                    },
+                    "usage": { "input_tokens": 92, "output_tokens": 28, "total_tokens": 120 }
+                })
+                .to_string()
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+
+    let ctx_patch = serde_json::json!({
+        "decision_endpoint": format!("http://127.0.0.1:{port}/v1/systemone"),
+    })
+    .to_string();
+
+    // Case 1: High-confidence billing refund -> auto-remediates via `issuing_refund` -> `resolved`!
+    let out1 = Command::new(bin_path())
+        .arg("run")
+        .arg(workspace_file("examples/support_triage_decide.star"))
+        .arg("--context")
+        .arg(&ctx_patch)
+        .arg("--trace")
+        .arg("-")
+        .output()
+        .expect("run support_triage_decide auto-refund");
+    let stdout1 = String::from_utf8_lossy(&out1.stdout);
+    let stderr1 = String::from_utf8_lossy(&out1.stderr);
+    assert!(out1.status.success(), "stdout:\n{stdout1}\nstderr:\n{stderr1}");
+
+    let recs1 = parse_jsonl(&stdout1);
+    assert!(
+        recs1
+            .iter()
+            .any(|r| r["kind"] == "transition" && r["to"] == serde_json::json!(["issuing_refund"])),
+        "expected transition through `issuing_refund`:\n{stdout1}"
+    );
+    let final1 = recs1.iter().rfind(|r| r["kind"] == "transition").unwrap();
+    assert_eq!(final1["to"], serde_json::json!(["resolved"]));
+    assert_eq!(final1["context"]["team"], "BILLING");
+    assert_eq!(final1["context"]["refund_approved"], true);
+    assert_eq!(final1["context"]["urgency"], "urgent");
+
+    // Case 2: Model refuses `team` (`optional = True`) -> enters `awaiting_human_triage`,
+    //         then human dispatches `{"type":"ASSIGN_TEAM","team":"TECHNICAL"}` over stdin!
+    refuse_team.store(true, Ordering::SeqCst);
+    let mut child2 = Command::new(bin_path())
+        .arg("run")
+        .arg(workspace_file("examples/support_triage_decide.star"))
+        .arg("--context")
+        .arg(&ctx_patch)
+        .arg("--events-stdin")
+        .arg("--trace")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn support_triage_decide refusal run");
+
+    {
+        let mut stdin = child2.stdin.take().unwrap();
+        writeln!(stdin, "sleep:80").unwrap();
+        writeln!(stdin, r#"{{"type":"ASSIGN_TEAM","team":"TECHNICAL"}}"#).unwrap();
+    }
+    let out2 = child2.wait_with_output().unwrap();
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
+    assert!(out2.status.success(), "stdout:\n{stdout2}\nstderr:\n{stderr2}");
+
+    let recs2 = parse_jsonl(&stdout2);
+    assert!(
+        recs2.iter().any(|r| {
+            r["kind"] == "transition" && r["to"] == serde_json::json!(["awaiting_human_triage"])
+        }),
+        "expected refusal to pause in `awaiting_human_triage`:\n{stdout2}"
+    );
+    let final2 = recs2.iter().rfind(|r| r["kind"] == "transition").unwrap();
+    assert_eq!(final2["to"], serde_json::json!(["resolved"]));
+    assert_eq!(final2["context"]["team"], "TECHNICAL");
+    assert_eq!(final2["context"]["urgency"], "today");
+}
+
+#[test]
+fn decide_openai_endpoint_resolves_secret_and_redacts_trace() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    let dir = std::env::temp_dir().join(format!(
+        "starchart_decide_openai_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let seen_auth = Arc::new(Mutex::new(String::new()));
+    let seen_auth_clone = Arc::clone(&seen_auth);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0_u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            *seen_auth_clone.lock().unwrap() = req;
+
+            let body = serde_json::json!({
+                "id": "resp_oai_1",
+                "model": "gpt-6-luna",
+                "answers": [
+                    { "name": "is_spam", "type": "predicate", "probability": 0.04 },
+                    {
+                        "name": "route",
+                        "type": "choice",
+                        "choice": "inbox",
+                        "confidence": 0.97,
+                        "probabilities": [
+                            { "value": "inbox", "probability": 0.96 },
+                            { "value": "quarantine", "probability": 0.04 }
+                        ]
+                    },
+                    {
+                        "name": "risk",
+                        "type": "score",
+                        "score": 0.1,
+                        "confidence": 0.95,
+                        "probabilities": [
+                            { "value": 0, "label": "low", "probability": 0.90 },
+                            { "value": 1, "label": "high", "probability": 0.10 }
+                        ]
+                    }
+                ],
+                "usage": { "input_tokens": 50, "output_tokens": 20, "total_tokens": 70 }
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+
+    let chart_path = dir.join("openai_decide.star");
+    std::fs::write(
+        &chart_path,
+        format!(
+            r#"
+load("@starchart/secrets", "secret")
+load("@starchart/decide", "choice", "invoke_decision", "is_yes", "level", "noul", "openai_decision", "score", "selected")
+
+Ctx = record(msg = field(str, "Quarterly report attached"), dest = field(str, ""), risk = field(str, ""))
+S = state_space("filtering", "accepted", "quarantined", "failed")
+
+chart = machine(
+    id = "openai_decide",
+    initial = S.filtering,
+    context = Ctx(),
+    states = {{
+        S.filtering: state(
+            invoke = invoke_decision(
+                provider = openai_decision(
+                    api_key = secret("STARCHART_TEST_DECIDE_OPENAI_KEY"),
+                    endpoint = "http://127.0.0.1:{port}/v1/decisions",
+                ),
+                evidence = lambda ctx, _ev: ctx.msg,
+                questions = {{
+                    "is_spam": noul("Is this message spam?"),
+                    "route": choice("Where should it go?", options = ["inbox", "quarantine"]),
+                    "risk": score("Risk level?", levels = {{"low": "Benign", "high": "Suspicious"}}),
+                }},
+                on_done = [
+                    outcome(
+                        target = S.quarantined,
+                        guard = lambda _ctx, ev: is_yes(ev, "is_spam"),
+                    ),
+                    outcome(
+                        target = S.accepted,
+                        assign = lambda ctx, ev: update(
+                            ctx,
+                            dest = selected(ev, "route") or "",
+                            risk = level(ev, "risk") or "",
+                        ),
+                    ),
+                ],
+                on_error = S.failed,
+            ),
+        ),
+        S.accepted: final_state(),
+        S.quarantined: final_state(),
+        S.failed: final_state(),
+    }},
+)
+"#
+        ),
+    )
+    .unwrap();
+
+    let out = Command::new(bin_path())
+        .arg("run")
+        .arg(&chart_path)
+        .arg("--trace")
+        .arg("-")
+        .env("STARCHART_TEST_DECIDE_OPENAI_KEY", "sk_openai_decide_secret_321")
+        .output()
+        .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(!stdout.contains("sk_openai_decide_secret_321"));
+    assert!(!stderr.contains("sk_openai_decide_secret_321"));
+    assert!(stdout.contains("<secret:STARCHART_TEST_DECIDE_OPENAI_KEY>"));
+
+    let raw_req = seen_auth.lock().unwrap().to_ascii_lowercase();
+    assert!(
+        raw_req.contains("authorization: bearer sk_openai_decide_secret_321"),
+        "expected Bearer header on wire:\n{raw_req}"
+    );
+
+    let recs = parse_jsonl(&stdout);
+    let final_tr = recs.iter().rfind(|r| r["kind"] == "transition").unwrap();
+    assert_eq!(
+        final_tr["to"],
+        serde_json::json!(["accepted"]),
+        "trace:\n{stdout}"
+    );
+    assert_eq!(final_tr["context"]["dest"], "inbox");
+    assert_eq!(final_tr["context"]["risk"], "low");
+}
