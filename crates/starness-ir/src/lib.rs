@@ -388,7 +388,10 @@ pub enum IrValidationError {
     #[error("secret descriptor at `{path}` cannot be stored in machine `context` (pass `secret(...)` only to outbound service inputs)")]
     SecretInContext { path: String },
 
-    #[error("UI spec on state `{state}` references unhandled or forbidden event `{event}` (allowed: {allowed})")]
+    #[error("UI view-sheet for machine `{machine}` references undeclared state `{state}`")]
+    UnknownUiState { machine: String, state: StateId },
+
+    #[error("UI view on state `{state}` references unhandled or forbidden event `{event}` (allowed: {allowed})")]
     UnknownUiEvent {
         state: StateId,
         event: String,
@@ -643,26 +646,6 @@ impl MachineDef {
                 }
             }
 
-            if let Some(ui_val) = record.node.meta.as_ref().and_then(|m| m.get("ui")) {
-                let ui_events = collect_ui_spec_events(ui_val);
-                if !ui_events.is_empty() {
-                    let allowed = Self::allowed_events_from_registry(state_id, &registry);
-                    for ev in ui_events {
-                        if !allowed.iter().any(|a| a == &ev) {
-                            let allowed_str = if allowed.is_empty() {
-                                "(none)".to_owned()
-                            } else {
-                                allowed.join(", ")
-                            };
-                            errors.push(IrValidationError::UnknownUiEvent {
-                                state: state_id.clone(),
-                                event: ev,
-                                allowed: allowed_str,
-                            });
-                        }
-                    }
-                }
-            }
         }
 
         if root_initial_valid && !has_duplicates {
@@ -952,16 +935,58 @@ impl MachineDef {
         }
         out
     }
+}
 
-    /// Resolves the active `json-render` UI spec for `active_states` (checking each active leaf and
-    /// its ancestors for `meta["ui"]`). If `meta["ui"]` is a `{"$state": "/pointer"}` binding,
-    /// resolves the RFC 6901 JSON Pointer against `context`.
-    pub fn resolve_ui_for_active_states(
+/// External view-sheet (`*.ui.json`) attaching `json-render` UI specs to a pure `.star` machine
+/// without coupling UI declarations into the statechart source.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UiViewSheet {
+    /// Machine ID this view-sheet targets (matched against [`MachineDef::id`]).
+    pub machine: String,
+    /// Per-state `json-render` specs (`{"root": ..., "elements": ...}` or `{"$state": "/ptr"}`).
+    #[serde(default)]
+    pub views: IndexMap<StateId, serde_json::Value>,
+    /// Tag-based `json-render` specs matched when no explicit state view matches.
+    #[serde(default)]
+    pub tag_views: IndexMap<String, serde_json::Value>,
+}
+
+impl UiViewSheet {
+    /// Parses a `*.ui.json` view-sheet from JSON text.
+    pub fn from_json_str(raw: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(raw)
+    }
+
+    /// Resolves the active `json-render` UI spec for `active_states`:
+    /// 1. Checks `self.views` by active state leaf -> ancestor;
+    /// 2. Else checks `self.tag_views` by active state tags (leaf -> ancestor);
+    /// 3. Supports both static `{root, elements}` specs and dynamic `{"$state": "/pointer"}` specs.
+    pub fn resolve_for_active_states(
         &self,
+        ir: &MachineDef,
         active_states: &[String],
         context: &serde_json::Value,
     ) -> Option<serde_json::Value> {
-        let registry = self.build_registry();
+        let registry = ir.build_registry();
+
+        // 1. Direct state views (leaf -> ancestor)
+        for active in active_states {
+            let leaf = active.rsplit('.').next().unwrap_or(active.as_str());
+            let mut cursor = Some(StateId::from(leaf));
+            while let Some(id) = cursor {
+                if let Some(ui_val) = self.views.get(&id)
+                    && let Some(resolved) = resolve_ui_spec_value(ui_val, context)
+                {
+                    return Some(resolved);
+                }
+                let Some(rec) = registry.get(&id) else {
+                    break;
+                };
+                cursor = rec.parent.clone();
+            }
+        }
+
+        // 2. Tag views (leaf -> ancestor)
         for active in active_states {
             let leaf = active.rsplit('.').next().unwrap_or(active.as_str());
             let mut cursor = Some(StateId::from(leaf));
@@ -969,15 +994,89 @@ impl MachineDef {
                 let Some(rec) = registry.get(&id) else {
                     break;
                 };
-                if let Some(ui_val) = rec.node.meta.as_ref().and_then(|m| m.get("ui"))
-                    && let Some(resolved) = resolve_ui_spec_value(ui_val, context)
-                {
-                    return Some(resolved);
+                for tag in &rec.node.tags {
+                    if let Some(ui_val) = self.tag_views.get(tag)
+                        && let Some(resolved) = resolve_ui_spec_value(ui_val, context)
+                    {
+                        return Some(resolved);
+                    }
                 }
                 cursor = rec.parent.clone();
             }
         }
+
         None
+    }
+
+    /// Statically validates this view-sheet against `ir`:
+    /// - Every key in `views` must refer to a declared state in `ir`.
+    /// - Every static action event in `views[state]` must be handled by an outgoing `on`
+    ///   transition on `state` or an ancestor (respecting `forbid`).
+    /// - Every static action event in `tag_views[tag]` must be handled by every state carrying `tag`.
+    pub fn validate_against(&self, ir: &MachineDef) -> Result<(), Vec<IrValidationError>> {
+        let registry = ir.build_registry();
+        let mut errors = Vec::new();
+
+        for (state_id, ui_val) in &self.views {
+            if !registry.contains_key(state_id) {
+                errors.push(IrValidationError::UnknownUiState {
+                    machine: ir.id.clone(),
+                    state: state_id.clone(),
+                });
+                continue;
+            }
+            let ui_events = collect_ui_spec_events(ui_val);
+            if !ui_events.is_empty() {
+                let allowed = MachineDef::allowed_events_from_registry(state_id, &registry);
+                for ev in ui_events {
+                    if !allowed.iter().any(|a| a == &ev) {
+                        let allowed_str = if allowed.is_empty() {
+                            "(none)".to_owned()
+                        } else {
+                            allowed.join(", ")
+                        };
+                        errors.push(IrValidationError::UnknownUiEvent {
+                            state: state_id.clone(),
+                            event: ev,
+                            allowed: allowed_str,
+                        });
+                    }
+                }
+            }
+        }
+
+        for (tag, ui_val) in &self.tag_views {
+            let ui_events = collect_ui_spec_events(ui_val);
+            if ui_events.is_empty() {
+                continue;
+            }
+            for (state_id, rec) in &registry {
+                if !rec.node.tags.iter().any(|t| t == tag) {
+                    continue;
+                }
+                let allowed = MachineDef::allowed_events_from_registry(state_id, &registry);
+                for ev in &ui_events {
+                    if !allowed.iter().any(|a| a == ev) {
+                        let allowed_str = if allowed.is_empty() {
+                            "(none)".to_owned()
+                        } else {
+                            allowed.join(", ")
+                        };
+                        errors.push(IrValidationError::UnknownUiEvent {
+                            state: state_id.clone(),
+                            event: ev.clone(),
+                            allowed: allowed_str,
+                        });
+                    }
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 }
 
@@ -1449,5 +1548,134 @@ mod tests {
             from: StateId::from("paused"),
             target: StateId::from("ghost_state"),
         }));
+    }
+
+    #[test]
+    fn ui_view_sheet_validates_states_events_forbids_and_tag_views() {
+        let mut states = IndexMap::new();
+        let mut review = StateNodeDef::atomic();
+        review.tags.push("review_gate".to_owned());
+        review.on.push(TransitionDef {
+            event: "APPROVE".to_owned(),
+            target: Some(StateId::from("done")),
+            guard: None,
+            actions: vec![],
+            assign: None,
+            reenter: false,
+            description: None,
+            forbidden: false,
+        });
+        review.on.push(TransitionDef {
+            event: "DELETE".to_owned(),
+            target: None,
+            guard: None,
+            actions: vec![],
+            assign: None,
+            reenter: false,
+            description: None,
+            forbidden: true,
+        });
+        states.insert(StateId::from("review"), review);
+        states.insert(StateId::from("done"), StateNodeDef::final_state());
+
+        let machine = MachineDef {
+            id: "doc_flow".into(),
+            initial: StateId::from("review"),
+            context: json!({
+                "dynamic_ui": {
+                    "root": "b1",
+                    "elements": { "b1": { "type": "Button", "props": { "label": "Go", "event": "APPROVE" } } }
+                }
+            }),
+            states,
+            output: None,
+            description: None,
+        };
+
+        // Valid view-sheet (direct state view + tag_view + dynamic $state pointer)
+        let valid_sheet = UiViewSheet::from_json_str(
+            r#"{
+                "machine": "doc_flow",
+                "views": {
+                    "review": { "$state": "/dynamic_ui" }
+                },
+                "tag_views": {
+                    "review_gate": {
+                        "root": "ok",
+                        "elements": {
+                            "ok": { "type": "Button", "props": { "label": "Approve", "event": "APPROVE" } }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(valid_sheet.validate_against(&machine), Ok(()));
+        let resolved = valid_sheet
+            .resolve_for_active_states(&machine, &["doc_flow.review".to_owned()], &machine.context)
+            .expect("should resolve $state pointer");
+        assert_eq!(resolved["root"], "b1");
+
+        // Fallback to tag_views when state has no direct view
+        let tag_only = UiViewSheet::from_json_str(
+            r#"{
+                "machine": "doc_flow",
+                "tag_views": {
+                    "review_gate": {
+                        "root": "ok",
+                        "elements": {
+                            "ok": { "type": "Button", "props": { "label": "Approve", "event": "APPROVE" } }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let resolved_tag = tag_only
+            .resolve_for_active_states(&machine, &["review".to_owned()], &machine.context)
+            .expect("should fall back to tag_views");
+        assert_eq!(resolved_tag["root"], "ok");
+
+        // Invalid view-sheet: unknown state + forbidden event + unhandled tag_view event
+        let invalid_sheet = UiViewSheet::from_json_str(
+            r#"{
+                "machine": "doc_flow",
+                "views": {
+                    "ghost": { "root": "x", "elements": {} },
+                    "review": {
+                        "root": "del",
+                        "elements": {
+                            "del": { "type": "Button", "props": { "label": "Del", "event": "DELETE" } }
+                        }
+                    }
+                },
+                "tag_views": {
+                    "review_gate": {
+                        "root": "bad",
+                        "elements": {
+                            "bad": { "type": "Button", "props": { "label": "Nope", "event": "NOPE" } }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let errs = invalid_sheet
+            .validate_against(&machine)
+            .expect_err("expected validation errors");
+        assert!(errs.contains(&IrValidationError::UnknownUiState {
+            machine: "doc_flow".to_owned(),
+            state: StateId::from("ghost"),
+        }));
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            IrValidationError::UnknownUiEvent { state, event, .. }
+            if state.as_str() == "review" && event == "DELETE"
+        )));
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            IrValidationError::UnknownUiEvent { state, event, .. }
+            if state.as_str() == "review" && event == "NOPE"
+        )));
     }
 }
