@@ -1,5 +1,5 @@
 # Live Bluesky Topic Radar (pure headless `.star` statechart — zero UI coupling):
-# - Queries Bluesky's public unauthenticated AppView API (`public.api.bsky.app`) for posts matching
+# - Queries Bluesky's public unauthenticated AppView API (`api.bsky.app`) for posts matching
 #   a topic (`"ai harness"` by default) across two parallel orthogonal regions (`latest` + `top`),
 #   each with per-region exponential backoff on HTTP 429/5xx or transient network errors.
 # - Deduplicates and summarizes posts into structured context (`summary_kv`, `posts_rows`, `digest_md`)
@@ -23,7 +23,7 @@ RadarEvent = enum(
 )
 
 RadarCtx = record(
-    api_base = field(str, "https://public.api.bsky.app"),
+    api_base = field(str, "https://api.bsky.app"),
     query = field(str, "ai harness"),
     limit = field(int, 10),
     poll_interval_ms = field(int, 30000),
