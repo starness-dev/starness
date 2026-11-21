@@ -1,7 +1,8 @@
 mod tui;
+mod tui_ratatui;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +11,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use indexmap::IndexMap;
 use serde_json::Value;
-use starness_ir::{ActionDef, StateId, StateKind, StateNodeDef};
+use starness_ir::{ActionDef, StateId, StateKind, StateNodeDef, UiViewSheet};
 use starness_runtime::builtins::acp::serve_chart_as_acp_agent;
 use starness_runtime::{
     HostCallbacks, ServeDefinition, ServeOptions, StarnessActor, StarnessSyncRunner,
@@ -54,6 +55,10 @@ enum Commands {
         /// Exported variable name holding the `StateMachine` (defaults to `chart`).
         #[arg(long, default_value = "chart")]
         export: String,
+
+        /// Optional external `*.ui.json` view-sheet file(s) or directory to validate against matching machines.
+        #[arg(long = "ui", value_name = "PATH")]
+        ui: Vec<PathBuf>,
     },
 
     /// Render a Mermaid `stateDiagram-v2` graph from a `.star` statechart file.
@@ -93,9 +98,13 @@ enum Commands {
         events_stdin: bool,
 
         /// Run an interactive terminal UI when the statechart waits for human input (renders
-        /// `@starness/ui` `json-render` specs or falls back to an `allowed_events` picker).
+        /// `--ui` `json-render` view-sheets or falls back to an `allowed_events` picker).
         #[arg(short = 'i', long = "interactive")]
         interactive: bool,
+
+        /// Optional external `*.ui.json` view-sheet file (or directory) for interactive TUI rendering.
+        #[arg(long = "ui", value_name = "PATH")]
+        ui: Option<PathBuf>,
 
         /// Write the full execution trace as JSON Lines to PATH (`-` for stdout; human-readable
         /// progress then moves to stderr). One record per line: `started`, `transition`,
@@ -113,6 +122,10 @@ enum Commands {
         /// Exported variable name holding the `StateMachine` (defaults to `chart`).
         #[arg(long, default_value = "chart")]
         export: String,
+
+        /// Optional external `*.ui.json` view-sheet file(s) or directory to attach to matching machines.
+        #[arg(long = "ui", value_name = "PATH")]
+        ui: Vec<PathBuf>,
 
         /// TCP address to bind (e.g. `127.0.0.1:8080` or `127.0.0.1:0` for an ephemeral port).
         #[arg(long, default_value = "127.0.0.1:8080")]
@@ -193,7 +206,7 @@ enum SecretsCommand {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Check { files, export } => run_check(&files, &export),
+        Commands::Check { files, export, ui } => run_check(&files, &export, &ui),
         Commands::Diagram { file, export } => run_diagram(&file, &export),
         Commands::Run {
             file,
@@ -203,6 +216,7 @@ fn main() -> ExitCode {
             events,
             events_stdin,
             interactive,
+            ui,
             trace,
         } => run_execute(
             &file,
@@ -212,14 +226,16 @@ fn main() -> ExitCode {
             &events,
             events_stdin,
             interactive,
+            ui.as_deref(),
             trace.as_deref(),
         ),
         Commands::Serve {
             paths,
             export,
+            ui,
             bind,
             db,
-        } => run_serve(&paths, &export, &bind, &db),
+        } => run_serve(&paths, &export, &ui, &bind, &db),
         Commands::Acp { file, export } => run_acp_server(&file, &export),
         Commands::Lsp => run_lsp(),
         Commands::Secrets { action } => run_secrets(action),
@@ -315,23 +331,120 @@ fn run_mcp_bridge(addr: &str, token: &str) -> ExitCode {
     }
 }
 
-fn run_check(files: &[PathBuf], export: &str) -> ExitCode {
+fn collect_ui_sheet_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            let entries = std::fs::read_dir(path)
+                .map_err(|err| format!("failed reading directory `{}`: {err}", path.display()))?;
+            let mut dir_files = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|err| {
+                    format!("failed reading entry in `{}`: {err}", path.display())
+                })?;
+                let p = entry.path();
+                if p.is_file()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.ends_with(".ui.json"))
+                {
+                    dir_files.push(p);
+                }
+            }
+            dir_files.sort();
+            files.extend(dir_files);
+        } else if path.is_file() {
+            files.push(path.clone());
+        } else {
+            return Err(format!("UI view-sheet path `{}` does not exist", path.display()));
+        }
+    }
+    Ok(files)
+}
+
+fn load_ui_view_sheets(paths: &[PathBuf]) -> Result<HashMap<String, (PathBuf, UiViewSheet)>, String> {
+    let files = collect_ui_sheet_files(paths)?;
+    let mut map = HashMap::new();
+    for file in files {
+        let raw = std::fs::read_to_string(&file)
+            .map_err(|err| format!("failed reading `{}`: {err}", file.display()))?;
+        let sheet = UiViewSheet::from_json_str(&raw)
+            .map_err(|err| format!("invalid UI view-sheet JSON in `{}`: {err}", file.display()))?;
+        if sheet.machine.trim().is_empty() {
+            return Err(format!(
+                "UI view-sheet `{}` is missing a non-empty `machine` id",
+                file.display()
+            ));
+        }
+        let machine_id = sheet.machine.clone();
+        if let Some((prev, _)) = map.insert(machine_id.clone(), (file.clone(), sheet)) {
+            return Err(format!(
+                "duplicate UI view-sheet for machine `{machine_id}` in `{}` and `{}`",
+                prev.display(),
+                file.display(),
+            ));
+        }
+    }
+    Ok(map)
+}
+
+fn run_check(files: &[PathBuf], export: &str, ui_paths: &[PathBuf]) -> ExitCode {
+    let mut ui_sheets = match load_ui_view_sheets(ui_paths) {
+        Ok(m) => m,
+        Err(msg) => {
+            eprintln!("ERROR {msg}");
+            return ExitCode::from(1);
+        }
+    };
+
     let mut had_error = false;
     for file in files {
         match compile_starlark_file(file, Some(export)) {
             Ok(compiled) => {
-                println!(
-                    "OK {} (machine `{}`, initial `{}`)",
-                    file.display(),
-                    compiled.ir.id,
-                    compiled.ir.initial
-                );
+                if let Some((ui_path, sheet)) = ui_sheets.remove(&compiled.ir.id) {
+                    match sheet.validate_against(&compiled.ir) {
+                        Ok(()) => {
+                            println!(
+                                "OK {} (machine `{}`, initial `{}`, ui `{}`)",
+                                file.display(),
+                                compiled.ir.id,
+                                compiled.ir.initial,
+                                ui_path.display()
+                            );
+                        }
+                        Err(errs) => {
+                            had_error = true;
+                            eprintln!(
+                                "ERROR {} (ui `{}`):",
+                                file.display(),
+                                ui_path.display()
+                            );
+                            for e in errs {
+                                eprintln!("  {e}");
+                            }
+                        }
+                    }
+                } else {
+                    println!(
+                        "OK {} (machine `{}`, initial `{}`)",
+                        file.display(),
+                        compiled.ir.id,
+                        compiled.ir.initial
+                    );
+                }
             }
             Err(err) => {
                 had_error = true;
                 eprintln!("ERROR {}:\n{err}", file.display());
             }
         }
+    }
+    for (machine_id, (ui_path, _)) in ui_sheets {
+        had_error = true;
+        eprintln!(
+            "ERROR UI view-sheet `{}` targets machine `{machine_id}`, which was not among the checked `.star` files",
+            ui_path.display()
+        );
     }
     if had_error {
         ExitCode::from(1)
@@ -370,6 +483,7 @@ fn run_execute(
     raw_events: &[String],
     events_stdin: bool,
     interactive: bool,
+    ui_path: Option<&Path>,
     trace_target: Option<&str>,
 ) -> ExitCode {
     let trace_out = match trace_target.map(open_trace_sink).transpose() {
@@ -385,6 +499,34 @@ fn run_execute(
             eprintln!("ERROR {}:\n{err}", file.display());
             return ExitCode::from(1);
         }
+    };
+
+    let ui_sheet = if let Some(path) = ui_path {
+        let mut sheets = match load_ui_view_sheets(&[path.to_path_buf()]) {
+            Ok(m) => m,
+            Err(msg) => {
+                eprintln!("ERROR {msg}");
+                return ExitCode::from(1);
+            }
+        };
+        let Some((sheet_path, sheet)) = sheets.remove(&compiled.ir.id) else {
+            eprintln!(
+                "ERROR no UI view-sheet in `{}` matches machine `{}`",
+                path.display(),
+                compiled.ir.id
+            );
+            return ExitCode::from(1);
+        };
+        if let Err(errs) = sheet.validate_against(&compiled.ir) {
+            eprintln!("ERROR invalid UI view-sheet `{}`:", sheet_path.display());
+            for e in errs {
+                eprintln!("  {e}");
+            }
+            return ExitCode::from(1);
+        }
+        Some(sheet)
+    } else {
+        None
     };
 
     if let Some(patch_str) = context_override {
@@ -424,6 +566,7 @@ fn run_execute(
             raw_events,
             events_stdin,
             interactive,
+            ui_sheet,
             trace_out,
         );
     }
@@ -518,6 +661,7 @@ fn build_cli_callbacks(
     callbacks
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_execute_async(
     compiled: CompiledChart,
     action_names: HashSet<String>,
@@ -525,6 +669,7 @@ fn run_execute_async(
     raw_events: &[String],
     events_stdin: bool,
     interactive: bool,
+    ui_sheet: Option<UiViewSheet>,
     trace_out: Option<TraceSink>,
 ) -> ExitCode {
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -548,7 +693,31 @@ fn run_execute_async(
             }
         };
         let trace_writer = trace_out.map(|sink| spawn_trace_writer(actor.subscribe_traces(), sink));
-        let code = drive_async(&compiled, &actor, raw_events, events_stdin, interactive).await;
+        let use_fullscreen_tui = interactive
+            && raw_events.is_empty()
+            && !events_stdin
+            && !HUMAN_TO_STDERR.load(Ordering::Relaxed)
+            && std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal();
+        let code = if use_fullscreen_tui {
+            match tui_ratatui::run_ratatui_app(&compiled, ui_sheet, &actor).await {
+                Ok(c) => c,
+                Err(err) => {
+                    eprintln!("ERROR running Ratatui TUI: {err:#}");
+                    ExitCode::from(1)
+                }
+            }
+        } else {
+            drive_async(
+                &compiled,
+                &actor,
+                raw_events,
+                events_stdin,
+                interactive,
+                ui_sheet.as_ref(),
+            )
+            .await
+        };
         actor.stop().await;
         actor.trace_hub().close();
         tokio::task::spawn_blocking(move || finish_trace_writer(trace_writer))
@@ -578,6 +747,7 @@ async fn drive_async(
     raw_events: &[String],
     events_stdin: bool,
     interactive: bool,
+    ui_sheet: Option<&UiViewSheet>,
 ) -> ExitCode {
     let init_ctx = actor.context().await.unwrap_or(Value::Null);
     say!(
@@ -659,6 +829,7 @@ async fn drive_async(
             if !has_autonomous && interactive {
                 let ctx = actor.context().await.unwrap_or(Value::Null);
                 let ir_clone = compiled.ir.clone();
+                let ui_clone = ui_sheet.cloned();
                 let states_clone = current_states.clone();
                 let use_stderr = HUMAN_TO_STDERR.load(Ordering::Relaxed);
                 let decision = tokio::task::spawn_blocking(move || {
@@ -669,6 +840,7 @@ async fn drive_async(
                         let mut locked_out = stderr.lock();
                         tui::prompt_interactive_event(
                             &ir_clone,
+                            ui_clone.as_ref(),
                             &states_clone,
                             &ctx,
                             &mut locked_in,
@@ -679,6 +851,7 @@ async fn drive_async(
                         let mut locked_out = stdout.lock();
                         tui::prompt_interactive_event(
                             &ir_clone,
+                            ui_clone.as_ref(),
                             &states_clone,
                             &ctx,
                             &mut locked_in,
@@ -943,9 +1116,22 @@ fn collect_star_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-fn run_serve(paths: &[PathBuf], export: &str, bind: &str, db: &str) -> ExitCode {
+fn run_serve(
+    paths: &[PathBuf],
+    export: &str,
+    ui_paths: &[PathBuf],
+    bind: &str,
+    db: &str,
+) -> ExitCode {
     let star_files = match collect_star_files(paths) {
         Ok(list) => list,
+        Err(msg) => {
+            eprintln!("ERROR {msg}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut ui_sheets = match load_ui_view_sheets(ui_paths) {
+        Ok(m) => m,
         Err(msg) => {
             eprintln!("ERROR {msg}");
             return ExitCode::from(1);
@@ -972,6 +1158,7 @@ fn run_serve(paths: &[PathBuf], export: &str, bind: &str, db: &str) -> ExitCode 
             );
             return ExitCode::from(1);
         }
+        let ui_sheet = ui_sheets.remove(&compiled.ir.id).map(|(_, s)| s);
         let mut action_names = HashSet::new();
         let mut service_names = HashSet::new();
         collect_actions_and_services(&compiled.ir.states, &mut action_names, &mut service_names);
@@ -980,6 +1167,7 @@ fn run_serve(paths: &[PathBuf], export: &str, bind: &str, db: &str) -> ExitCode 
         definitions.push(ServeDefinition {
             chart: compiled,
             callbacks,
+            ui_sheet,
         });
     }
 
@@ -1165,8 +1353,6 @@ fn build_builtin_lsp_interfaces(
         "@starness/decide.star",
         "@starness/llm",
         "@starness/llm.star",
-        "@starness/ui",
-        "@starness/ui.star",
     ] {
         if let Some((canon_id, src)) = resolve_builtin_module(alias)
             && let Ok(ast) = AstModule::parse(canon_id, src.to_owned(), &dialect)

@@ -39,3 +39,5 @@ rusqlite = { version = "0.43", default-features = false, features = ["cache", "l
 secrecy = "0.10"
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "io-std", "net"] }
 clap = { version = "4.5", features = ["derive"] }
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }

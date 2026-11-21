@@ -9,7 +9,7 @@
 use std::io::{BufRead, Write};
 
 use serde_json::{Map, Value, json};
-use starness_ir::MachineDef;
+use starness_ir::{MachineDef, UiViewSheet};
 
 /// Outcome of one interactive terminal prompt cycle.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +35,7 @@ struct MarkdownSection {
 /// UI spec or an auto-generated fallback picker of `allowed_events`.
 pub fn prompt_interactive_event<R: BufRead, W: Write>(
     ir: &MachineDef,
+    ui_sheet: Option<&UiViewSheet>,
     active_states: &[String],
     context: &Value,
     reader: &mut R,
@@ -45,7 +46,9 @@ pub fn prompt_interactive_event<R: BufRead, W: Write>(
         return Ok(InteractiveDecision::Quit);
     }
 
-    if let Some(ui_spec) = ir.resolve_ui_for_active_states(active_states, context) {
+    if let Some(ui_spec) =
+        ui_sheet.and_then(|s| s.resolve_for_active_states(ir, active_states, context))
+    {
         return run_ui_spec_prompt(&ui_spec, active_states, context, &allowed, reader, writer);
     }
 
@@ -724,8 +727,6 @@ mod tests {
     #[test]
     fn tui_markdown_review_attaches_anchored_comment_and_dispatches_revise() {
         let src = r##"
-load("@starness/ui", "ui_bind", "ui_markdown_review", "ui_spec")
-
 Ctx = record(
     plan = field(str, "# Goal\nShip UI\n\n## Steps\n- Add TUI"),
     notes = field(list[dict], [{"heading": "Steps", "note": "Check non-TTY tests"}]),
@@ -739,16 +740,6 @@ chart = machine(
     context = Ctx(),
     states = {
         S.reviewing: state(
-            ui = ui_spec(
-                ui_markdown_review(
-                    "Plan Review",
-                    markdown = ui_bind("/plan"),
-                    agent_notes = ui_bind("/notes"),
-                    comments_path = "/draft_comments",
-                    approve_event = "APPROVE",
-                    revise_event = "REQUEST_CHANGES",
-                ),
-            ),
             on = [
                 transition(event = "APPROVE", target = S.done),
                 internal_transition(event = "REQUEST_CHANGES"),
@@ -758,11 +749,37 @@ chart = machine(
     },
 )
 "##;
+        let ui_sheet = UiViewSheet::from_json_str(
+            r#"{
+                "machine": "tui_review_test",
+                "views": {
+                    "reviewing": {
+                        "root": "review",
+                        "elements": {
+                            "review": {
+                                "type": "MarkdownReview",
+                                "props": {
+                                    "title": "Plan Review",
+                                    "markdown": {"$state": "/plan"},
+                                    "agent_notes": {"$state": "/notes"},
+                                    "comments_path": "/draft_comments",
+                                    "approve_event": "APPROVE",
+                                    "revise_event": "REQUEST_CHANGES"
+                                }
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
         let compiled = compile_starlark_str("tui_review_test.star", src, None).unwrap();
+        assert_eq!(ui_sheet.validate_against(&compiled.ir), Ok(()));
         let mut input = Cursor::new("c 2 Please add retry logic\nr\n");
         let mut output = Vec::new();
         let decision = prompt_interactive_event(
             &compiled.ir,
+            Some(&ui_sheet),
             &["reviewing".to_owned()],
             &compiled.ir.context,
             &mut input,
@@ -811,6 +828,7 @@ chart = machine(
         let mut output = Vec::new();
         let decision = prompt_interactive_event(
             &compiled.ir,
+            None,
             &["waiting".to_owned()],
             &compiled.ir.context,
             &mut input,
