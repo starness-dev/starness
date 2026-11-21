@@ -2286,3 +2286,143 @@ fn coding_session_llm_example_runs_multiturn_tool_loop_and_exits() {
     assert_eq!(final_tr["context"]["turns"], 1);
     assert_eq!(final_tr["context"]["last_reply"], "Observed starness_repl_ok");
 }
+
+#[test]
+fn plan_review_ui_interactive_tui_revises_with_anchored_comments_and_approves() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(bin_path())
+        .arg("run")
+        .arg("-i")
+        .arg(workspace_file("examples/plan_review_ui.star"))
+        .arg("--trace")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn interactive plan_review_ui");
+
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        // Attach a section-anchored comment to section 2 ("Architecture"), request changes, then approve rev 2!
+        writeln!(stdin, "c 2 Add CORS headers to serve.rs").unwrap();
+        writeln!(stdin, "r").unwrap();
+        writeln!(stdin, "a").unwrap();
+    }
+
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("Agent note:"),
+        "expected TUI to display agent notes on stderr:\n{stderr}"
+    );
+
+    let recs = parse_jsonl(&stdout);
+    let final_tr = recs.iter().rfind(|r| r["kind"] == "transition").unwrap();
+    assert_eq!(final_tr["to"], serde_json::json!(["approved"]));
+    assert_eq!(final_tr["context"]["revision"], 2);
+    assert!(
+        final_tr["context"]["plan"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Add CORS headers to serve.rs"),
+        "expected addressed comment in revised plan:\n{}",
+        final_tr["context"]["plan"]
+    );
+}
+
+#[test]
+fn serve_exposes_active_ui_allowed_events_and_embedded_web_studio() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let mut child = Command::new(bin_path())
+        .arg("serve")
+        .arg(workspace_file("examples/plan_review_ui.star"))
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn starness serve");
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut first_line = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut first_line).unwrap();
+    let addr = first_line
+        .split("http://")
+        .nth(1)
+        .expect("listening url")
+        .trim()
+        .to_owned();
+
+    let send_raw = |req: &str| -> String {
+        let mut stream = TcpStream::connect(&addr).unwrap();
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        resp
+    };
+
+    // 1. Embedded Web Studio at GET /ui
+    let ui_resp = send_raw("GET /ui HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    assert!(ui_resp.starts_with("HTTP/1.1 200 OK"), "ui_resp:\n{ui_resp}");
+    assert!(ui_resp.contains("Starness Studio"));
+
+    // 2. Create instance -> snapshot includes `ui` and `allowed_events`
+    let create_resp = send_raw(
+        "POST /machines/plan_review_ui/instances HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+    );
+    let create_body = create_resp.split("\r\n\r\n").nth(1).unwrap();
+    let created: serde_json::Value = serde_json::from_str(create_body).unwrap();
+    let id = created["id"].as_str().unwrap().to_owned();
+    assert_eq!(created["status"], "waiting");
+    assert_eq!(created["ui"]["root"], "n0");
+    assert_eq!(
+        created["allowed_events"],
+        serde_json::json!(["APPROVE", "REQUEST_CHANGES", "ABORT"])
+    );
+
+    // 3. Send REQUEST_CHANGES with anchored comments -> loops back to revision 2
+    let rev_payload = serde_json::json!({
+        "type": "REQUEST_CHANGES",
+        "comments": [{"heading": "Architecture", "quote": "", "comment": "Clarify fallback form"}]
+    })
+    .to_string();
+    let rev_req = format!(
+        "POST /machines/plan_review_ui/instances/{id}/events HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{rev_payload}",
+        rev_payload.len()
+    );
+    let rev_resp = send_raw(&rev_req);
+    let rev_body = rev_resp.split("\r\n\r\n").nth(1).unwrap();
+    let revised: serde_json::Value = serde_json::from_str(rev_body).unwrap();
+    assert_eq!(revised["status"], "waiting");
+    assert_eq!(revised["context"]["revision"], 2);
+    assert!(
+        revised["context"]["plan"]
+            .as_str()
+            .unwrap()
+            .contains("Clarify fallback form")
+    );
+
+    // 4. Send APPROVE -> completed with empty allowed_events and null ui
+    let app_payload = r#"{"type":"APPROVE"}"#;
+    let app_req = format!(
+        "POST /machines/plan_review_ui/instances/{id}/events HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{app_payload}",
+        app_payload.len()
+    );
+    let app_resp = send_raw(&app_req);
+    let app_body = app_resp.split("\r\n\r\n").nth(1).unwrap();
+    let approved: serde_json::Value = serde_json::from_str(app_body).unwrap();
+    assert_eq!(approved["status"], "completed");
+    assert_eq!(approved["allowed_events"], serde_json::json!([]));
+    assert!(approved["ui"].is_null());
+
+    let _ = child.kill();
+    let _ = child.wait();
+}

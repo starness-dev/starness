@@ -40,6 +40,7 @@ Never use a heavyweight autonomous agent for work that belongs to a lighter, fas
 | External tool server | `@starness/mcp` | Deterministic MCP tool calls over `stdio` or Streamable HTTP |
 | REST API / webhook | `@starness/http` | Async HTTP/JSON requests cancelled automatically on state exit |
 | Shell command / build / test / CLI | `@starness/exec` | Subprocess execution with automatic `kill_on_drop` cancellation on state exit |
+| Human-in-the-loop UI (Web & TUI) | `@starness/ui` | `json-render` specs (`ui_spec`, `ui_markdown_review`, `ui_bind`, buttons/inputs) with static event verification, embedded Web Studio (`/ui`), and `starness run -i` |
 | API keys & tokens | `@starness/secrets` | Late-bound `env` / `file` / OS `keychain` secrets scrubbed as `<secret:NAME>` from traces & errors |
 
 > Read [`references/modules.md`](references/modules.md) for when, why, and how to use each `@starness/*` module with full idioms and signatures.

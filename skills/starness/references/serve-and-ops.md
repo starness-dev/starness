@@ -14,6 +14,9 @@ starness run workflow.star --context '{"repo":"floodfx/starness"}' --trace -
 
 # Interactive / human-in-the-loop workflow (events sent line-by-line on stdin)
 starness run examples/coding_session_llm.star --events-stdin --trace session.jsonl
+
+# Interactive terminal TUI (renders @starness/ui specs or falls back to an allowed_events picker)
+starness run -i examples/plan_review_ui.star
 ```
 
 **Stdin event formats (`--events-stdin`):**
@@ -76,11 +79,13 @@ curl -s -X DELETE "http://127.0.0.1:8080/machines/coding_session_llm/instances/$
 ```
 
 ### All HTTP Routes
+- `GET /ui` (or `GET /` with `Accept: text/html`) — Embedded Starness Studio (`@json-render/react` + `<MarkdownReview>` + Mermaid diagram + live SSE trace). Set `STARNESS_UI_DIR` to serve a custom local build.
 - `GET /health` — Liveness, loaded machines, live actor count, DB target.
 - `GET /trace` — Server-wide SSE / JSONL firehose across all machines and instances.
 - `GET /machines` / `GET /machines/:machine` / `GET /machines/:machine/diagram`.
 - `POST /machines/:machine/instances` / `GET /machines/:machine/instances` (`?status=active|waiting|completed|failed|cancelled`).
-- `GET /machines/:machine/instances/:id` / `DELETE /machines/:machine/instances/:id` (`?purge=true`).
+- `GET /machines/:machine/instances/:id` — Returns `InstanceSnapshot` enriched with active `ui` spec and `allowed_events`.
+- `DELETE /machines/:machine/instances/:id` (`?purge=true`).
 - `POST /machines/:machine/instances/:id/events` / `POST /machines/:machine/instances/:id/cancel`.
 - `GET /machines/:machine/instances/:id/trace` (SSE or `?format=jsonl`).
 

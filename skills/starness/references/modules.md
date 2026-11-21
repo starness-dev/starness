@@ -230,3 +230,38 @@ secret("OPENAI_API_KEY")                                                        
 secret("/run/secrets/db_pass", source = SecretSource.file)                      # file on disk
 secret("PROD_TOKEN", source = SecretSource.keychain, service = "starness", prefix = "Bearer ", optional = False)
 ```
+
+---
+
+## 7. `@starness/ui` — Declarative & Generative `json-render` UIs
+
+**When & Why:** Attach interactive human-in-the-loop interfaces directly to any waiting `state(..., ui = ui_spec(...))` or `compound_state(...)` — or bind dynamically to a spec generated into `context` via `state(..., ui = ui_bind("/generated_ui"))`. Static UI button/review events are verified by `starness check` against outgoing `on` transitions (excluding `forbid`s), and the same spec renders in both the embedded Web Studio (`starness serve` → `/ui`) and the terminal TUI (`starness run -i`).
+
+```python
+load(
+    "@starness/ui",
+    "ui_badge", "ui_bind", "ui_button", "ui_card", "ui_confirm", "ui_key_value",
+    "ui_markdown", "ui_markdown_review", "ui_select", "ui_spec", "ui_stack",
+    "ui_table", "ui_text_input", "ui_textarea",
+)
+
+S.human_review: state(
+    ui = ui_spec(
+        ui_stack([
+            ui_card("Status", [ui_badge(ui_bind("/status"), variant = "warning")]),
+            ui_markdown_review(
+                "Implementation Plan",
+                markdown = ui_bind("/plan"),
+                agent_notes = ui_bind("/notes"),
+                comments_path = "/draft_comments",
+                approve_event = "APPROVE",
+                revise_event = "REQUEST_CHANGES",
+            ),
+        ]),
+    ),
+    on = [
+        transition(event = "APPROVE", target = S.approved),
+        transition(event = "REQUEST_CHANGES", target = S.revising, assign = capture_comments),
+    ],
+)
+```
