@@ -1,47 +1,35 @@
-# Interactive human-in-the-loop Markdown plan review statechart using `@starness/ui`:
-# - Renders a `json-render` UI (`ui_markdown_review`) in BOTH:
-#     1. Web Studio: `starness serve examples/plan_review_ui.star --bind 127.0.0.1:8080` -> open http://127.0.0.1:8080/ui
-#     2. Terminal TUI: `starness run -i examples/plan_review_ui.star`
-# - Displays structured Markdown sections alongside inline agent review notes, lets a human attach
-#   anchored section comments (`[{heading, quote, comment}]`), loops through `revising` on
-#   `REQUEST_CHANGES`, and completes cleanly on `APPROVE`.
-
-load(
-    "@starness/ui",
-    "ui_badge",
-    "ui_bind",
-    "ui_button",
-    "ui_card",
-    "ui_key_value",
-    "ui_markdown_review",
-    "ui_spec",
-    "ui_stack",
-)
+# Pure headless Markdown plan review statechart (zero UI coupling in `.star`):
+# - Run headlessly or with an auto-generated fallback picker:
+#     starness run -i examples/plan_review.star
+# - Attach the optional external view-sheet (`examples/plan_review.ui.json`) for rich TUI / Web Studio:
+#     starness check examples/plan_review.star --ui examples/plan_review.ui.json
+#     starness run -i examples/plan_review.star --ui examples/plan_review.ui.json
+#     starness serve examples/plan_review.star --ui examples/plan_review.ui.json --bind 127.0.0.1:8080
 
 ReviewEvent = enum("APPROVE", "REQUEST_CHANGES", "ABORT")
 
 INITIAL_PLAN = """# Goal
-Add declarative and generative UI support to Starness using `json-render`.
+Decouple workflow statecharts from UI presentation using external `*.ui.json` view-sheets.
 
 ## Architecture
-- Provide `@starness/ui` helpers compiling to `json-render` `{root, elements}` specs.
-- Validate static UI button event names against outgoing state transitions in `starness check`.
-- Expose active `ui` and `allowed_events` on `starness serve` instance snapshots.
+- Keep `.star` workflows 100% pure headless statecharts with zero UI imports.
+- Attach optional `*.ui.json` `json-render` view-sheets via `--ui` for both Web Studio and Ratatui TUI.
+- Validate view-sheet state IDs and action events statically in `starness check --ui`.
 
 ## Verification
 - Run `cargo clippy --workspace --all-targets -- -D warnings`.
-- Run `cargo test --workspace` and `starness check examples/*.star`."""
+- Run `cargo test --workspace` and `starness check examples/plan_review.star --ui examples/plan_review.ui.json`."""
 
 INITIAL_NOTES = [
     {
         "heading": "Architecture",
         "severity": "info",
-        "note": "Static UI event validation runs during `starness check` before any runtime execution.",
+        "note": "View-sheet event validation runs during `starness check --ui` before any runtime execution.",
     },
     {
         "heading": "Verification",
         "severity": "warning",
-        "note": "Confirm both non-TTY TUI tests and `starness serve` HTTP integration tests pass.",
+        "note": "Confirm both interactive TUI tests (with and without `--ui`) and `starness serve` HTTP tests pass.",
     },
 ]
 
@@ -72,9 +60,11 @@ def apply_revisions(ctx: PlanCtx, _ev: dict) -> PlanCtx:
     additions = []
     for c in ctx.draft_comments:
         heading = str(c.get("heading", "General"))
+        line_no = c.get("line", None)
+        loc = heading + (" L" + str(line_no) if line_no != None else "")
         comment = str(c.get("comment", ""))
         if comment != "":
-            additions.append("- [" + heading + "] Addressed: " + comment)
+            additions.append("- [" + loc + "] Addressed: " + comment)
     revision_block = "\n\n## Revision " + str(next_rev) + " Updates\n" + (
         "\n".join(additions) if len(additions) > 0 else "- General refinement applied."
     )
@@ -92,32 +82,13 @@ def apply_revisions(ctx: PlanCtx, _ev: dict) -> PlanCtx:
     )
 
 chart: StateMachine = machine(
-    id = "plan_review_ui",
-    description = "Interactive Markdown plan review loop powered by @starness/ui (Web Studio & TUI)",
+    id = "plan_review",
+    description = "Pure headless Markdown plan review loop (pair with examples/plan_review.ui.json)",
     initial = S.human_review,
     context = PlanCtx(),
     states = {
         S.human_review: state(
-            ui = ui_spec(
-                ui_stack([
-                    ui_card(
-                        "Plan Review Status",
-                        [
-                            ui_badge(ui_bind("/status_label"), variant = "warning"),
-                            ui_key_value(ui_bind("/meta_summary")),
-                        ],
-                    ),
-                    ui_markdown_review(
-                        "Implementation Plan",
-                        markdown = ui_bind("/plan"),
-                        agent_notes = ui_bind("/notes"),
-                        comments_path = "/draft_comments",
-                        approve_event = ReviewEvent.APPROVE,
-                        revise_event = ReviewEvent.REQUEST_CHANGES,
-                    ),
-                    ui_button("Abort Plan", event = ReviewEvent.ABORT, variant = "danger"),
-                ]),
-            ),
+            tags = ["review_gate"],
             on = [
                 transition(event = ReviewEvent.APPROVE, target = S.approved),
                 transition(
@@ -129,7 +100,8 @@ chart: StateMachine = machine(
             ],
         ),
         S.revising: state(
-            always = outcome(target = S.human_review, assign = apply_revisions),
+            # Brief simulated revision delay so state transitions and the live spinner are visible
+            after = after(delay = 1200, target = S.human_review, assign = apply_revisions),
         ),
         S.approved: final_state(output = {"status": "approved"}),
         S.aborted: final_state(output = {"status": "aborted"}),

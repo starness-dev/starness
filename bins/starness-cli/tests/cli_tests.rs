@@ -2288,21 +2288,73 @@ fn coding_session_llm_example_runs_multiturn_tool_loop_and_exits() {
 }
 
 #[test]
-fn plan_review_ui_interactive_tui_revises_with_anchored_comments_and_approves() {
+fn check_validates_external_ui_view_sheet_and_rejects_invalid_views() {
+    // 1. Valid view-sheet passes `starness check --ui`
+    let ok = Command::new(bin_path())
+        .arg("check")
+        .arg(workspace_file("examples/plan_review.star"))
+        .arg("--ui")
+        .arg(workspace_file("examples/plan_review.ui.json"))
+        .output()
+        .expect("run starness check --ui");
+    let stdout = String::from_utf8_lossy(&ok.stdout);
+    let stderr = String::from_utf8_lossy(&ok.stderr);
+    assert!(ok.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("plan_review.ui.json"));
+
+    // 2. Invalid view-sheet (unknown state + unhandled event) fails `starness check --ui`
+    let bad_path = std::env::temp_dir().join("starness_bad_view_sheet_test.ui.json");
+    std::fs::write(
+        &bad_path,
+        r#"{
+            "machine": "plan_review",
+            "views": {
+                "ghost_state": { "root": "a", "elements": {} },
+                "human_review": {
+                    "root": "btn",
+                    "elements": {
+                        "btn": { "type": "Button", "props": { "label": "Oops", "event": "TYPO_EVENT" } }
+                    }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let bad = Command::new(bin_path())
+        .arg("check")
+        .arg(workspace_file("examples/plan_review.star"))
+        .arg("--ui")
+        .arg(&bad_path)
+        .output()
+        .expect("run invalid starness check --ui");
+    let _ = std::fs::remove_file(&bad_path);
+    assert!(!bad.status.success());
+    let bad_err = String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        bad_err.contains("ghost_state") && bad_err.contains("TYPO_EVENT"),
+        "expected unknown state & event errors, got:\n{bad_err}"
+    );
+}
+
+#[test]
+fn plan_review_interactive_tui_with_ui_sheet_and_zero_config_fallback() {
     use std::io::Write;
     use std::process::Stdio;
 
+    // 1. With `--ui examples/plan_review.ui.json`: rich MarkdownReview commenting + revision loop
     let mut child = Command::new(bin_path())
         .arg("run")
         .arg("-i")
-        .arg(workspace_file("examples/plan_review_ui.star"))
+        .arg(workspace_file("examples/plan_review.star"))
+        .arg("--ui")
+        .arg(workspace_file("examples/plan_review.ui.json"))
         .arg("--trace")
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn interactive plan_review_ui");
+        .expect("spawn interactive plan_review with --ui");
 
     {
         let mut stdin = child.stdin.take().unwrap();
@@ -2333,6 +2385,34 @@ fn plan_review_ui_interactive_tui_revises_with_anchored_comments_and_approves() 
         "expected addressed comment in revised plan:\n{}",
         final_tr["context"]["plan"]
     );
+
+    // 2. Without `--ui`: zero-config fallback picker lets user pick `[1] APPROVE` directly
+    let mut fallback = Command::new(bin_path())
+        .arg("run")
+        .arg("-i")
+        .arg(workspace_file("examples/plan_review.star"))
+        .arg("--trace")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn interactive plan_review without --ui");
+    {
+        let mut stdin = fallback.stdin.take().unwrap();
+        writeln!(stdin, "1").unwrap();
+    }
+    let fb_out = fallback.wait_with_output().unwrap();
+    let fb_stdout = String::from_utf8_lossy(&fb_out.stdout);
+    let fb_stderr = String::from_utf8_lossy(&fb_out.stderr);
+    assert!(
+        fb_out.status.success(),
+        "fallback stdout:\n{fb_stdout}\nstderr:\n{fb_stderr}"
+    );
+    assert!(fb_stderr.contains("Waiting in [human_review]"));
+    let fb_recs = parse_jsonl(&fb_stdout);
+    let fb_tr = fb_recs.iter().rfind(|r| r["kind"] == "transition").unwrap();
+    assert_eq!(fb_tr["to"], serde_json::json!(["approved"]));
 }
 
 #[test]
@@ -2342,7 +2422,9 @@ fn serve_exposes_active_ui_allowed_events_and_embedded_web_studio() {
 
     let mut child = Command::new(bin_path())
         .arg("serve")
-        .arg(workspace_file("examples/plan_review_ui.star"))
+        .arg(workspace_file("examples/plan_review.star"))
+        .arg("--ui")
+        .arg(workspace_file("examples/plan_review.ui.json"))
         .arg("--bind")
         .arg("127.0.0.1:0")
         .stdout(std::process::Stdio::piped())
@@ -2374,33 +2456,44 @@ fn serve_exposes_active_ui_allowed_events_and_embedded_web_studio() {
     assert!(ui_resp.starts_with("HTTP/1.1 200 OK"), "ui_resp:\n{ui_resp}");
     assert!(ui_resp.contains("Starness Studio"));
 
-    // 2. Create instance -> snapshot includes `ui` and `allowed_events`
+    // 2. Create instance -> snapshot includes resolved external `ui` and `allowed_events`
     let create_resp = send_raw(
-        "POST /machines/plan_review_ui/instances HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        "POST /machines/plan_review/instances HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
     );
     let create_body = create_resp.split("\r\n\r\n").nth(1).unwrap();
     let created: serde_json::Value = serde_json::from_str(create_body).unwrap();
     let id = created["id"].as_str().unwrap().to_owned();
     assert_eq!(created["status"], "waiting");
-    assert_eq!(created["ui"]["root"], "n0");
+    assert_eq!(created["ui"]["root"], "root");
     assert_eq!(
         created["allowed_events"],
         serde_json::json!(["APPROVE", "REQUEST_CHANGES", "ABORT"])
     );
 
-    // 3. Send REQUEST_CHANGES with anchored comments -> loops back to revision 2
+    // 3. Send REQUEST_CHANGES with anchored comments -> enters `revising`, then loops back to revision 2
     let rev_payload = serde_json::json!({
         "type": "REQUEST_CHANGES",
         "comments": [{"heading": "Architecture", "quote": "", "comment": "Clarify fallback form"}]
     })
     .to_string();
     let rev_req = format!(
-        "POST /machines/plan_review_ui/instances/{id}/events HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{rev_payload}",
+        "POST /machines/plan_review/instances/{id}/events HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{rev_payload}",
         rev_payload.len()
     );
     let rev_resp = send_raw(&rev_req);
     let rev_body = rev_resp.split("\r\n\r\n").nth(1).unwrap();
-    let revised: serde_json::Value = serde_json::from_str(rev_body).unwrap();
+    let mut revised: serde_json::Value = serde_json::from_str(rev_body).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while revised["context"]["revision"].as_u64() != Some(2)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let poll_resp = send_raw(&format!(
+            "GET /machines/plan_review/instances/{id} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        ));
+        let poll_body = poll_resp.split("\r\n\r\n").nth(1).unwrap();
+        revised = serde_json::from_str(poll_body).unwrap();
+    }
     assert_eq!(revised["status"], "waiting");
     assert_eq!(revised["context"]["revision"], 2);
     assert!(
@@ -2413,7 +2506,7 @@ fn serve_exposes_active_ui_allowed_events_and_embedded_web_studio() {
     // 4. Send APPROVE -> completed with empty allowed_events and null ui
     let app_payload = r#"{"type":"APPROVE"}"#;
     let app_req = format!(
-        "POST /machines/plan_review_ui/instances/{id}/events HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{app_payload}",
+        "POST /machines/plan_review/instances/{id}/events HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{app_payload}",
         app_payload.len()
     );
     let app_resp = send_raw(&app_req);

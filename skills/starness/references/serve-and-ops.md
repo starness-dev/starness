@@ -15,8 +15,15 @@ starness run workflow.star --context '{"repo":"floodfx/starness"}' --trace -
 # Interactive / human-in-the-loop workflow (events sent line-by-line on stdin)
 starness run examples/coding_session_llm.star --events-stdin --trace session.jsonl
 
-# Interactive terminal TUI (renders @starness/ui specs or falls back to an allowed_events picker)
-starness run -i examples/plan_review_ui.star
+# Validate a statechart and its optional external UI view-sheet
+starness check examples/plan_review.star --ui examples/plan_review.ui.json
+
+# Interactive terminal TUI (renders --ui view-sheet or falls back to an allowed_events picker)
+starness run -i examples/plan_review.star --ui examples/plan_review.ui.json
+starness run -i examples/plan_review.star
+
+# Multi-machine HTTP + SSE daemon + embedded Web Studio (/ui)
+starness serve examples/plan_review.star --ui examples/plan_review.ui.json --bind 127.0.0.1:8080
 ```
 
 **Stdin event formats (`--events-stdin`):**

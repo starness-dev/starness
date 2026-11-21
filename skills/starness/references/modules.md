@@ -233,35 +233,36 @@ secret("PROD_TOKEN", source = SecretSource.keychain, service = "starness", prefi
 
 ---
 
-## 7. `@starness/ui` — Declarative & Generative `json-render` UIs
+## 7. External UI View-Sheets (`*.ui.json` via `--ui`)
 
-**When & Why:** Attach interactive human-in-the-loop interfaces directly to any waiting `state(..., ui = ui_spec(...))` or `compound_state(...)` — or bind dynamically to a spec generated into `context` via `state(..., ui = ui_bind("/generated_ui"))`. Static UI button/review events are verified by `starness check` against outgoing `on` transitions (excluding `forbid`s), and the same spec renders in both the embedded Web Studio (`starness serve` → `/ui`) and the terminal TUI (`starness run -i`).
+**When & Why:** `.star` statecharts stay **100% headless** with zero UI coupling. To attach rich human-in-the-loop interfaces to the embedded Web Studio (`starness serve --ui`) and fullscreen Ratatui TUI (`starness run -i --ui`), pair your workflow with an external `*.ui.json` `json-render` view-sheet (or build a custom UI by observing `TraceHub` / SSE `/trace` and posting to `/events`). Without `--ui`, both Web Studio and TUI automatically fall back to a zero-config `allowed_events` picker.
 
-```python
-load(
-    "@starness/ui",
-    "ui_badge", "ui_bind", "ui_button", "ui_card", "ui_confirm", "ui_key_value",
-    "ui_markdown", "ui_markdown_review", "ui_select", "ui_spec", "ui_stack",
-    "ui_table", "ui_text_input", "ui_textarea",
-)
+`starness check <file.star> --ui <file.ui.json>` statically verifies every state key in `views` and every action event (`event`, `approve_event`, `revise_event`, `confirm_event`, `cancel_event`) in `views` and `tag_views` against outgoing `on` transitions (respecting `forbid`).
 
-S.human_review: state(
-    ui = ui_spec(
-        ui_stack([
-            ui_card("Status", [ui_badge(ui_bind("/status"), variant = "warning")]),
-            ui_markdown_review(
-                "Implementation Plan",
-                markdown = ui_bind("/plan"),
-                agent_notes = ui_bind("/notes"),
-                comments_path = "/draft_comments",
-                approve_event = "APPROVE",
-                revise_event = "REQUEST_CHANGES",
-            ),
-        ]),
-    ),
-    on = [
-        transition(event = "APPROVE", target = S.approved),
-        transition(event = "REQUEST_CHANGES", target = S.revising, assign = capture_comments),
-    ],
-)
+```json
+{
+  "machine": "plan_review",
+  "views": {
+    "human_review": {
+      "root": "root",
+      "elements": {
+        "root": { "type": "Stack", "props": { "direction": "vertical" }, "children": ["review"] },
+        "review": {
+          "type": "MarkdownReview",
+          "props": {
+            "title": "Implementation Plan",
+            "markdown": { "$state": "/plan" },
+            "agent_notes": { "$state": "/notes" },
+            "comments_path": "/draft_comments",
+            "approve_event": "APPROVE",
+            "revise_event": "REQUEST_CHANGES"
+          }
+        }
+      }
+    }
+  },
+  "tag_views": {
+    "generative_gate": { "$state": "/generated_ui" }
+  }
+}
 ```

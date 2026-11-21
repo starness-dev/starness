@@ -1,0 +1,59 @@
+{
+  "machine": "plan_review",
+  "views": {
+    "human_review": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": {
+            "direction": "vertical",
+            "gap": "md"
+          },
+          "children": ["status_card", "plan_review", "abort_btn"]
+        },
+        "status_card": {
+          "type": "Card",
+          "props": {
+            "title": "Plan Review Status"
+          },
+          "children": ["status_badge", "meta_kv"]
+        },
+        "status_badge": {
+          "type": "Badge",
+          "props": {
+            "label": { "$state": "/status_label" },
+            "variant": "warning"
+          }
+        },
+        "meta_kv": {
+          "type": "KeyValue",
+          "props": {
+            "items": { "$state": "/meta_summary" }
+          }
+        },
+        "plan_review": {
+          "type": "MarkdownReview",
+          "props": {
+            "title": "Implementation Plan",
+            "markdown": { "$state": "/plan" },
+            "agent_notes": { "$state": "/notes" },
+            "comments_path": "/draft_comments",
+            "approve_event": "APPROVE",
+            "revise_event": "REQUEST_CHANGES",
+            "approve_label": "Approve",
+            "revise_label": "Request Changes"
+          }
+        },
+        "abort_btn": {
+          "type": "Button",
+          "props": {
+            "label": "Abort Plan",
+            "event": "ABORT",
+            "variant": "danger"
+          }
+        }
+      }
+    }
+  }
+}

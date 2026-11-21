@@ -219,7 +219,7 @@ Starness gives you structured control flow primitives that keep complex agent wo
 | **MCP** | `@starness/mcp` | `mcp_stdio_server`, `mcp_http_server`, `invoke_mcp` | Call tools on local (`stdio`) or remote (Streamable HTTP) MCP servers directly |
 | **Deterministic** | `@starness/http` | `http_request`, `invoke_http`, `HttpMethod` | Call REST/JSON APIs, webhooks, health checks, and internal services |
 | **Deterministic** | `@starness/exec` | `exec_spec`, `invoke_cmd` | Run shell commands, builds, test suites, or CLIs with automatic cancellation on state exit |
-| **Interactive UI** | `@starness/ui` | `ui_spec`, `ui_markdown_review`, `ui_stack`, `ui_card`, `ui_button`, `ui_bind` | Declarative & generative `json-render` human-in-the-loop UIs rendered in both the embedded Web Studio (`/ui`) and terminal TUI (`starness run -i`) |
+| **External UI View-Sheets** | `*.ui.json` (`--ui`) | `views`, `tag_views`, `$state` bindings | Keep `.star` workflows 100% headless while attaching optional `json-render` UIs to Web Studio (`/ui`) and Ratatui TUI (`starness run -i --ui`), statically verified by `starness check --ui` |
 | **Secrets** | `@starness/secrets` | `secret`, `SecretSource` (`env`, `file`, `keychain`) | Load API keys and tokens from env vars, files, or the OS keychain with automatic `<secret:NAME>` redaction in traces and errors |
 
 ---
@@ -382,7 +382,7 @@ Every example in `examples/` is pure Starlark (no custom Rust required) and pass
 | Example | Modules Used | Highlights |
 | :--- | :--- | :--- |
 | [`examples/coding_session_llm.star`](examples/coding_session_llm.star) | `llm`, `exec`, `secrets` | Interactive multi-turn coding REPL (`working { thinking <-> acting }`), native `bash` tool calling, `assistant_msg(ev)` lossless round-tripping, and `INTERRUPT` cancellation |
-| [`examples/plan_review_ui.star`](examples/plan_review_ui.star) | `ui` | Interactive Markdown plan review (`ui_markdown_review`) with anchored section comments and `REQUEST_CHANGES` / `APPROVE` loop in both Web Studio (`starness serve` → `/ui`) and terminal TUI (`starness run -i`) |
+| [`examples/plan_review.star`](examples/plan_review.star) + [`plan_review.ui.json`](examples/plan_review.ui.json) | `ui` | Pure headless Markdown plan review statechart paired with an external `*.ui.json` view-sheet (`MarkdownReview`, per-line comments, `REQUEST_CHANGES` / `APPROVE` loop) in Web Studio (`starness serve --ui`) and Ratatui TUI (`starness run -i --ui`) |
 | [`examples/release_notes_llm.star`](examples/release_notes_llm.star) | `llm`, `exec`, `secrets` | Constrained-decoding Starlark `Record` + nested `Enum` extraction (`ReleaseSummary`), SSE streaming, and breaking-change approval gate |
 | [`examples/parallel_review_llm.star`](examples/parallel_review_llm.star) | `llm` | `parallel_state` fanning out a PR review across two models (`gpt-6-luna` + `gemini-2.5-flash`) with `on_done` consensus convergence |
 | [`examples/issue_autopilot.star`](examples/issue_autopilot.star) | `decide`, `llm`, `acp`, `exec` | 3-tier composition: decision-model triage (`decide`) → structured `FixPlan` (`llm`) → coding harness (`acp` + `artifact_tool`) → test verification (`exec`) |
