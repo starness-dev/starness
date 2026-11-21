@@ -387,6 +387,13 @@ pub enum IrValidationError {
 
     #[error("secret descriptor at `{path}` cannot be stored in machine `context` (pass `secret(...)` only to outbound service inputs)")]
     SecretInContext { path: String },
+
+    #[error("UI spec on state `{state}` references unhandled or forbidden event `{event}` (allowed: {allowed})")]
+    UnknownUiEvent {
+        state: StateId,
+        event: String,
+        allowed: String,
+    },
 }
 
 /// JSON object key marking a late-bound `@starness/secrets` descriptor (`{"$starness_secret": {...}}`).
@@ -635,6 +642,27 @@ impl MachineDef {
                     }
                 }
             }
+
+            if let Some(ui_val) = record.node.meta.as_ref().and_then(|m| m.get("ui")) {
+                let ui_events = collect_ui_spec_events(ui_val);
+                if !ui_events.is_empty() {
+                    let allowed = Self::allowed_events_from_registry(state_id, &registry);
+                    for ev in ui_events {
+                        if !allowed.iter().any(|a| a == &ev) {
+                            let allowed_str = if allowed.is_empty() {
+                                "(none)".to_owned()
+                            } else {
+                                allowed.join(", ")
+                            };
+                            errors.push(IrValidationError::UnknownUiEvent {
+                                state: state_id.clone(),
+                                event: ev,
+                                allowed: allowed_str,
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         if root_initial_valid && !has_duplicates {
@@ -854,6 +882,170 @@ impl MachineDef {
 
         active
     }
+
+    fn build_registry(&self) -> IndexMap<StateId, NodeRecord<'_>> {
+        let mut registry = IndexMap::new();
+        let mut errors = Vec::new();
+        let mut has_dups = false;
+        Self::collect_states(
+            &self.id,
+            None,
+            &self.states,
+            &mut registry,
+            &mut errors,
+            &mut has_dups,
+        );
+        registry
+    }
+
+    fn allowed_events_from_registry(
+        state_id: &StateId,
+        registry: &IndexMap<StateId, NodeRecord<'_>>,
+    ) -> Vec<String> {
+        let mut forbidden: HashSet<String> = HashSet::new();
+        let mut allowed: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut cursor = Some(state_id.clone());
+
+        while let Some(id) = cursor {
+            let Some(rec) = registry.get(&id) else {
+                break;
+            };
+            for tr in &rec.node.on {
+                if tr.forbidden {
+                    forbidden.insert(tr.event.clone());
+                }
+            }
+            for tr in &rec.node.on {
+                if !tr.forbidden
+                    && !forbidden.contains(&tr.event)
+                    && seen.insert(tr.event.clone())
+                {
+                    allowed.push(tr.event.clone());
+                }
+            }
+            cursor = rec.parent.clone();
+        }
+        allowed
+    }
+
+    /// Returns deduplicated event names handled by `state_id` or its ancestors (excluding `forbid`s).
+    pub fn allowed_events_for_state(&self, state_id: &StateId) -> Vec<String> {
+        let registry = self.build_registry();
+        Self::allowed_events_from_registry(state_id, &registry)
+    }
+
+    /// Returns deduplicated outgoing event names handled by any of `active_states` (or their ancestors),
+    /// respecting `forbid` transitions. Accepts dotted XState paths (`"working.thinking"`) or leaf IDs.
+    pub fn allowed_events_for_active_states(&self, active_states: &[String]) -> Vec<String> {
+        let registry = self.build_registry();
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for active in active_states {
+            let leaf = active.rsplit('.').next().unwrap_or(active.as_str());
+            let sid = StateId::from(leaf);
+            for ev in Self::allowed_events_from_registry(&sid, &registry) {
+                if seen.insert(ev.clone()) {
+                    out.push(ev);
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolves the active `json-render` UI spec for `active_states` (checking each active leaf and
+    /// its ancestors for `meta["ui"]`). If `meta["ui"]` is a `{"$state": "/pointer"}` binding,
+    /// resolves the RFC 6901 JSON Pointer against `context`.
+    pub fn resolve_ui_for_active_states(
+        &self,
+        active_states: &[String],
+        context: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let registry = self.build_registry();
+        for active in active_states {
+            let leaf = active.rsplit('.').next().unwrap_or(active.as_str());
+            let mut cursor = Some(StateId::from(leaf));
+            while let Some(id) = cursor {
+                let Some(rec) = registry.get(&id) else {
+                    break;
+                };
+                if let Some(ui_val) = rec.node.meta.as_ref().and_then(|m| m.get("ui"))
+                    && let Some(resolved) = resolve_ui_spec_value(ui_val, context)
+                {
+                    return Some(resolved);
+                }
+                cursor = rec.parent.clone();
+            }
+        }
+        None
+    }
+}
+
+/// Resolves a `meta["ui"]` entry: either a static `{"root": ..., "elements": ...}` spec or a
+/// dynamic `{"$state": "/pointer"}` RFC 6901 pointer into `context`.
+pub fn resolve_ui_spec_value(
+    ui_val: &serde_json::Value,
+    context: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let obj = ui_val.as_object()?;
+    if let Some(ptr) = obj.get("$state").and_then(serde_json::Value::as_str) {
+        let target = context.pointer(ptr)?;
+        if target.is_object()
+            && target.get("root").is_some()
+            && target.get("elements").is_some()
+        {
+            return Some(target.clone());
+        }
+        return None;
+    }
+    if obj.get("root").is_some() && obj.get("elements").is_some() {
+        return Some(ui_val.clone());
+    }
+    None
+}
+
+/// Collects all static event names declared by interactive elements inside a `json-render` UI spec.
+pub fn collect_ui_spec_events(ui_val: &serde_json::Value) -> Vec<String> {
+    let mut events = Vec::new();
+    let mut seen = HashSet::new();
+    let Some(elements) = ui_val.get("elements").and_then(serde_json::Value::as_object) else {
+        return events;
+    };
+
+    let mut push_event = |raw: &str| {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_owned()) {
+            events.push(trimmed.to_owned());
+        }
+    };
+
+    for elem in elements.values() {
+        if let Some(props) = elem.get("props").and_then(serde_json::Value::as_object) {
+            for key in [
+                "event",
+                "approve_event",
+                "revise_event",
+                "confirm_event",
+                "cancel_event",
+            ] {
+                if let Some(ev) = props.get(key).and_then(serde_json::Value::as_str) {
+                    push_event(ev);
+                }
+            }
+        }
+        if let Some(on_map) = elem.get("on").and_then(serde_json::Value::as_object) {
+            for handler in on_map.values() {
+                if let Some(ev) = handler
+                    .get("params")
+                    .and_then(|p| p.get("event"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    push_event(ev);
+                }
+            }
+        }
+    }
+    events
 }
 
 #[cfg(test)]

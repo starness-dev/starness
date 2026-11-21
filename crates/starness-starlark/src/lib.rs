@@ -18,7 +18,7 @@ pub use schema::{
 pub use stdlib::{
     ACP_MODULE_ID, BUILTIN_ACP_SERVICE, BUILTIN_DECIDE_SERVICE, BUILTIN_EXEC_SERVICE,
     BUILTIN_HTTP_SERVICE, BUILTIN_LLM_SERVICE, BUILTIN_MCP_SERVICE, DECIDE_MODULE_ID,
-    EXEC_MODULE_ID, HTTP_MODULE_ID, LLM_MODULE_ID, MCP_MODULE_ID, SECRETS_MODULE_ID,
+    EXEC_MODULE_ID, HTTP_MODULE_ID, LLM_MODULE_ID, MCP_MODULE_ID, SECRETS_MODULE_ID, UI_MODULE_ID,
     is_builtin_service, resolve_builtin_module,
 };
 pub use types::{
@@ -892,6 +892,118 @@ chart = machine(
         assert_eq!(
             inv.input["tools"][0]["schema"]["schema"]["properties"]["command"]["type"],
             "string"
+        );
+    }
+
+    #[test]
+    fn ui_module_compiles_json_render_spec_and_validates_event_references() {
+        let valid_src = r##"
+load(
+    "@starness/ui",
+    "ui_badge",
+    "ui_bind",
+    "ui_button",
+    "ui_card",
+    "ui_confirm",
+    "ui_key_value",
+    "ui_markdown",
+    "ui_markdown_review",
+    "ui_select",
+    "ui_spec",
+    "ui_stack",
+    "ui_table",
+    "ui_text_input",
+    "ui_textarea",
+)
+
+ReviewEvent = enum("APPROVE", "REQUEST_CHANGES", "ABORT")
+
+Ctx = record(
+    plan = field(str, "# Plan\n\n- Step 1"),
+    notes = field(list[dict], []),
+    draft_comments = field(list[dict], []),
+    reviewer = field(str, ""),
+)
+
+S = state_space("reviewing", "done", "aborted")
+
+chart = machine(
+    id = "ui_valid_check",
+    initial = S.reviewing,
+    context = Ctx(),
+    states = {
+        S.reviewing: state(
+            ui = ui_spec(
+                ui_stack([
+                    ui_card(
+                        "Plan Review",
+                        [
+                            ui_badge("Waiting", variant = "warning"),
+                            ui_key_value({"status": "pending"}),
+                            ui_table(["Step", "Owner"], [["1", "agent"]]),
+                            ui_markdown(ui_bind("/plan")),
+                            ui_text_input("Reviewer", bind = "/reviewer"),
+                            ui_textarea("Notes", bind = "/reviewer"),
+                            ui_select("Priority", bind = "/reviewer", options = ["low", "high"]),
+                            ui_confirm("Abort?", confirm_event = ReviewEvent.ABORT),
+                        ],
+                    ),
+                    ui_markdown_review(
+                        "Implementation Plan",
+                        markdown = ui_bind("/plan"),
+                        agent_notes = ui_bind("/notes"),
+                        comments_path = "/draft_comments",
+                        approve_event = ReviewEvent.APPROVE,
+                        revise_event = ReviewEvent.REQUEST_CHANGES,
+                    ),
+                    ui_button("Abort Now", event = ReviewEvent.ABORT, variant = "danger"),
+                ]),
+            ),
+            on = [
+                transition(event = ReviewEvent.APPROVE, target = S.done),
+                internal_transition(event = ReviewEvent.REQUEST_CHANGES),
+                transition(event = ReviewEvent.ABORT, target = S.aborted),
+            ],
+        ),
+        S.done: final_state(),
+        S.aborted: final_state(),
+    },
+)
+"##;
+        let compiled = compile_starlark_str("ui_valid_check.star", valid_src, None)
+            .expect("@starness/ui spec should compile and validate");
+        let ui = compiled.ir.states[&starness_ir::StateId::from("reviewing")]
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("ui"))
+            .expect("state meta.ui");
+        assert_eq!(ui["root"], "n0");
+        assert!(ui["elements"].as_object().unwrap().len() >= 10);
+
+        // Invalid UI event reference must fail static validation inside `machine(...)`!
+        let bad_src = r#"
+load("@starness/ui", "ui_button", "ui_spec")
+
+S = state_space("waiting", "done")
+
+chart = machine(
+    id = "ui_bad_event",
+    initial = S.waiting,
+    states = {
+        S.waiting: state(
+            ui = ui_spec(ui_button("Ship It", event = "TYPO_APPROVE")),
+            on = [transition(event = "APPROVE", target = S.done)],
+        ),
+        S.done: final_state(),
+    },
+)
+"#;
+        let err = compile_starlark_str("ui_bad_event.star", bad_src, None)
+            .expect_err("unhandled UI event must fail static validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("TYPO_APPROVE") && msg.contains("APPROVE"),
+            "expected UnknownUiEvent error, got:\n{msg}"
         );
     }
 }

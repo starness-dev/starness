@@ -120,6 +120,41 @@ fn unpack_optional_meta(val: Option<Value<'_>>) -> anyhow::Result<Option<JsonHol
     }
 }
 
+fn merge_meta_and_ui(
+    meta: Option<Value<'_>>,
+    ui: Option<Value<'_>>,
+) -> anyhow::Result<Option<JsonHolder>> {
+    let mut base_meta = unpack_optional_meta(meta)?.map(|j| j.0);
+    if let Some(ui_val) = ui
+        && !ui_val.is_none()
+    {
+        let ui_json = ui_val.to_json_value()?;
+        let Some(ui_obj) = ui_json.as_object() else {
+            bail!(
+                "`ui` must be a `ui_spec(...)` or `ui_bind(...)` dict, got `{}`",
+                ui_val.get_type()
+            );
+        };
+        let is_binding = ui_obj.get("$state").and_then(serde_json::Value::as_str).is_some();
+        let is_spec = ui_obj.get("root").is_some() && ui_obj.get("elements").is_some();
+        if !is_binding && !is_spec {
+            bail!(
+                "`ui` must be a `json-render` spec (`{{\"root\": ..., \"elements\": ...}}`) or a `ui_bind(\"/...\")` state pointer"
+            );
+        }
+        let mut map = match base_meta {
+            Some(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        if map.contains_key("ui") {
+            bail!("cannot specify both `ui = ...` and `meta = {{\"ui\": ...}}` on the same state");
+        }
+        map.insert("ui".to_owned(), ui_json);
+        base_meta = Some(serde_json::Value::Object(map));
+    }
+    Ok(base_meta.map(JsonHolder))
+}
+
 #[starlark_module]
 #[starlark_types(
     StarlarkStateId as StateId,
@@ -508,6 +543,7 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
             SymbolOrEnum,
         >,
         #[starlark(require = named)] meta: Option<Value<'v>>,
+        #[starlark(require = named)] ui: Option<Value<'v>>,
         #[starlark(require = named)] description: Option<&str>,
     ) -> anyhow::Result<StarlarkStateNode<'v>> {
         Ok(StarlarkStateNode {
@@ -526,7 +562,7 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
                 on_done: Vec::new(),
                 output: None,
                 tags: tags.items.into_iter().map(|t| t.0).collect(),
-                meta: unpack_optional_meta(meta)?,
+                meta: merge_meta_and_ui(meta, ui)?,
                 description: description.map(str::to_owned),
             },
         })
@@ -561,6 +597,7 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
             SymbolOrEnum,
         >,
         #[starlark(require = named)] meta: Option<Value<'v>>,
+        #[starlark(require = named)] ui: Option<Value<'v>>,
         #[starlark(require = named)] description: Option<&str>,
     ) -> anyhow::Result<StarlarkStateNode<'v>> {
         let children = states
@@ -588,7 +625,7 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
                 on_done: on_done.0,
                 output: None,
                 tags: tags.items.into_iter().map(|t| t.0).collect(),
-                meta: unpack_optional_meta(meta)?,
+                meta: merge_meta_and_ui(meta, ui)?,
                 description: description.map(str::to_owned),
             },
         })
@@ -623,6 +660,7 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
             SymbolOrEnum,
         >,
         #[starlark(require = named)] meta: Option<Value<'v>>,
+        #[starlark(require = named)] ui: Option<Value<'v>>,
         #[starlark(require = named)] description: Option<&str>,
     ) -> anyhow::Result<StarlarkStateNode<'v>> {
         let children = states
@@ -647,7 +685,7 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
                 on_done: on_done.0,
                 output: None,
                 tags: tags.items.into_iter().map(|t| t.0).collect(),
-                meta: unpack_optional_meta(meta)?,
+                meta: merge_meta_and_ui(meta, ui)?,
                 description: description.map(str::to_owned),
             },
         })
