@@ -1,6 +1,14 @@
 import { defineRegistry, useActions, useStateStore } from "@json-render/react";
 import { starnessCatalog } from "./catalog";
-import { MarkdownReviewView } from "./components/MarkdownReview";
+import { MarkdownReviewView, renderInlineMarkdown } from "./components/MarkdownReview";
+import { DiffReviewView } from "./components/DiffReview";
+
+const ALERT_VARIANTS: Record<string, string> = {
+  info: "border-sky-500/40 bg-sky-950/30 text-sky-200",
+  success: "border-emerald-500/40 bg-emerald-950/30 text-emerald-200",
+  warning: "border-amber-500/40 bg-amber-950/30 text-amber-200",
+  danger: "border-rose-500/40 bg-rose-950/30 text-rose-200",
+};
 
 const BADGE_VARIANTS: Record<string, string> = {
   default: "bg-zinc-800 text-zinc-200 border-zinc-700",
@@ -44,11 +52,15 @@ export const { registry: starnessRegistry } = defineRegistry(starnessCatalog, {
     ),
 
     Markdown: ({ props }) => (
-      <div className="rounded-lg border border-zinc-800 bg-zinc-950/60 p-4 space-y-2">
+      <div className="rounded-lg border border-zinc-800 bg-zinc-950/60 p-4 space-y-1.5">
         {props.title && <h4 className="text-xs font-semibold uppercase tracking-wide text-zinc-400">{props.title}</h4>}
-        <pre className="whitespace-pre-wrap text-sm text-zinc-200 font-sans leading-relaxed">
-          {String(props.content ?? "")}
-        </pre>
+        <div className="space-y-1 text-sm text-zinc-200 leading-relaxed">
+          {String(props.content ?? "")
+            .split(/\r?\n/)
+            .map((line, idx) => (
+              <div key={idx}>{line ? renderInlineMarkdown(line) : <span className="inline-block h-2" />}</div>
+            ))}
+        </div>
       </div>
     ),
 
@@ -65,10 +77,16 @@ export const { registry: starnessRegistry } = defineRegistry(starnessCatalog, {
           }
         }
       }
+      const gridCols =
+        entries.length === 3
+          ? "grid-cols-1 sm:grid-cols-3"
+          : entries.length >= 4
+            ? "grid-cols-2 sm:grid-cols-4"
+            : "grid-cols-1 sm:grid-cols-2";
       return (
         <div className="space-y-2">
           {props.title && <h4 className="text-xs font-semibold uppercase tracking-wide text-zinc-400">{props.title}</h4>}
-          <dl className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <dl className={`grid ${gridCols} gap-2`}>
             {entries.map(([k, v]) => (
               <div key={k} className="rounded-lg border border-zinc-800/80 bg-zinc-950/50 px-3 py-2">
                 <dt className="text-[11px] font-medium text-zinc-400">{k}</dt>
@@ -119,6 +137,17 @@ export const { registry: starnessRegistry } = defineRegistry(starnessCatalog, {
         <span className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-[11px] font-medium ${style}`}>
           {String(props.label ?? "")}
         </span>
+      );
+    },
+
+    Alert: ({ props }) => {
+      const style = ALERT_VARIANTS[props.variant ?? "info"] ?? ALERT_VARIANTS.info;
+      const msg = props.message != null ? String(props.message) : "";
+      return (
+        <div className={`rounded-xl border px-4 py-3 space-y-1 ${style}`}>
+          <div className="text-xs font-semibold">{props.title}</div>
+          {msg && <div className="text-xs opacity-90">{msg}</div>}
+        </div>
       );
     },
 
@@ -184,6 +213,45 @@ export const { registry: starnessRegistry } = defineRegistry(starnessCatalog, {
       );
     },
 
+    MultiSelect: ({ props }) => {
+      const store = useStateStore();
+      const raw = store.get(props.bind);
+      const selected: string[] = Array.isArray(raw) ? raw.map(String) : [];
+      const toggle = (id: string) => {
+        const next = selected.includes(id)
+          ? selected.filter((x) => x !== id)
+          : [...selected, id];
+        store.set(props.bind, next);
+      };
+      return (
+        <div className="space-y-1.5">
+          <div className="text-xs font-medium text-zinc-300">{props.label}</div>
+          <div className="space-y-1">
+            {props.options.map((opt) => {
+              const checked = selected.includes(opt.id);
+              return (
+                <label
+                  key={opt.id}
+                  className="flex items-start gap-2.5 rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-xs cursor-pointer hover:border-zinc-700"
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggle(opt.id)}
+                    className="mt-0.5 accent-sky-500"
+                  />
+                  <div>
+                    <div className="text-zinc-100 font-medium">{opt.label}</div>
+                    {opt.description && <div className="text-zinc-400 text-[11px]">{opt.description}</div>}
+                  </div>
+                </label>
+              );
+            })}
+          </div>
+        </div>
+      );
+    },
+
     Confirm: ({ props }) => {
       const { execute } = useActions();
       return (
@@ -226,7 +294,7 @@ export const { registry: starnessRegistry } = defineRegistry(starnessCatalog, {
               params: { event: props.event, payload: props.payload ?? {} },
             })
           }
-          className={`inline-flex items-center justify-center rounded-lg border px-3.5 py-1.5 text-xs font-medium transition cursor-pointer ${style}`}
+          className={`self-start inline-flex items-center justify-center rounded-lg border px-3.5 py-1.5 text-xs font-medium transition cursor-pointer ${style}`}
         >
           {props.label}
         </button>
@@ -234,6 +302,7 @@ export const { registry: starnessRegistry } = defineRegistry(starnessCatalog, {
     },
 
     MarkdownReview: ({ props }) => <MarkdownReviewView props={props} />,
+    DiffReview: ({ props }) => <DiffReviewView props={props} />,
   },
   actions: {
     send_event: async () => {},

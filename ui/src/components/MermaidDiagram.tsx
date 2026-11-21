@@ -30,8 +30,23 @@ export function MermaidDiagram({
 
     let cancelled = false;
     const renderKey = `mermaid_${id}_${Date.now()}`;
+    let decoratedSource = source;
+    if (activeStates && activeStates.length > 0) {
+      const leafIds = Array.from(
+        new Set(
+          activeStates
+            .map((st) => st.split(".").pop()?.trim() ?? "")
+            .filter((s) => /^[A-Za-z0-9_]+$/.test(s)),
+        ),
+      );
+      if (leafIds.length > 0) {
+        decoratedSource = `${source}\n    classDef starnessActive fill:#0c4a6e,stroke:#38bdf8,stroke-width:2.5px,color:#f0f9ff\n${leafIds
+          .map((s) => `    class ${s} starnessActive`)
+          .join("\n")}\n`;
+      }
+    }
     mermaid
-      .render(renderKey, source)
+      .render(renderKey, decoratedSource)
       .then(({ svg: rendered }) => {
         if (!cancelled) {
           setSvg(rendered);
@@ -47,7 +62,7 @@ export function MermaidDiagram({
     return () => {
       cancelled = true;
     };
-  }, [source, id]);
+  }, [source, activeStates, id]);
 
   if (error) {
     return (

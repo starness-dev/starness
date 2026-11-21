@@ -49,6 +49,14 @@ export const starnessCatalog = defineCatalog(schema, {
       }),
       description: "Status badge pill.",
     },
+    Alert: {
+      props: z.object({
+        title: z.string(),
+        message: z.unknown().optional(),
+        variant: z.enum(["info", "success", "warning", "danger"]).optional(),
+      }),
+      description: "Status callout banner.",
+    },
     TextInput: {
       props: z.object({
         label: z.string(),
@@ -79,6 +87,21 @@ export const starnessCatalog = defineCatalog(schema, {
         required: z.boolean().optional(),
       }),
       description: "Dropdown select input bound to a JSON Pointer path.",
+    },
+    MultiSelect: {
+      props: z.object({
+        label: z.string(),
+        bind: z.string(),
+        value: z.unknown().optional(),
+        options: z.array(
+          z.object({
+            id: z.string(),
+            label: z.string(),
+            description: z.string().optional(),
+          }),
+        ),
+      }),
+      description: "Checklist of toggleable options bound to a list of IDs.",
     },
     Confirm: {
       props: z.object({
@@ -113,6 +136,20 @@ export const starnessCatalog = defineCatalog(schema, {
       }),
       description:
         "Interactive Markdown artifact reviewer with section-anchored comments and approve/revise actions.",
+    },
+    DiffReview: {
+      props: z.object({
+        title: z.string(),
+        diff: z.unknown(),
+        agent_notes: z.unknown().optional(),
+        comments_path: z.string().optional(),
+        approve_event: z.string(),
+        revise_event: z.string(),
+        approve_label: z.string().optional(),
+        revise_label: z.string().optional(),
+      }),
+      description:
+        "Interactive unified diff reviewer with file & line-anchored comments and approve/revise actions.",
     },
   },
   actions: {

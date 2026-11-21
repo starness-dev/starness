@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { JSONUIProvider, Renderer, createStateStore } from "@json-render/react";
 import {
-  Activity,
+  Braces,
   GitBranch,
   Layers,
+  Loader2,
   Play,
   RefreshCw,
   Square,
@@ -252,14 +253,28 @@ export function App() {
                 <h2 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
                   Instances ({instances.length})
                 </h2>
-                <button
-                  type="button"
-                  onClick={() => setShowNewForm((s) => !s)}
-                  className="inline-flex items-center gap-1 rounded-md bg-sky-600 px-2 py-1 text-[11px] font-medium text-white hover:bg-sky-500 cursor-pointer"
-                >
-                  <Play className="h-3 w-3" />
-                  New
-                </button>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setShowNewForm((s) => !s)}
+                    title="Start with custom initial JSON context"
+                    className={`inline-flex items-center rounded-md border px-1.5 py-1 text-[11px] cursor-pointer ${
+                      showNewForm
+                        ? "border-sky-500/50 bg-sky-500/15 text-sky-300"
+                        : "border-zinc-700 bg-zinc-800/80 text-zinc-400 hover:text-zinc-200"
+                    }`}
+                  >
+                    <Braces className="h-3 w-3" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleCreateInstance()}
+                    className="inline-flex items-center gap-1 rounded-md bg-sky-600 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-sky-500 cursor-pointer"
+                  >
+                    <Play className="h-3 w-3" />
+                    New
+                  </button>
+                </div>
               </div>
 
               {showNewForm && (
@@ -381,10 +396,11 @@ export function App() {
                     <button
                       type="button"
                       onClick={() => void handleCancel()}
-                      className="inline-flex items-center gap-1 rounded-lg border border-rose-500/40 bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-500/20 cursor-pointer"
+                      title="Stop this running instance"
+                      className="inline-flex items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-800/80 px-2.5 py-1.5 text-xs text-zinc-300 hover:border-rose-500/40 hover:text-rose-300 cursor-pointer"
                     >
                       <Square className="h-3 w-3" />
-                      Cancel
+                      Stop
                     </button>
                   )}
                 </div>
@@ -446,11 +462,16 @@ export function App() {
                       onSend={handleDispatchEvent}
                     />
                   ) : snapshot.status === "active" ? (
-                    <div className="rounded-xl border border-sky-500/30 bg-sky-950/20 p-5 flex items-center gap-3 text-sm text-sky-200">
-                      <Activity className="h-4 w-4 animate-pulse" />
-                      <span>
-                        Running in <code className="font-mono">{snapshot.active_states.join(", ")}</code>…
-                      </span>
+                    <div className="rounded-xl border border-sky-500/30 bg-sky-950/20 p-6 flex items-center gap-3 text-sm text-sky-200">
+                      <Loader2 className="h-4 w-4 animate-spin text-sky-400 shrink-0" />
+                      <div>
+                        <div className="font-medium">
+                          Running in <code className="font-mono text-sky-300">{snapshot.active_states.join(", ")}</code>…
+                        </div>
+                        <div className="text-xs text-zinc-400 mt-0.5">
+                          Waiting for state transition to complete.
+                        </div>
+                      </div>
                     </div>
                   ) : null}
                 </div>
@@ -461,7 +482,7 @@ export function App() {
               )}
 
               {tab === "context" && (
-                <pre className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-4 text-xs text-zinc-200 overflow-x-auto">
+                <pre className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-4 text-xs text-zinc-200 whitespace-pre-wrap break-words overflow-x-auto">
                   {JSON.stringify(snapshot.context, null, 2)}
                 </pre>
               )}
