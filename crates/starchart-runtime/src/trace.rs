@@ -22,6 +22,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
+use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -502,23 +503,66 @@ pub(crate) fn split_invoke_envelope(raw: &Value, src: &str) -> (Option<InvokeMet
 pub(crate) struct ServiceScope {
     pub hub: Arc<TraceHub>,
     pub meta: InvokeMeta,
+    redactions: Arc<Mutex<Vec<(SecretString, String)>>>,
 }
 
 impl ServiceScope {
+    pub(crate) fn new(hub: Arc<TraceHub>, meta: InvokeMeta) -> Self {
+        Self {
+            hub,
+            meta,
+            redactions: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn register_redaction(&self, needle: SecretString, placeholder: &str) {
+        if needle.expose_secret().is_empty() {
+            return;
+        }
+        let mut guard = self
+            .redactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard
+            .iter()
+            .any(|(n, _)| n.expose_secret() == needle.expose_secret())
+        {
+            return;
+        }
+        guard.push((needle, placeholder.to_owned()));
+        guard.sort_by_key(|a| std::cmp::Reverse(a.0.expose_secret().len()));
+    }
+
+    fn scrub_text(&self, text: &str) -> String {
+        let guard = self
+            .redactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::builtins::secrets::scrub_with_entries(text, &guard)
+    }
+
+    fn scrub_json(&self, val: &Value) -> Value {
+        let guard = self
+            .redactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::builtins::secrets::scrub_json_with_entries(val, &guard)
+    }
+
     pub(crate) fn started(&self, input: &Value) {
         self.hub.emit(TraceEvent::ServiceStarted {
             invoke_id: self.meta.invoke_id.clone(),
             state: self.meta.state.clone(),
             src: self.meta.src.clone(),
-            input: input.clone(),
+            input: self.scrub_json(input),
         });
     }
 
     pub(crate) fn finished(&self, result: Result<&Value, String>, started: Instant) {
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let (ok, output, error) = match result {
-            Ok(v) => (true, Some(v.clone()), None),
-            Err(e) => (false, None, Some(e)),
+            Ok(v) => (true, Some(self.scrub_json(v)), None),
+            Err(e) => (false, None, Some(self.scrub_text(&e))),
         };
         self.hub.emit(TraceEvent::ServiceFinished {
             invoke_id: self.meta.invoke_id.clone(),
@@ -537,8 +581,15 @@ impl ServiceScope {
             state: self.meta.state.clone(),
             src: self.meta.src.clone(),
             stream,
-            chunk,
+            chunk: self.scrub_text(&chunk),
         });
+    }
+}
+
+/// Registers a secret redaction pair (`raw_secret` -> `<secret:NAME>`) on the active [`ServiceScope`].
+pub(crate) fn register_scope_redaction(raw_secret: SecretString, placeholder: &str) {
+    if let Some(scope) = current_scope() {
+        scope.register_redaction(raw_secret, placeholder);
     }
 }
 

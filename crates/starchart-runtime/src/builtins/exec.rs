@@ -4,15 +4,26 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+use crate::builtins::secrets::{SecretScrubber, resolve_secret_string_map};
 use crate::trace::{ProgressKind, progress_enabled, report_progress};
 
 /// Executes an `ExecSpec` (or `list[str]`) command specification from `@starchart/exec`.
 /// Uses `kill_on_drop(true)` so exiting the owning state immediately terminates the child process.
 pub async fn execute_command(_ctx: Value, input: Value) -> anyhow::Result<Value> {
+    let mut scrubber = SecretScrubber::new();
+    let res = execute_command_inner(&input, &mut scrubber).await;
+    scrubber.scrub_result(res)
+}
+
+async fn execute_command_inner(
+    input: &Value,
+    scrubber: &mut SecretScrubber,
+) -> anyhow::Result<Value> {
     let (cmd_vec, cwd, env_map, stdin_str, timeout_ms, check) = if let Some(arr) = input.as_array() {
         let args = parse_string_list(arr)?;
         (args, None, None, None, 60_000_u64, true)
@@ -32,8 +43,10 @@ pub async fn execute_command(_ctx: Value, input: Value) -> anyhow::Result<Value>
         let check = obj.get("check").and_then(Value::as_bool).unwrap_or(true);
         (args, cwd, env_map, stdin_str, timeout_ms, check)
     } else {
-        bail!("`@starchart/exec` input must be an ExecSpec object or string list, got `{input}`");
+        bail!("`@starchart/exec` input must be an ExecSpec object or string list");
     };
+
+    let resolved_envs = resolve_secret_string_map(env_map.as_ref(), scrubber)?;
 
     let Some((program, args)) = cmd_vec.split_first() else {
         bail!("`@starchart/exec` `cmd` must contain at least a program name");
@@ -56,12 +69,8 @@ pub async fn execute_command(_ctx: Value, input: Value) -> anyhow::Result<Value>
         command.current_dir(dir);
     }
 
-    if let Some(envs) = &env_map {
-        for (k, v) in envs {
-            if let Some(val_str) = v.as_str() {
-                command.env(k, val_str);
-            }
-        }
+    for (k, val_str) in &resolved_envs {
+        command.env(k, val_str.expose_secret());
     }
 
     let mut child = command

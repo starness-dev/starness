@@ -813,9 +813,18 @@ pub async fn run_stdio_bridge(addr: &str, token: &str) -> anyhow::Result<()> {
 
 /// Executes a deterministic MCP `tools/call` invocation declared via `invoke_mcp(...)`.
 pub async fn execute_mcp_client_call(_ctx: Value, input: Value) -> anyhow::Result<Value> {
+    let mut scrubber = crate::builtins::secrets::SecretScrubber::new();
+    let res = execute_mcp_client_call_inner(&input, &mut scrubber).await;
+    scrubber.scrub_result(res)
+}
+
+async fn execute_mcp_client_call_inner(
+    input: &Value,
+    scrubber: &mut crate::builtins::secrets::SecretScrubber,
+) -> anyhow::Result<Value> {
     let obj = input
         .as_object()
-        .ok_or_else(|| anyhow::anyhow!("`@starchart/mcp` input must be an object, got `{input}`"))?;
+        .ok_or_else(|| anyhow::anyhow!("`@starchart/mcp` input must be an object"))?;
 
     let server = obj
         .get("server")
@@ -841,9 +850,11 @@ pub async fn execute_mcp_client_call(_ctx: Value, input: Value) -> anyhow::Resul
     }
 
     let raw_args = obj.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    let arguments = match raw_args {
+    let resolved_args = match raw_args {
         Value::Null => json!({}),
-        Value::Object(_) => raw_args,
+        Value::Object(_) => {
+            crate::builtins::secrets::resolve_secrets_in_value(&raw_args, scrubber)?
+        }
         other => bail!("`invoke_mcp` `arguments` must resolve to a dict/record, got `{other}`"),
     };
 
@@ -859,9 +870,13 @@ pub async fn execute_mcp_client_call(_ctx: Value, input: Value) -> anyhow::Resul
 
     let raw_result = match transport.to_ascii_uppercase().as_str() {
         "STDIO" => {
+            let resolved_envs = crate::builtins::secrets::resolve_secret_string_map(
+                server.get("env").and_then(Value::as_object),
+                scrubber,
+            )?;
             tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
-                call_stdio_mcp_server(server, tool_name, &arguments),
+                call_stdio_mcp_server(server, &resolved_envs, tool_name, &resolved_args),
             )
             .await
             .map_err(|_| {
@@ -871,9 +886,19 @@ pub async fn execute_mcp_client_call(_ctx: Value, input: Value) -> anyhow::Resul
             })??
         }
         "HTTP" => {
+            let resolved_headers = crate::builtins::secrets::resolve_secret_string_map(
+                server.get("headers").and_then(Value::as_object),
+                scrubber,
+            )?;
             tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
-                call_http_mcp_server(server, tool_name, &arguments, timeout_ms),
+                call_http_mcp_server(
+                    server,
+                    &resolved_headers,
+                    tool_name,
+                    &resolved_args,
+                    timeout_ms,
+                ),
             )
             .await
             .map_err(|_| {
@@ -912,9 +937,11 @@ pub async fn execute_mcp_client_call(_ctx: Value, input: Value) -> anyhow::Resul
 
 async fn call_stdio_mcp_server(
     server: &Map<String, Value>,
+    resolved_envs: &indexmap::IndexMap<String, secrecy::SecretString>,
     tool_name: &str,
     arguments: &Value,
 ) -> anyhow::Result<Value> {
+    use secrecy::ExposeSecret;
     let command_prog = server
         .get("command")
         .and_then(Value::as_str)
@@ -945,12 +972,8 @@ async fn call_stdio_mcp_server(
     {
         cmd.current_dir(cwd);
     }
-    if let Some(envs) = server.get("env").and_then(Value::as_object) {
-        for (k, v) in envs {
-            if let Some(vs) = v.as_str() {
-                cmd.env(k, vs);
-            }
-        }
+    for (k, vs) in resolved_envs {
+        cmd.env(k, vs.expose_secret());
     }
 
     let mut child = cmd
@@ -1056,6 +1079,7 @@ async fn await_mcp_stdio_response(
 
 async fn call_http_mcp_server(
     server: &Map<String, Value>,
+    custom_headers: &indexmap::IndexMap<String, secrecy::SecretString>,
     tool_name: &str,
     arguments: &Value,
     timeout_ms: u64,
@@ -1070,8 +1094,6 @@ async fn call_http_mcp_server(
         .timeout(std::time::Duration::from_millis(timeout_ms))
         .build()
         .context("failed building HTTP MCP client")?;
-
-    let custom_headers = server.get("headers").and_then(Value::as_object);
 
     // 1. `initialize`
     let (init_msg, session_id) = send_http_mcp_rpc(
@@ -1138,11 +1160,12 @@ async fn call_http_mcp_server(
 async fn send_http_mcp_rpc(
     client: &reqwest::Client,
     url: &str,
-    headers: Option<&Map<String, Value>>,
+    headers: &indexmap::IndexMap<String, secrecy::SecretString>,
     session_id: Option<&str>,
     body: &Value,
     expected_id: Option<u64>,
 ) -> anyhow::Result<(Value, Option<String>)> {
+    use secrecy::ExposeSecret;
     let mut req = client
         .post(url)
         .header("Content-Type", "application/json")
@@ -1152,12 +1175,8 @@ async fn send_http_mcp_rpc(
     if let Some(sid) = session_id {
         req = req.header("Mcp-Session-Id", sid);
     }
-    if let Some(hdrs) = headers {
-        for (k, v) in hdrs {
-            if let Some(vs) = v.as_str() {
-                req = req.header(k.as_str(), vs);
-            }
-        }
+    for (k, vs) in headers {
+        req = req.header(k.as_str(), vs.expose_secret());
     }
 
     let resp = req.send().await?;

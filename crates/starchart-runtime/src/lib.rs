@@ -1216,7 +1216,7 @@ pub fn build_machine_logic_traced(
             let scope = hub
                 .as_ref()
                 .zip(meta)
-                .map(|(hub, meta)| trace::ServiceScope { hub: Arc::clone(hub), meta });
+                .map(|(hub, meta)| trace::ServiceScope::new(Arc::clone(hub), meta));
             let started = std::time::Instant::now();
             let run = || -> Result<Value, XStateError> {
                 let resolved_input = resolve_dynamic_service_input(
@@ -1265,7 +1265,7 @@ pub fn build_machine_logic_traced(
             let scope = hub
                 .as_ref()
                 .zip(meta)
-                .map(|(hub, meta)| trace::ServiceScope { hub: Arc::clone(hub), meta });
+                .map(|(hub, meta)| trace::ServiceScope::new(Arc::clone(hub), meta));
             let tool_scope = (!tool_slots.is_empty()).then(|| builtins::mcp::ToolRuntimeScope {
                 tools: Arc::clone(&tool_slots),
                 type_registry: Arc::clone(&type_registry),
@@ -1416,6 +1416,11 @@ fn eval_starlark_reducer(
                 return Err(XStateError::Logic(format!(
                     "assign reducer `{reducer_name}` must return a dict or record, got `{}`",
                     result.get_type()
+                )));
+            }
+            if let Some(secret_path) = starchart_ir::find_secret_marker_path(&next_json) {
+                return Err(XStateError::Logic(format!(
+                    "assign reducer `{reducer_name}` cannot store `secret(...)` in `{secret_path}`"
                 )));
             }
 

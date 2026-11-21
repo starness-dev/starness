@@ -1,9 +1,10 @@
-//! Built-in `@starchart/*` runtime drivers (`http`, `exec`, `acp`).
+//! Built-in `@starchart/*` runtime drivers (`http`, `exec`, `acp`, `mcp`, `secrets`).
 
 pub mod acp;
 pub mod exec;
 pub mod http;
 pub mod mcp;
+pub mod secrets;
 
 use starchart_starlark::{
     BUILTIN_ACP_SERVICE, BUILTIN_EXEC_SERVICE, BUILTIN_HTTP_SERVICE, BUILTIN_MCP_SERVICE,

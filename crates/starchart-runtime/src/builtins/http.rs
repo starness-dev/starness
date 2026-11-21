@@ -5,8 +5,12 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use reqwest::{Client, Method};
+use secrecy::ExposeSecret;
 use serde_json::{Map, Value, json};
 
+use crate::builtins::secrets::{
+    SecretScrubber, resolve_secret_string_map, resolve_secrets_in_value,
+};
 use crate::trace::{ProgressKind, report_progress};
 
 fn shared_http_client() -> &'static Client {
@@ -21,9 +25,18 @@ fn shared_http_client() -> &'static Client {
 
 /// Executes an `HttpRequest` JSON specification resolved from `@starchart/http`.
 pub async fn execute_http_request(_ctx: Value, input: Value) -> anyhow::Result<Value> {
+    let mut scrubber = SecretScrubber::new();
+    let res = execute_http_request_inner(&input, &mut scrubber).await;
+    scrubber.scrub_result(res)
+}
+
+async fn execute_http_request_inner(
+    input: &Value,
+    scrubber: &mut SecretScrubber,
+) -> anyhow::Result<Value> {
     let obj = input
         .as_object()
-        .ok_or_else(|| anyhow::anyhow!("`@starchart/http` input must be an HttpRequest object, got `{input}`"))?;
+        .ok_or_else(|| anyhow::anyhow!("`@starchart/http` input must be an HttpRequest object"))?;
 
     let url = obj
         .get("url")
@@ -42,22 +55,24 @@ pub async fn execute_http_request(_ctx: Value, input: Value) -> anyhow::Result<V
         bail!("HttpRequest `timeout_ms` must be > 0");
     }
 
+    let resolved_headers =
+        resolve_secret_string_map(obj.get("headers").and_then(Value::as_object), scrubber)?;
+
     let mut req = shared_http_client()
         .request(method, url)
         .timeout(Duration::from_millis(timeout_ms));
 
-    if let Some(headers) = obj.get("headers").and_then(Value::as_object) {
-        for (k, v) in headers {
-            if let Some(val_str) = v.as_str() {
-                req = req.header(k.as_str(), val_str);
-            }
-        }
+    for (k, val_str) in &resolved_headers {
+        req = req.header(k.as_str(), val_str.expose_secret());
     }
 
-    let json_payload = obj.get("json").filter(|v| !v.is_null());
+    let json_payload = match obj.get("json").filter(|v| !v.is_null()) {
+        Some(raw_json) => Some(resolve_secrets_in_value(raw_json, scrubber)?),
+        None => None,
+    };
     let raw_body = obj.get("body").and_then(Value::as_str);
 
-    if let Some(j) = json_payload {
+    if let Some(j) = &json_payload {
         req = req.json(j);
     } else if let Some(b) = raw_body {
         req = req.body(b.to_owned());

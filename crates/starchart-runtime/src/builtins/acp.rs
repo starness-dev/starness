@@ -13,6 +13,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use starchart_starlark::CompiledChart;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -39,9 +40,19 @@ fn render_state_context_block(machine_ctx: &Value, explicit_ctx: Option<&Value>)
 
 /// Executes a single ACP prompt turn against a configured `AcpAgent` subprocess over `stdio`.
 pub async fn execute_acp_turn(ctx: Value, input: Value) -> anyhow::Result<Value> {
+    let mut scrubber = crate::builtins::secrets::SecretScrubber::new();
+    let res = execute_acp_turn_inner(ctx, input, &mut scrubber).await;
+    scrubber.scrub_result(res)
+}
+
+async fn execute_acp_turn_inner(
+    ctx: Value,
+    input: Value,
+    scrubber: &mut crate::builtins::secrets::SecretScrubber,
+) -> anyhow::Result<Value> {
     let obj = input
         .as_object()
-        .ok_or_else(|| anyhow::anyhow!("`@starchart/acp` input must be an object, got `{input}`"))?;
+        .ok_or_else(|| anyhow::anyhow!("`@starchart/acp` input must be an object"))?;
 
     let agent = obj
         .get("agent")
@@ -86,7 +97,10 @@ pub async fn execute_acp_turn(ctx: Value, input: Value) -> anyhow::Result<Value>
         _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
     let canonical_cwd = std::fs::canonicalize(&session_cwd).unwrap_or(session_cwd);
-    let env_map = agent.get("env").and_then(Value::as_object);
+    let resolved_envs = crate::builtins::secrets::resolve_secret_string_map(
+        agent.get("env").and_then(Value::as_object),
+        scrubber,
+    )?;
     let config_map = agent.get("config").and_then(Value::as_object);
     let mcp_server = TurnMcpServer::start_if_configured(&input).await?;
     let bridge_spec = mcp_server.as_ref().map(|s| s.launch_spec().clone());
@@ -105,7 +119,7 @@ pub async fn execute_acp_turn(ctx: Value, input: Value) -> anyhow::Result<Value>
                     &args,
                     &canonical_cwd,
                     model,
-                    env_map,
+                    &resolved_envs,
                     config_map,
                     bridge_spec.as_ref(),
                     timeout_ms,
@@ -118,7 +132,7 @@ pub async fn execute_acp_turn(ctx: Value, input: Value) -> anyhow::Result<Value>
                     &args,
                     &canonical_cwd,
                     model,
-                    env_map,
+                    &resolved_envs,
                     config_map,
                     bridge_spec.as_ref(),
                     timeout_ms,
@@ -151,12 +165,8 @@ pub async fn execute_acp_turn(ctx: Value, input: Value) -> anyhow::Result<Value>
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
 
-    if let Some(envs) = agent.get("env").and_then(Value::as_object) {
-        for (k, v) in envs {
-            if let Some(val_str) = v.as_str() {
-                cmd.env(k, val_str);
-            }
-        }
+    for (k, val_str) in &resolved_envs {
+        cmd.env(k, val_str.expose_secret());
     }
 
     let mut child = cmd
@@ -206,7 +216,7 @@ async fn execute_claude_cli_turn(
     extra_args: &[String],
     cwd: &Path,
     model: &str,
-    env_map: Option<&serde_json::Map<String, Value>>,
+    env_map: &indexmap::IndexMap<String, secrecy::SecretString>,
     config_map: Option<&serde_json::Map<String, Value>>,
     bridge_spec: Option<&BridgeLaunchSpec>,
     timeout_ms: u64,
@@ -251,12 +261,8 @@ async fn execute_claude_cli_turn(
     } else if !perm_mode.is_empty() {
         cmd.arg("--permission-mode").arg(perm_mode);
     }
-    if let Some(envs) = env_map {
-        for (k, v) in envs {
-            if let Some(val_str) = v.as_str() {
-                cmd.env(k, val_str);
-            }
-        }
+    for (k, val_str) in env_map {
+        cmd.env(k, val_str.expose_secret());
     }
 
     let mut child = cmd
@@ -325,7 +331,7 @@ async fn execute_codex_cli_turn(
     extra_args: &[String],
     cwd: &Path,
     model: &str,
-    env_map: Option<&serde_json::Map<String, Value>>,
+    env_map: &indexmap::IndexMap<String, secrecy::SecretString>,
     config_map: Option<&serde_json::Map<String, Value>>,
     bridge_spec: Option<&BridgeLaunchSpec>,
     timeout_ms: u64,
@@ -366,12 +372,8 @@ async fn execute_codex_cli_turn(
     }
     cmd.arg("-");
 
-    if let Some(envs) = env_map {
-        for (k, v) in envs {
-            if let Some(val_str) = v.as_str() {
-                cmd.env(k, val_str);
-            }
-        }
+    for (k, val_str) in env_map {
+        cmd.env(k, val_str.expose_secret());
     }
 
     let mut child = cmd
