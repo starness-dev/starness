@@ -24,7 +24,7 @@ use anyhow::{Context, bail};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use starness_ir::{MachineDef, StateId, StateKind, StateNodeDef};
+use starness_ir::{MachineDef, StateId, StateKind, StateNodeDef, UiViewSheet};
 use starness_starlark::CompiledChart;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -155,11 +155,13 @@ pub fn record_compound_history(active_states: &[String], history: &mut HashMap<S
     }
 }
 
-/// One compiled statechart definition plus host callbacks to register in [`serve_charts_http`].
+/// One compiled statechart definition plus host callbacks and optional external view-sheet
+/// (`*.ui.json`) to register in [`serve_charts_http`].
 #[derive(Clone)]
 pub struct ServeDefinition {
     pub chart: CompiledChart,
     pub callbacks: HostCallbacks,
+    pub ui_sheet: Option<UiViewSheet>,
 }
 
 impl std::fmt::Debug for ServeDefinition {
@@ -193,6 +195,7 @@ impl Default for ServeOptions {
 struct RegisteredMachine {
     chart: CompiledChart,
     callbacks: HostCallbacks,
+    ui_sheet: Option<UiViewSheet>,
     diagram: String,
     completable: bool,
 }
@@ -338,6 +341,16 @@ pub async fn serve_charts_http(
         if machines.contains_key(&id) {
             bail!("duplicate machine id `{id}` registered in starness serve");
         }
+        if let Some(sheet) = &def.ui_sheet
+            && let Err(errs) = sheet.validate_against(&def.chart.ir)
+        {
+            let joined = errs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            bail!("invalid UI view-sheet for machine `{id}`:\n  {joined}");
+        }
         let diagram = render_mermaid(&def.chart)
             .with_context(|| format!("failed rendering Mermaid diagram for `{id}`"))?;
         let completable = machine_is_completable(&def.chart.ir);
@@ -346,6 +359,7 @@ pub async fn serve_charts_http(
             Arc::new(RegisteredMachine {
                 chart: def.chart,
                 callbacks: def.callbacks,
+                ui_sheet: def.ui_sheet,
                 diagram,
                 completable,
             }),
@@ -1289,9 +1303,11 @@ fn enriched_instance_json(
                 .ir
                 .allowed_events_for_active_states(&snap.active_states);
             let ui = reg
-                .chart
-                .ir
-                .resolve_ui_for_active_states(&snap.active_states, &snap.context);
+                .ui_sheet
+                .as_ref()
+                .and_then(|sheet| {
+                    sheet.resolve_for_active_states(&reg.chart.ir, &snap.active_states, &snap.context)
+                });
             (events, ui)
         };
         obj.insert("allowed_events".to_owned(), json!(allowed_events));
@@ -1302,15 +1318,21 @@ fn enriched_instance_json(
 
 fn collect_states_with_ui(
     states: &indexmap::IndexMap<StateId, starness_ir::StateNodeDef>,
+    ui_sheet: Option<&UiViewSheet>,
     out: &mut Vec<String>,
 ) {
+    let Some(sheet) = ui_sheet else {
+        return;
+    };
     for (sid, node) in states {
-        if node.meta.as_ref().and_then(|m| m.get("ui")).is_some() {
+        let has_direct = sheet.views.contains_key(sid);
+        let has_tag = node.tags.iter().any(|t| sheet.tag_views.contains_key(t));
+        if has_direct || has_tag {
             out.push(sid.as_str().to_owned());
         }
         match &node.kind {
             StateKind::Compound { states: kids, .. } | StateKind::Parallel { states: kids } => {
-                collect_states_with_ui(kids, out);
+                collect_states_with_ui(kids, ui_sheet, out);
             }
             StateKind::Atomic | StateKind::Final | StateKind::History { .. } => {}
         }
@@ -1322,12 +1344,11 @@ fn machine_summary_json(
     counts: &HashMap<String, usize>,
 ) -> Value {
     let mut states_with_ui = Vec::new();
-    collect_states_with_ui(&reg.chart.ir.states, &mut states_with_ui);
+    collect_states_with_ui(&reg.chart.ir.states, reg.ui_sheet.as_ref(), &mut states_with_ui);
     let initial_active = vec![reg.chart.ir.initial.as_str().to_owned()];
-    let initial_ui = reg
-        .chart
-        .ir
-        .resolve_ui_for_active_states(&initial_active, &reg.chart.ir.context);
+    let initial_ui = reg.ui_sheet.as_ref().and_then(|sheet| {
+        sheet.resolve_for_active_states(&reg.chart.ir, &initial_active, &reg.chart.ir.context)
+    });
     let initial_allowed_events = reg
         .chart
         .ir
