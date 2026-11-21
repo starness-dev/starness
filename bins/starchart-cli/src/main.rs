@@ -129,6 +129,12 @@ enum Commands {
     /// Start the Starlark Language Server Protocol (LSP) server over stdio.
     Lsp,
 
+    /// Manage secrets stored in the OS Keychain (`source = "keychain"` in `@starchart/secrets`).
+    Secrets {
+        #[command(subcommand)]
+        action: SecretsCommand,
+    },
+
     /// Internal stdio <-> localhost TCP bridge for turn-scoped MCP tools.
     #[command(name = "mcp-bridge", hide = true)]
     McpBridge {
@@ -137,6 +143,43 @@ enum Commands {
 
         #[arg(long)]
         token: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretsCommand {
+    /// Store or update a secret in the OS Keychain (reads from `--value` or a single line on stdin).
+    Set {
+        /// Secret account/key name referenced by `secret("<NAME>", source = "keychain")`.
+        name: String,
+
+        /// Keychain service namespace (defaults to `starchart`).
+        #[arg(long, default_value = starchart_runtime::builtins::secrets::DEFAULT_KEYCHAIN_SERVICE)]
+        service: String,
+
+        /// Secret value (omit to read from stdin so secrets stay out of shell history).
+        #[arg(long)]
+        value: Option<String>,
+    },
+
+    /// Check whether a secret exists in the OS Keychain without printing its value.
+    Check {
+        /// Secret account/key name.
+        name: String,
+
+        /// Keychain service namespace (defaults to `starchart`).
+        #[arg(long, default_value = starchart_runtime::builtins::secrets::DEFAULT_KEYCHAIN_SERVICE)]
+        service: String,
+    },
+
+    /// Delete a secret from the OS Keychain.
+    Delete {
+        /// Secret account/key name.
+        name: String,
+
+        /// Keychain service namespace (defaults to `starchart`).
+        #[arg(long, default_value = starchart_runtime::builtins::secrets::DEFAULT_KEYCHAIN_SERVICE)]
+        service: String,
     },
 }
 
@@ -170,7 +213,76 @@ fn main() -> ExitCode {
         } => run_serve(&paths, &export, &bind, &db),
         Commands::Acp { file, export } => run_acp_server(&file, &export),
         Commands::Lsp => run_lsp(),
+        Commands::Secrets { action } => run_secrets(action),
         Commands::McpBridge { addr, token } => run_mcp_bridge(&addr, &token),
+    }
+}
+
+fn run_secrets(action: SecretsCommand) -> ExitCode {
+    use secrecy::{ExposeSecret, SecretString};
+    use starchart_runtime::builtins::secrets::{keychain_delete, keychain_exists, keychain_set};
+
+    match action {
+        SecretsCommand::Set {
+            name,
+            service,
+            value,
+        } => {
+            let secret_val: SecretString = match value {
+                Some(v) => SecretString::from(v),
+                None => {
+                    let mut line = String::new();
+                    if let Err(err) = std::io::stdin().read_line(&mut line) {
+                        eprintln!("ERROR reading secret from stdin: {err}");
+                        return ExitCode::from(1);
+                    }
+                    let trimmed = line.trim_end_matches(['\r', '\n']).to_owned();
+                    SecretString::from(trimmed)
+                }
+            };
+            if secret_val.expose_secret().is_empty() {
+                eprintln!("ERROR secret value for `{name}` must not be empty");
+                return ExitCode::from(1);
+            }
+            match keychain_set(&service, &name, &secret_val) {
+                Ok(()) => {
+                    println!("OK stored secret `{name}` in OS keychain (service `{service}`)");
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("ERROR {err:#}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        SecretsCommand::Check { name, service } => match keychain_exists(&service, &name) {
+            Ok(true) => {
+                println!("OK secret `{name}` is present in OS keychain (service `{service}`)");
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                eprintln!("MISSING secret `{name}` not found in OS keychain (service `{service}`)");
+                ExitCode::from(1)
+            }
+            Err(err) => {
+                eprintln!("ERROR {err:#}");
+                ExitCode::from(1)
+            }
+        },
+        SecretsCommand::Delete { name, service } => match keychain_delete(&service, &name) {
+            Ok(true) => {
+                println!("OK deleted secret `{name}` from OS keychain (service `{service}`)");
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                println!("OK secret `{name}` was already absent in OS keychain (service `{service}`)");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("ERROR {err:#}");
+                ExitCode::from(1)
+            }
+        },
     }
 }
 
@@ -321,7 +433,6 @@ macro_rules! say {
         }
     };
 }
-use say;
 
 type TraceSink = Box<dyn Write + Send>;
 
@@ -960,6 +1071,8 @@ fn build_builtin_lsp_interfaces(
         "@starchart/agents.star",
         "@starchart/mcp",
         "@starchart/mcp.star",
+        "@starchart/secrets",
+        "@starchart/secrets.star",
     ] {
         if let Some((canon_id, src)) = resolve_builtin_module(alias)
             && let Ok(ast) = AstModule::parse(canon_id, src.to_owned(), &dialect)

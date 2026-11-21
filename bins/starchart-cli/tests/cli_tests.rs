@@ -1254,3 +1254,293 @@ fn serve_rehydrates_in_flight_instances_from_sqlite_db_file_across_restart() {
     let _ = server2.wait();
     let _ = std::fs::remove_dir_all(&db_dir);
 }
+
+#[test]
+fn secrets_cli_and_runtime_resolve_env_file_keychain_and_redact_traces_and_errors() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+
+    let dir = std::env::temp_dir().join(format!(
+        "starchart_secrets_e2e_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let keychain_file = dir.join("mock_keychain.json");
+    let file_secret_path = dir.join("mcp_token.secret");
+    std::fs::write(&file_secret_path, "file_secret_val_999\n").unwrap();
+
+    // 1. Test `starchart secrets set`, `check`, and `delete` via STARCHART_KEYCHAIN_MOCK_FILE
+    let mut set_child = Command::new(bin_path())
+        .args(["secrets", "set", "STRIPE_KEY"])
+        .env("STARCHART_KEYCHAIN_MOCK_FILE", &keychain_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn starchart secrets set");
+    writeln!(
+        set_child.stdin.take().unwrap(),
+        "keychain_secret_val_777"
+    )
+    .unwrap();
+    let set_out = set_child.wait_with_output().unwrap();
+    assert!(set_out.status.success());
+
+    let check_ok = Command::new(bin_path())
+        .args(["secrets", "check", "STRIPE_KEY"])
+        .env("STARCHART_KEYCHAIN_MOCK_FILE", &keychain_file)
+        .output()
+        .unwrap();
+    assert!(check_ok.status.success());
+
+    // 2. Spawn a local mock server handling both `/charge` (`@starchart/http`) and `/mcp` (`@starchart/mcp`)
+    let captured_headers: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let headers_clone = Arc::clone(&captured_headers);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0_u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            headers_clone.lock().unwrap().push(req.clone());
+
+            let (head, body_part) = req.split_once("\r\n\r\n").unwrap_or((&req, ""));
+            let first_line = head.lines().next().unwrap_or("");
+            let resp_body = if first_line.contains("/charge") {
+                r#"{"charged":true}"#.to_owned()
+            } else if body_part.contains(r#""method":"initialize""#) {
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":"1.0"}}}"#.to_owned()
+            } else if body_part.contains(r#""notifications/initialized""#) {
+                String::new()
+            } else {
+                r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"mcp_ok\":true}"}],"isError":false}}"#.to_owned()
+            };
+            let status_line = if resp_body.is_empty() {
+                "202 Accepted"
+            } else {
+                "200 OK"
+            };
+            let resp = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+
+    // 3. Write a `.star` workflow using `secret(...)` across `@starchart/http` (keychain),
+    //    `@starchart/mcp` (file), and `@starchart/exec` (env, intentionally echoing the secret to stderr on failure!)
+    let chart_path = dir.join("secrets_workflow.star");
+    let chart_src = format!(
+        r#"
+load("@starchart/secrets", "SecretSource", "secret")
+load("@starchart/http", "HttpMethod", "http_request", "invoke_http")
+load("@starchart/mcp", "invoke_mcp", "mcp_http_server")
+load("@starchart/exec", "invoke_cmd")
+
+Ctx = record(
+    http_ok = field(bool, False),
+    mcp_ok = field(bool, False),
+    scrubbed_err = field(str, ""),
+)
+
+S = state_space("charging", "calling_mcp", "running_exec", "scrubbed_failure", "unexpected_ok")
+
+mcp_srv = mcp_http_server(
+    id = "vault_mcp",
+    url = "http://127.0.0.1:{port}/mcp",
+    headers = {{
+        "X-Mcp-Auth": secret(
+            {file_secret_lit},
+            source = SecretSource.file,
+            prefix = "Token ",
+        ),
+    }},
+)
+
+chart = machine(
+    id = "secrets_workflow",
+    initial = S.charging,
+    context = Ctx(),
+    states = {{
+        S.charging: state(
+            invoke = invoke_http(
+                id = "stripe_charge",
+                request = http_request(
+                    method = HttpMethod.POST,
+                    url = "http://127.0.0.1:{port}/charge",
+                    headers = {{
+                        "Authorization": secret(
+                            "STRIPE_KEY",
+                            source = SecretSource.keychain,
+                            prefix = "Bearer ",
+                        ),
+                        "X-Optional": secret("STARCHART_MISSING_OPTIONAL_VAR", optional = True),
+                    }},
+                    json = {{"amount": 1000}},
+                ),
+                on_done = outcome(
+                    target = S.calling_mcp,
+                    assign = lambda ctx, ev: update(ctx, http_ok = bool(ev["output"]["body"].get("charged", False))),
+                ),
+                on_error = outcome(
+                    target = S.scrubbed_failure,
+                    assign = lambda ctx, ev: update(ctx, scrubbed_err = str(ev.get("error", ""))),
+                ),
+            ),
+        ),
+        S.calling_mcp: state(
+            invoke = invoke_mcp(
+                server = mcp_srv,
+                tool = "verify",
+                on_done = outcome(
+                    target = S.running_exec,
+                    assign = lambda ctx, ev: update(ctx, mcp_ok = bool(ev["output"]["data"].get("mcp_ok", False))),
+                ),
+                on_error = outcome(
+                    target = S.scrubbed_failure,
+                    assign = lambda ctx, ev: update(ctx, scrubbed_err = str(ev.get("error", ""))),
+                ),
+            ),
+        ),
+        S.running_exec: state(
+            invoke = invoke_cmd(
+                id = "leaky_cmd",
+                cmd = ["sh", "-c", "echo \"auth failed with $EXEC_API_SECRET\" >&2; exit 1"],
+                env = {{"EXEC_API_SECRET": secret("STARCHART_TEST_EXEC_SECRET")}},
+                on_done = S.unexpected_ok,
+                on_error = outcome(
+                    target = S.scrubbed_failure,
+                    assign = lambda ctx, ev: update(ctx, scrubbed_err = str(ev.get("error", ""))),
+                ),
+            ),
+        ),
+        S.scrubbed_failure: final_state(),
+        S.unexpected_ok: final_state(),
+    }},
+)
+"#,
+        port = port,
+        file_secret_lit = serde_json::to_string(&file_secret_path.to_string_lossy()).unwrap(),
+    );
+    std::fs::write(&chart_path, chart_src).unwrap();
+
+    // 4. `starchart check` MUST succeed without `STARCHART_TEST_EXEC_SECRET` or keychain env set!
+    let check_chart = Command::new(bin_path())
+        .arg("check")
+        .arg(&chart_path)
+        .env_remove("STARCHART_TEST_EXEC_SECRET")
+        .env_remove("STARCHART_KEYCHAIN_MOCK_FILE")
+        .output()
+        .unwrap();
+    assert!(
+        check_chart.status.success(),
+        "starchart check failed:\n{}",
+        String::from_utf8_lossy(&check_chart.stderr)
+    );
+
+    // 5. Running WITHOUT `STARCHART_TEST_EXEC_SECRET` fails cleanly with a clear missing-secret message
+    let missing_run = Command::new(bin_path())
+        .arg("run")
+        .arg(&chart_path)
+        .arg("--trace")
+        .arg("-")
+        .env("STARCHART_KEYCHAIN_MOCK_FILE", &keychain_file)
+        .env_remove("STARCHART_TEST_EXEC_SECRET")
+        .output()
+        .unwrap();
+    assert!(missing_run.status.success());
+    let missing_stdout = String::from_utf8_lossy(&missing_run.stdout);
+    assert!(
+        missing_stdout.contains("missing required secret `STARCHART_TEST_EXEC_SECRET`"),
+        "expected missing secret error in:\n{missing_stdout}"
+    );
+
+    // 6. Run with all 3 secret sources (`keychain`, `file`, `env`) populated and verify:
+    //    - Outbound HTTP + MCP requests received the real resolved headers
+    //    - JSONL trace AND `context.scrubbed_err` completely redact all 3 raw secret values!
+    let full_run = Command::new(bin_path())
+        .arg("run")
+        .arg(&chart_path)
+        .arg("--trace")
+        .arg("-")
+        .env("STARCHART_KEYCHAIN_MOCK_FILE", &keychain_file)
+        .env("STARCHART_TEST_EXEC_SECRET", "env_secret_val_555")
+        .output()
+        .unwrap();
+    let full_stdout = String::from_utf8_lossy(&full_run.stdout);
+    let full_stderr = String::from_utf8_lossy(&full_run.stderr);
+    assert!(
+        full_run.status.success(),
+        "stdout:\n{full_stdout}\nstderr:\n{full_stderr}"
+    );
+
+    // Raw secrets must NEVER appear anywhere in stdout trace or stderr human logs!
+    for raw_secret in [
+        "keychain_secret_val_777",
+        "file_secret_val_999",
+        "env_secret_val_555",
+    ] {
+        assert!(
+            !full_stdout.contains(raw_secret),
+            "raw secret `{raw_secret}` leaked into JSONL trace:\n{full_stdout}"
+        );
+        assert!(
+            !full_stderr.contains(raw_secret),
+            "raw secret `{raw_secret}` leaked into stderr:\n{full_stderr}"
+        );
+    }
+
+    // Verify redaction placeholders ARE present in `service_started`, `service_progress`, and `context.scrubbed_err`!
+    assert!(full_stdout.contains("<secret:STRIPE_KEY>"));
+    assert!(full_stdout.contains("<secret:STARCHART_TEST_EXEC_SECRET>"));
+    let records = parse_jsonl(&full_stdout);
+    let final_tr = records
+        .iter()
+        .rfind(|r| r["kind"] == "transition")
+        .unwrap();
+    assert_eq!(final_tr["context"]["http_ok"], true);
+    assert_eq!(final_tr["context"]["mcp_ok"], true);
+    assert!(
+        final_tr["context"]["scrubbed_err"]
+            .as_str()
+            .unwrap()
+            .contains("auth failed with <secret:STARCHART_TEST_EXEC_SECRET>"),
+        "expected scrubbed error in context: {final_tr}"
+    );
+
+    // Verify the mock server actually received the real resolved `Bearer` and `Token` headers over the wire!
+    let seen_reqs = captured_headers.lock().unwrap().join("\n---\n").to_ascii_lowercase();
+    assert!(
+        seen_reqs.contains("authorization: bearer keychain_secret_val_777"),
+        "expected Authorization header on wire:\n{seen_reqs}"
+    );
+    assert!(
+        seen_reqs.contains("x-mcp-auth: token file_secret_val_999"),
+        "expected X-Mcp-Auth header on wire:\n{seen_reqs}"
+    );
+    assert!(
+        !seen_reqs.contains("x-optional:"),
+        "optional unset secret should omit header:\n{seen_reqs}"
+    );
+
+    let del_out = Command::new(bin_path())
+        .args(["secrets", "delete", "STRIPE_KEY"])
+        .env("STARCHART_KEYCHAIN_MOCK_FILE", &keychain_file)
+        .output()
+        .unwrap();
+    assert!(del_out.status.success());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -16,6 +16,7 @@ starchart-runtime.workspace = true
 starchart-starlark.workspace = true
 clap.workspace = true
 indexmap.workspace = true
+secrecy.workspace = true
 serde_json.workspace = true
 starlark.workspace = true
 starlark_lsp.workspace = true
