@@ -1,3 +1,5 @@
+mod tui;
+
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -89,6 +91,11 @@ enum Commands {
         /// from `stdin` while the statechart executes.
         #[arg(long = "events-stdin", alias = "stdin")]
         events_stdin: bool,
+
+        /// Run an interactive terminal UI when the statechart waits for human input (renders
+        /// `@starness/ui` `json-render` specs or falls back to an `allowed_events` picker).
+        #[arg(short = 'i', long = "interactive")]
+        interactive: bool,
 
         /// Write the full execution trace as JSON Lines to PATH (`-` for stdout; human-readable
         /// progress then moves to stderr). One record per line: `started`, `transition`,
@@ -195,6 +202,7 @@ fn main() -> ExitCode {
             force_async,
             events,
             events_stdin,
+            interactive,
             trace,
         } => run_execute(
             &file,
@@ -203,6 +211,7 @@ fn main() -> ExitCode {
             force_async,
             &events,
             events_stdin,
+            interactive,
             trace.as_deref(),
         ),
         Commands::Serve {
@@ -360,6 +369,7 @@ fn run_execute(
     force_async: bool,
     raw_events: &[String],
     events_stdin: bool,
+    interactive: bool,
     trace_target: Option<&str>,
 ) -> ExitCode {
     let trace_out = match trace_target.map(open_trace_sink).transpose() {
@@ -406,13 +416,14 @@ fn run_execute(
         .iter()
         .any(|e| e.trim().starts_with("after:"));
 
-    if (force_async || events_stdin || uses_builtin_async) && !uses_simulated_clock {
+    if (force_async || events_stdin || interactive || uses_builtin_async) && !uses_simulated_clock {
         return run_execute_async(
             compiled,
             action_names,
             service_names,
             raw_events,
             events_stdin,
+            interactive,
             trace_out,
         );
     }
@@ -513,6 +524,7 @@ fn run_execute_async(
     service_names: HashSet<String>,
     raw_events: &[String],
     events_stdin: bool,
+    interactive: bool,
     trace_out: Option<TraceSink>,
 ) -> ExitCode {
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -536,7 +548,7 @@ fn run_execute_async(
             }
         };
         let trace_writer = trace_out.map(|sink| spawn_trace_writer(actor.subscribe_traces(), sink));
-        let code = drive_async(&compiled, &actor, raw_events, events_stdin).await;
+        let code = drive_async(&compiled, &actor, raw_events, events_stdin, interactive).await;
         actor.stop().await;
         actor.trace_hub().close();
         tokio::task::spawn_blocking(move || finish_trace_writer(trace_writer))
@@ -565,6 +577,7 @@ async fn drive_async(
     actor: &StarnessActor,
     raw_events: &[String],
     events_stdin: bool,
+    interactive: bool,
 ) -> ExitCode {
     let init_ctx = actor.context().await.unwrap_or(Value::Null);
     say!(
@@ -642,7 +655,82 @@ async fn drive_async(
             if view.status != xstate_statemachine::core::Status::Running {
                 break;
             }
-            if !stdin_open && !active_states_have_autonomous_work(&compiled.ir, &current_states) {
+            let has_autonomous = active_states_have_autonomous_work(&compiled.ir, &current_states);
+            if !has_autonomous && interactive {
+                let ctx = actor.context().await.unwrap_or(Value::Null);
+                let ir_clone = compiled.ir.clone();
+                let states_clone = current_states.clone();
+                let use_stderr = HUMAN_TO_STDERR.load(Ordering::Relaxed);
+                let decision = tokio::task::spawn_blocking(move || {
+                    let stdin = std::io::stdin();
+                    let mut locked_in = stdin.lock();
+                    if use_stderr {
+                        let stderr = std::io::stderr();
+                        let mut locked_out = stderr.lock();
+                        tui::prompt_interactive_event(
+                            &ir_clone,
+                            &states_clone,
+                            &ctx,
+                            &mut locked_in,
+                            &mut locked_out,
+                        )
+                    } else {
+                        let stdout = std::io::stdout();
+                        let mut locked_out = stdout.lock();
+                        tui::prompt_interactive_event(
+                            &ir_clone,
+                            &states_clone,
+                            &ctx,
+                            &mut locked_in,
+                            &mut locked_out,
+                        )
+                    }
+                })
+                .await;
+
+                match decision {
+                    Ok(Ok(tui::InteractiveDecision::Dispatch {
+                        event_type,
+                        payload,
+                    })) => {
+                        step_num += 1;
+                        let res = if payload.is_null() {
+                            actor.send(&event_type).await
+                        } else {
+                            actor.send_with_payload(&event_type, payload).await
+                        };
+                        if let Err(err) = res {
+                            eprintln!("ERROR dispatching interactive event `{event_type}`: {err}");
+                            return ExitCode::from(1);
+                        }
+                        let ctx = actor.context().await.unwrap_or(Value::Null);
+                        prev_states = actor.active_states();
+                        say!(
+                            "[tui {}] event=`{}` active={:?} done={} output={} context={}",
+                            step_num,
+                            event_type,
+                            prev_states,
+                            actor.is_done(),
+                            actor.output(),
+                            ctx
+                        );
+                        if actor.is_done() {
+                            break;
+                        }
+                        continue;
+                    }
+                    Ok(Ok(tui::InteractiveDecision::Quit)) => break,
+                    Ok(Err(err)) => {
+                        eprintln!("ERROR in interactive TUI: {err:#}");
+                        return ExitCode::from(1);
+                    }
+                    Err(err) => {
+                        eprintln!("ERROR interactive TUI task panicked: {err}");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            if !stdin_open && !has_autonomous {
                 break;
             }
 
