@@ -3,9 +3,10 @@ use std::hash::Hash;
 
 use allocative::Allocative;
 use indexmap::{IndexMap, IndexSet};
+use serde::ser::SerializeMap;
 use starchart_ir::{
     ActionDef, AfterDef, AssignRef, DelayRef, GuardRef, InvokeDef, IrValidationError, MachineDef,
-    OutcomeDef, StateId, StateKind, StateNodeDef, TransitionDef,
+    OutcomeDef, SECRET_MARKER_KEY, StateId, StateKind, StateNodeDef, TransitionDef,
 };
 use starlark::any::ProvidesStaticType;
 use starlark::coerce::Coerce;
@@ -164,6 +165,88 @@ impl<'v> StarlarkValue<'v> for StarlarkStateId {
 
     fn dir_attr(&self) -> Vec<String> {
         vec!["id".to_owned(), "name".to_owned()]
+    }
+}
+
+/// Late-bound secret handle constructed via `@starchart/secrets` (`secret("API_KEY", ...)`).
+/// Never resolves environment variables, files, or OS keychains during Starlark evaluation;
+/// serializes to an opaque `$starchart_secret` descriptor resolved inside outbound Rust drivers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Allocative, ProvidesStaticType)]
+pub struct StarlarkSecret {
+    pub source: String,
+    pub name: String,
+    pub service: String,
+    pub prefix: String,
+    pub optional: bool,
+}
+
+starlark_simple_value!(StarlarkSecret);
+
+impl Display for StarlarkSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<secret:{}>", self.name)
+    }
+}
+
+impl serde::Serialize for StarlarkSecret {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(serde::Serialize)]
+        struct Inner<'a> {
+            source: &'a str,
+            name: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            service: Option<&'a str>,
+            prefix: &'a str,
+            optional: bool,
+        }
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(
+            SECRET_MARKER_KEY,
+            &Inner {
+                source: &self.source,
+                name: &self.name,
+                service: (self.source == "keychain").then_some(self.service.as_str()),
+                prefix: &self.prefix,
+                optional: self.optional,
+            },
+        )?;
+        map.end()
+    }
+}
+
+#[starlark_value(type = "Secret")]
+impl<'v> StarlarkValue<'v> for StarlarkSecret {
+    fn equals(&self, other: Value<'v>) -> starlark::Result<bool> {
+        Ok(match StarlarkSecret::from_value(other) {
+            Some(other_sec) => self == other_sec,
+            None => false,
+        })
+    }
+
+    fn write_hash(&self, hasher: &mut StarlarkHasher) -> starlark::Result<()> {
+        self.hash(hasher);
+        Ok(())
+    }
+
+    fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
+        match attribute {
+            "name" => Some(heap.alloc_str(&self.name).to_value()),
+            "source" => Some(heap.alloc_str(&self.source).to_value()),
+            "service" => Some(heap.alloc_str(&self.service).to_value()),
+            "prefix" => Some(heap.alloc_str(&self.prefix).to_value()),
+            "optional" => Some(Value::new_bool(self.optional)),
+            _ => None,
+        }
+    }
+
+    fn dir_attr(&self) -> Vec<String> {
+        vec![
+            "name".to_owned(),
+            "source".to_owned(),
+            "service".to_owned(),
+            "prefix".to_owned(),
+            "optional".to_owned(),
+        ]
     }
 }
 

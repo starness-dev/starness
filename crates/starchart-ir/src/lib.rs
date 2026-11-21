@@ -384,6 +384,44 @@ pub enum IrValidationError {
 
     #[error("state `{state}` is unreachable from initial state `{initial}`")]
     UnreachableState { state: StateId, initial: StateId },
+
+    #[error("secret descriptor at `{path}` cannot be stored in machine `context` (pass `secret(...)` only to outbound service inputs)")]
+    SecretInContext { path: String },
+}
+
+/// JSON object key marking a late-bound `@starchart/secrets` descriptor (`{"$starchart_secret": {...}}`).
+pub const SECRET_MARKER_KEY: &str = "$starchart_secret";
+
+/// Recursively inspects `val` for any object containing [`SECRET_MARKER_KEY`], returning its JSON path.
+pub fn find_secret_marker_path(val: &serde_json::Value) -> Option<String> {
+    find_secret_marker_inner(val, "context".to_owned())
+}
+
+fn find_secret_marker_inner(val: &serde_json::Value, current_path: String) -> Option<String> {
+    match val {
+        serde_json::Value::Object(map) => {
+            if map.contains_key(SECRET_MARKER_KEY) {
+                return Some(current_path);
+            }
+            for (k, child) in map {
+                if let Some(found) = find_secret_marker_inner(child, format!("{current_path}.{k}")) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                if let Some(found) =
+                    find_secret_marker_inner(item, format!("{current_path}[{idx}]"))
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn format_missing_initial(parent: Option<&StateId>, initial: &StateId) -> String {
@@ -415,6 +453,10 @@ impl MachineDef {
         let mut errors = Vec::new();
         let mut registry: IndexMap<StateId, NodeRecord<'_>> = IndexMap::new();
         let mut has_duplicates = false;
+
+        if let Some(path) = find_secret_marker_path(&self.context) {
+            errors.push(IrValidationError::SecretInContext { path });
+        }
 
         Self::collect_states(
             &self.id,

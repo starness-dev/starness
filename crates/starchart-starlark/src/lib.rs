@@ -17,14 +17,15 @@ pub use schema::{
 };
 pub use stdlib::{
     ACP_MODULE_ID, BUILTIN_ACP_SERVICE, BUILTIN_EXEC_SERVICE, BUILTIN_HTTP_SERVICE,
-    BUILTIN_MCP_SERVICE, EXEC_MODULE_ID, HTTP_MODULE_ID, MCP_MODULE_ID, is_builtin_service,
-    resolve_builtin_module,
+    BUILTIN_MCP_SERVICE, EXEC_MODULE_ID, HTTP_MODULE_ID, MCP_MODULE_ID, SECRETS_MODULE_ID,
+    is_builtin_service, resolve_builtin_module,
 };
 pub use types::{
     ArtifactMode, FrozenStarlarkMachine, INVOKE_INPUT_SLOT_KEY, INVOKE_TOOL_SLOT_KEY,
     StarlarkAction, StarlarkAfter, StarlarkAgentTool, StarlarkGuard, StarlarkInvoke,
-    StarlarkMachine, StarlarkOutcome, StarlarkStateId, StarlarkStateNode, StarlarkStateSpace,
-    StarlarkTransition, SymbolOrEnum, starlark_input_slot_name, starlark_tool_slot_name,
+    StarlarkMachine, StarlarkOutcome, StarlarkSecret, StarlarkStateId, StarlarkStateNode,
+    StarlarkStateSpace, StarlarkTransition, SymbolOrEnum, starlark_input_slot_name,
+    starlark_tool_slot_name,
 };
 
 #[cfg(test)]
@@ -460,6 +461,90 @@ chart = machine(
         assert_eq!(
             compiled.ir.states[&starchart_ir::StateId::from("opening_pr")].invoke[0].id.as_deref(),
             Some("github_create_pull_request")
+        );
+    }
+
+    #[test]
+    fn secrets_module_compiles_without_env_and_rejects_secrets_in_context() {
+        let valid_src = r#"
+load("@starchart/secrets", "SecretSource", "secret")
+load("@starchart/http", "http_request", "invoke_http")
+load("@starchart/exec", "invoke_cmd")
+load("@starchart/mcp", "invoke_mcp", "mcp_http_server")
+
+S = state_space("calling_http", "calling_exec", "calling_mcp", "done")
+
+mcp_srv = mcp_http_server(
+    id = "remote_mcp",
+    url = "https://mcp.example.com",
+    headers = {"Authorization": secret("STARCHART_UNSET_MCP_TOKEN", prefix = "Bearer ")},
+)
+
+chart = machine(
+    id = "secrets_compile_ok",
+    initial = S.calling_http,
+    states = {
+        S.calling_http: state(
+            invoke = invoke_http(
+                request = http_request(
+                    url = "https://api.example.com/v1",
+                    headers = {
+                        "Authorization": secret(
+                            "STARCHART_UNSET_KEYCHAIN_TOKEN",
+                            source = SecretSource.keychain,
+                            prefix = "Bearer ",
+                        ),
+                    },
+                ),
+                on_done = S.calling_exec,
+            ),
+        ),
+        S.calling_exec: state(
+            invoke = invoke_cmd(
+                cmd = ["echo", "ok"],
+                env = {"API_KEY": secret("STARCHART_UNSET_ENV_KEY")},
+                on_done = S.calling_mcp,
+            ),
+        ),
+        S.calling_mcp: state(
+            invoke = invoke_mcp(
+                server = mcp_srv,
+                tool = "ping",
+                on_done = S.done,
+            ),
+        ),
+        S.done: final_state(),
+    },
+)
+"#;
+        let compiled = compile_starlark_str("secrets_compile_ok.star", valid_src, None)
+            .expect("@starchart/secrets should compile without resolving env/keychain");
+        let http_input = &compiled.ir.states[&starchart_ir::StateId::from("calling_http")].invoke[0].input;
+        assert_eq!(
+            http_input["headers"]["Authorization"]["$starchart_secret"]["source"],
+            "keychain"
+        );
+
+        let leaked_ctx_src = r#"
+load("@starchart/secrets", "secret")
+
+S = state_space("idle")
+
+chart = machine(
+    id = "bad_secret_ctx",
+    initial = S.idle,
+    context = {"api_key": secret("STRIPE_SECRET")},
+    states = {
+        S.idle: state(),
+    },
+)
+"#;
+        let err = compile_starlark_str("bad_secret_ctx.star", leaked_ctx_src, None)
+            .expect_err("secret(...) inside `context` must fail validation");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("context.api_key") && msg.contains("cannot be stored in machine `context`"),
+            "unexpected error message: {msg}"
         );
     }
 }

@@ -12,6 +12,14 @@ pub const BUILTIN_ACP_SERVICE: &str = "__starchart_builtin_acp__";
 /// Built-in runtime service identifier for `@starchart/mcp` (client).
 pub const BUILTIN_MCP_SERVICE: &str = "__starchart_builtin_mcp__";
 
+/// Virtual Starlark module source for `@starchart/secrets`.
+pub const SECRETS_MODULE_ID: &str = "@starchart/secrets.star";
+pub const SECRETS_MODULE_SOURCE: &str = r#"
+SecretSource = enum("env", "file", "keychain")
+
+secret = __starchart_secret__
+"#;
+
 /// Virtual Starlark module source for `@starchart/http`.
 pub const HTTP_MODULE_ID: &str = "@starchart/http.star";
 pub const HTTP_MODULE_SOURCE: &str = r#"
@@ -20,7 +28,7 @@ HttpMethod = enum("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD")
 HttpRequest = record(
     method = str,
     url = str,
-    headers = field(dict[str, str], {}),
+    headers = field(dict[str, str | Secret], {}),
     json = field(typing.Any, None),
     body = field(str | None, None),
     timeout_ms = field(int, 30000),
@@ -30,7 +38,7 @@ def http_request(
     *,
     url: str,
     method: HttpMethod | str = "GET",
-    headers: dict[str, str] = {},
+    headers: dict[str, str | Secret] = {},
     json = None,
     body: str | None = None,
     timeout_ms: int = 30000,
@@ -69,7 +77,7 @@ pub const EXEC_MODULE_SOURCE: &str = r#"
 ExecSpec = record(
     cmd = list[str],
     cwd = field(str | None, None),
-    env = field(dict[str, str], {}),
+    env = field(dict[str, str | Secret], {}),
     stdin = field(str | None, None),
     timeout_ms = field(int, 60000),
     check = field(bool, True),
@@ -79,7 +87,7 @@ def exec_spec(
     *,
     cmd: list[str],
     cwd: str | None = None,
-    env: dict[str, str] = {},
+    env: dict[str, str | Secret] = {},
     stdin: str | None = None,
     timeout_ms: int = 60000,
     check: bool = True,
@@ -102,7 +110,7 @@ def invoke_cmd(
     cmd: list[str] | ExecSpec | typing.Callable,
     id: str | None = None,
     cwd: str | None = None,
-    env: dict[str, str] = {},
+    env: dict[str, str | Secret] = {},
     stdin: str | None = None,
     timeout_ms: int = 60000,
     check: bool = True,
@@ -148,7 +156,7 @@ AcpAgent = record(
     args = field(list[str], []),
     model = field(str, ""),
     cwd = field(str | None, None),
-    env = field(dict[str, str], {}),
+    env = field(dict[str, str | Secret], {}),
     config = field(dict[str, str], {}),
     timeout_ms = field(int, 300000),
 )
@@ -161,7 +169,7 @@ def acp_agent(
     model: str = "",
     protocol: AgentProtocol | str = "ACP",
     cwd: str | None = None,
-    env: dict[str, str] = {},
+    env: dict[str, str | Secret] = {},
     config: dict[str, str] = {},
     timeout_ms: int = 300000,
 ) -> AcpAgent:
@@ -191,7 +199,7 @@ def agy_agent(
     args: list[str] = ["acp"],
     model: str = "",
     cwd: str | None = None,
-    env: dict[str, str] = {},
+    env: dict[str, str | Secret] = {},
     config: dict[str, str] = {},
     timeout_ms: int = 300000,
 ) -> AcpAgent:
@@ -216,7 +224,7 @@ def claude_agent(
     use_acp_adapter: bool = False,
     permission_mode: str = "",
     cwd: str | None = None,
-    env: dict[str, str] = {},
+    env: dict[str, str | Secret] = {},
     config: dict[str, str] = {},
     timeout_ms: int = 300000,
 ) -> AcpAgent:
@@ -256,7 +264,7 @@ def codex_agent(
     use_acp_adapter: bool = False,
     sandbox: str = "",
     cwd: str | None = None,
-    env: dict[str, str] = {},
+    env: dict[str, str | Secret] = {},
     config: dict[str, str] = {},
     timeout_ms: int = 300000,
 ) -> AcpAgent:
@@ -327,9 +335,9 @@ McpServer = record(
     command = field(str, ""),
     args = field(list[str], []),
     cwd = field(str | None, None),
-    env = field(dict[str, str], {}),
+    env = field(dict[str, str | Secret], {}),
     url = field(str, ""),
-    headers = field(dict[str, str], {}),
+    headers = field(dict[str, str | Secret], {}),
     timeout_ms = field(int, 30000),
 )
 
@@ -339,7 +347,7 @@ def mcp_stdio_server(
     command: str,
     args: list[str] = [],
     cwd: str | None = None,
-    env: dict[str, str] = {},
+    env: dict[str, str | Secret] = {},
     timeout_ms: int = 30000,
 ) -> McpServer:
     if id == "":
@@ -362,7 +370,7 @@ def mcp_http_server(
     *,
     id: str,
     url: str,
-    headers: dict[str, str] = {},
+    headers: dict[str, str | Secret] = {},
     timeout_ms: int = 30000,
 ) -> McpServer:
     if id == "":
@@ -385,9 +393,9 @@ def mcp_server(
     command: str = "",
     args: list[str] = [],
     cwd: str | None = None,
-    env: dict[str, str] = {},
+    env: dict[str, str | Secret] = {},
     url: str = "",
-    headers: dict[str, str] = {},
+    headers: dict[str, str | Secret] = {},
     timeout_ms: int = 30000,
 ) -> McpServer:
     if command != "" and url != "":
@@ -451,6 +459,9 @@ pub fn resolve_builtin_module(load_path: &str) -> Option<(&'static str, &'static
         | "/@starchart/agents.star" => Some((ACP_MODULE_ID, ACP_MODULE_SOURCE)),
         "@starchart/mcp" | "@starchart/mcp.star" | "/@starchart/mcp.star" => {
             Some((MCP_MODULE_ID, MCP_MODULE_SOURCE))
+        }
+        "@starchart/secrets" | "@starchart/secrets.star" | "/@starchart/secrets.star" => {
+            Some((SECRETS_MODULE_ID, SECRETS_MODULE_SOURCE))
         }
         _ => None,
     }

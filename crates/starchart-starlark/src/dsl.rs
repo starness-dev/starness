@@ -23,8 +23,8 @@ use crate::types::{
     DelayInput, GuardExprGen, GuardInput, InvokeDataGen, InvokeInputGen, InvokeOutcomesInput,
     JsonHolder, NodeKindDataGen, OneOrManyAfter, OneOrManyInvoke, OutcomeDataGen, StarlarkAction,
     StarlarkAfter, StarlarkAgentTool, StarlarkGuard, StarlarkInvoke, StarlarkMachine,
-    StarlarkOutcome, StarlarkStateId, StarlarkStateNode, StarlarkStateSpace, StarlarkTransition,
-    StateNodeDataGen, SymbolOrEnum, TransitionDataGen, TypeShapeHolder,
+    StarlarkOutcome, StarlarkSecret, StarlarkStateId, StarlarkStateNode, StarlarkStateSpace,
+    StarlarkTransition, StateNodeDataGen, SymbolOrEnum, TransitionDataGen, TypeShapeHolder,
     build_and_validate_machine, clone_node_to_value, clone_transition_to_value,
     unpack_invoke_input_value,
 };
@@ -129,6 +129,7 @@ fn unpack_optional_meta(val: Option<Value<'_>>) -> anyhow::Result<Option<JsonHol
     StarlarkOutcome as Outcome,
     StarlarkAfter as After,
     StarlarkAgentTool as AgentTool,
+    StarlarkSecret as Secret,
     StarlarkInvoke as Invoke,
     StarlarkStateNode as StateNode,
     StarlarkMachine as StateMachine
@@ -900,6 +901,45 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
         extract_artifact_list(event, name, schema, eval)
+    }
+
+    /// Internal constructor exposed by `@starchart/secrets` (`secret(name, *, source = "env", service = "starchart", prefix = "", optional = False)`).
+    fn __starchart_secret__(
+        #[starlark(require = pos)] name: &str,
+        #[starlark(require = named)] source: Option<SymbolOrEnum>,
+        #[starlark(require = named, default = "starchart")] service: &str,
+        #[starlark(require = named, default = "")] prefix: &str,
+        #[starlark(require = named, default = false)] optional: bool,
+    ) -> anyhow::Result<StarlarkSecret> {
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            bail!("secret `name` must not be empty");
+        }
+        let trimmed_service = service.trim();
+        if trimmed_service.is_empty() {
+            bail!("secret `service` must not be empty");
+        }
+        let raw_source = source
+            .as_ref()
+            .map(|s| s.0.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "env".to_owned());
+        let normalized_source = match raw_source.as_str() {
+            "env" => "env",
+            "file" => "file",
+            "keychain" | "keyring" => "keychain",
+            _ => {
+                bail!(
+                    "secret `source` must be `\"env\"`, `\"file\"`, or `\"keychain\"`, got `{raw_source}`"
+                );
+            }
+        };
+        Ok(StarlarkSecret {
+            source: normalized_source.to_owned(),
+            name: trimmed_name.to_owned(),
+            service: trimmed_service.to_owned(),
+            prefix: prefix.to_owned(),
+            optional,
+        })
     }
 }
 
