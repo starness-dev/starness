@@ -36,7 +36,7 @@ BashArgs = record(
 )
 
 SessionCtx = record(
-    model = field(str, "openai::gpt-4o-mini"),
+    model = field(str, "gpt-6-luna"),
     llm_endpoint = field(str, ""),
     cwd = field(str, ""),
     messages = field(list[dict], []),

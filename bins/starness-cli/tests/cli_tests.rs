@@ -1946,6 +1946,7 @@ fn release_notes_llm_example_streams_structured_record_and_gates_breaking_change
     });
 
     let ctx_patch = serde_json::json!({
+        "model": "openai::gpt-4o-mini",
         "llm_endpoint": format!("http://127.0.0.1:{port}/v1"),
     })
     .to_string();
@@ -2237,6 +2238,7 @@ fn coding_session_llm_example_runs_multiturn_tool_loop_and_exits() {
     });
 
     let ctx_patch = serde_json::json!({
+        "model": "openai::gpt-4o-mini",
         "llm_endpoint": format!("http://127.0.0.1:{port}/v1"),
     })
     .to_string();

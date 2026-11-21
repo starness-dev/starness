@@ -44,7 +44,7 @@ ReleaseCtx = record(
             "docs(readme): document @starness/llm standard module",
         ],
     ),
-    model = field(str, "openai::gpt-4o-mini"),
+    model = field(str, "gpt-6-luna"),
     llm_endpoint = field(str, ""),
     headline = field(str, ""),
     breaking = field(bool, False),
