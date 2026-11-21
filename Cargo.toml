@@ -22,6 +22,8 @@ starlark_map = "0.14.2"
 starlark_syntax = "0.14.2"
 starlark_lsp = "0.14.2"
 allocative = "0.3"
+base64 = "0.23"
+decision-rs = { version = "0.7.0", default-features = false, features = ["retry", "rustls-tls"] }
 dupe = "0.9"
 xstate-statemachine = { version = "0.1.1", features = ["tokio", "macros"] }
 serde = { version = "1.0", features = ["derive"] }

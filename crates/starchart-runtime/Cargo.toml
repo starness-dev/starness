@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
+decision-rs.workspace = true
 starchart-ir.workspace = true
 starchart-starlark.workspace = true
 dupe.workspace = true

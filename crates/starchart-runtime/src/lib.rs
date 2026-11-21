@@ -28,8 +28,8 @@ use starchart_ir::{
     StateNodeDef, TransitionDef,
 };
 use starchart_starlark::{
-    BUILTIN_ACP_SERVICE, BUILTIN_EXEC_SERVICE, BUILTIN_HTTP_SERVICE, BUILTIN_MCP_SERVICE,
-    CompiledChart, INVOKE_INPUT_SLOT_KEY,
+    BUILTIN_ACP_SERVICE, BUILTIN_DECIDE_SERVICE, BUILTIN_EXEC_SERVICE, BUILTIN_HTTP_SERVICE,
+    BUILTIN_MCP_SERVICE, CompiledChart, INVOKE_INPUT_SLOT_KEY,
 };
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
@@ -731,6 +731,20 @@ fn format_invoke_src_label(inv: &InvokeDef) -> String {
                 .and_then(Value::as_str)
                 .unwrap_or("call");
             format!("mcp {sid}.{tool}")
+        }
+        BUILTIN_DECIDE_SERVICE => {
+            if let Some(prov) = inv.input.get("provider").and_then(Value::as_object) {
+                let p = prov
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or("decide");
+                let m = prov.get("model").and_then(Value::as_str).unwrap_or("");
+                if !m.is_empty() {
+                    return format!("decide {p} ({m})");
+                }
+                return format!("decide {p}");
+            }
+            "decide".to_owned()
         }
         other => other.to_owned(),
     }
@@ -1549,9 +1563,21 @@ fn eval_starlark_input_fn(
                 unsafe { input_fn.owned_frozen_value(module.frozen_heap()) }.to_value();
 
             let mut eval = Evaluator::new(&module);
-            let result = eval
-                .eval_function(callable_val, &[ctx_val], &[])
-                .map_err(|e| XStateError::Logic(format!("service `{service_name}` input: {e:#}")))?;
+            let result = match eval.eval_function(callable_val, &[ctx_val], &[]) {
+                Ok(v) => v,
+                Err(first_err) if first_err.to_string().contains("Missing parameter") => {
+                    let empty_ev = module.heap().alloc(AllocDict::EMPTY);
+                    eval.eval_function(callable_val, &[ctx_val, empty_ev], &[])
+                        .map_err(|e| {
+                            XStateError::Logic(format!("service `{service_name}` input: {e:#}"))
+                        })?
+                }
+                Err(e) => {
+                    return Err(XStateError::Logic(format!(
+                        "service `{service_name}` input: {e:#}"
+                    )));
+                }
+            };
 
             result
                 .to_json_value()
