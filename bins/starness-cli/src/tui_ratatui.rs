@@ -1466,16 +1466,34 @@ fn render_main_pane(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
         return;
     }
 
-    // Split top display items from main interactive widgets
-    let display_height = estimate_display_height(&model.display_items).min(area.height / 3);
-    let (display_area, widgets_area) = if display_height > 0 {
+    // Split top display items from interactive widgets.
+    // When there is no full-height review/picker widget, let display items (e.g. a live Table)
+    // take the flexible remaining height while compact inputs/ActionBar sit neatly below.
+    let has_primary_widget = model.widgets.iter().any(|w| {
+        matches!(
+            w,
+            FocusWidget::MarkdownReview { .. }
+                | FocusWidget::DiffReview { .. }
+                | FocusWidget::FallbackPicker { .. }
+        )
+    });
+    let (display_area, widgets_area) = if model.display_items.is_empty() {
+        (None, area)
+    } else if has_primary_widget {
+        let display_height = estimate_display_height(&model.display_items).min(area.height / 3);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(display_height), Constraint::Min(6)])
             .split(area);
         (Some(chunks[0]), chunks[1])
     } else {
-        (None, area)
+        let widgets_height = estimate_compact_widgets_height(&model.widgets, area.width)
+            .min(area.height.saturating_sub(4));
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(4), Constraint::Length(widgets_height)])
+            .split(area);
+        (Some(chunks[0]), chunks[1])
     };
 
     if let Some(d_area) = display_area {
@@ -1483,6 +1501,31 @@ fn render_main_pane(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
     }
 
     render_interactive_widgets(f, widgets_area, model);
+}
+
+fn action_bar_height(buttons: &[ActionBarItem], area_width: u16) -> u16 {
+    let inner_w = area_width.saturating_sub(2).max(20) as usize;
+    let total_w: usize = buttons
+        .iter()
+        .map(|b| b.label.chars().count() + 10)
+        .sum();
+    let rows = total_w.div_ceil(inner_w).clamp(1, 3) as u16;
+    rows + 2
+}
+
+fn estimate_compact_widgets_height(widgets: &[FocusWidget], area_width: u16) -> u16 {
+    let mut total: u16 = 0;
+    for w in widgets {
+        total = total.saturating_add(match w {
+            FocusWidget::Select { options, .. } => (options.len() as u16).min(6) + 2,
+            FocusWidget::MultiSelect { options, .. } => (options.len() as u16).min(6) + 2,
+            FocusWidget::Confirm { .. } => 4,
+            FocusWidget::TextInput { .. } => 3,
+            FocusWidget::ActionBar { buttons, .. } => action_bar_height(buttons, area_width),
+            _ => 6,
+        });
+    }
+    total
 }
 
 fn estimate_display_height(items: &[DisplayItem]) -> u16 {
@@ -1590,14 +1633,18 @@ fn render_display_items(f: &mut Frame<'_>, area: Rect, items: &[DisplayItem]) {
                 columns,
                 rows,
             } => {
+                lines.push(Line::from(""));
                 if let Some(t) = title {
-                    lines.push(Line::styled(t.clone(), Style::default().fg(TEXT_MUTED)));
+                    lines.push(Line::styled(
+                        format!(" {t}"),
+                        Style::default().fg(TEXT_MUTED).add_modifier(Modifier::BOLD),
+                    ));
                 }
                 lines.push(Line::styled(
                     format!("  {}", columns.join(" │ ")),
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ));
-                for r in rows.iter().take(5) {
+                for r in rows.iter().take(25) {
                     lines.push(Line::styled(
                         format!("  {}", r.join(" │ ")),
                         Style::default().fg(TEXT_SECONDARY),
@@ -1647,7 +1694,10 @@ fn render_interactive_widgets(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
                 Constraint::Length((options.len() as u16).min(6) + 2)
             }
             FocusWidget::Confirm { .. } => Constraint::Length(4),
-            FocusWidget::TextInput { .. } | FocusWidget::ActionBar { .. } => Constraint::Length(3),
+            FocusWidget::TextInput { .. } => Constraint::Length(3),
+            FocusWidget::ActionBar { buttons, .. } => {
+                Constraint::Length(action_bar_height(buttons, area.width))
+            }
         });
     }
 
@@ -1824,11 +1874,12 @@ fn render_interactive_widgets(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
                 );
             }
             FocusWidget::ActionBar { buttons, cursor } => {
-                let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+                let inner_w = rect.width.saturating_sub(2).max(16) as usize;
+                let mut rows_out: Vec<Line<'static>> = Vec::new();
+                let mut cur_spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+                let mut cur_w: usize = 1;
+
                 for (bi, btn) in buttons.iter().enumerate() {
-                    if bi > 0 {
-                        spans.push(Span::raw("   "));
-                    }
                     let count_suffix = if btn.show_comment_count
                         && let Some(path) = &btn.comments_path
                     {
@@ -1853,23 +1904,37 @@ fn render_interactive_widgets(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
                         _ => TEXT_SECONDARY,
                     };
                     let text = format!("{}{count_suffix}", btn.label);
-                    if is_focused && bi == *cursor {
-                        spans.push(Span::styled(
-                            format!("  {text}  "),
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(color)
-                                .add_modifier(Modifier::BOLD),
-                        ));
+                    let chip_text = if is_focused && bi == *cursor {
+                        format!("  {text}  ")
                     } else {
-                        spans.push(Span::styled(
-                            format!("[ {text} ]"),
-                            Style::default().fg(color),
-                        ));
+                        format!("[ {text} ]")
+                    };
+                    let chip_w = chip_text.chars().count();
+                    let sep_w = if cur_spans.len() > 1 { 2 } else { 0 };
+                    if cur_spans.len() > 1 && cur_w + sep_w + chip_w > inner_w {
+                        rows_out.push(Line::from(std::mem::take(&mut cur_spans)));
+                        cur_spans.push(Span::raw(" "));
+                        cur_w = 1;
+                    } else if cur_spans.len() > 1 {
+                        cur_spans.push(Span::raw("  "));
+                        cur_w += 2;
                     }
+                    let style = if is_focused && bi == *cursor {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(color)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(color)
+                    };
+                    cur_spans.push(Span::styled(chip_text, style));
+                    cur_w += chip_w;
+                }
+                if cur_spans.len() > 1 {
+                    rows_out.push(Line::from(cur_spans));
                 }
                 f.render_widget(
-                    Paragraph::new(Line::from(spans)).block(
+                    Paragraph::new(rows_out).block(
                         Block::bordered()
                             .border_type(BorderType::Rounded)
                             .title(" Actions ")
