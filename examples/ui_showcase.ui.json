@@ -1,0 +1,177 @@
+{
+  "machine": "ui_showcase",
+  "views": {
+    "display": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["header_card", "crates_table", "intro_md", "nav_row"]
+        },
+        "header_card": {
+          "type": "Card",
+          "props": { "title": "1 / 4 · Display Widgets" },
+          "children": ["badge", "kv", "alert_info"]
+        },
+        "badge": {
+          "type": "Badge",
+          "props": { "label": { "$state": "/step_badge" }, "variant": "info" }
+        },
+        "kv": {
+          "type": "KeyValue",
+          "props": { "items": { "$state": "/metrics" } }
+        },
+        "alert_info": {
+          "type": "Alert",
+          "props": {
+            "title": "Dual-Target Catalog",
+            "message": "Same *.ui.json renders in both Ratatui TUI and embedded Web Studio.",
+            "variant": "success"
+          }
+        },
+        "crates_table": {
+          "type": "Table",
+          "props": {
+            "title": "Workspace Crates",
+            "columns": ["Crate", "Status", "Purpose"],
+            "rows": { "$state": "/services_rows" }
+          }
+        },
+        "intro_md": {
+          "type": "Markdown",
+          "props": {
+            "title": "Tip",
+            "content": { "$state": "/overview_md" }
+          }
+        },
+        "nav_row": {
+          "type": "Stack",
+          "props": { "direction": "horizontal", "gap": "sm" },
+          "children": ["btn_next", "btn_finish"]
+        },
+        "btn_next": {
+          "type": "Button",
+          "props": { "label": "Next: Inputs →", "event": "NEXT", "variant": "primary" }
+        },
+        "btn_finish": {
+          "type": "Button",
+          "props": { "label": "Finish", "event": "FINISH", "variant": "secondary" }
+        }
+      }
+    },
+    "inputs": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["title_card", "reviewer_in", "notes_area", "env_select", "checks_multi", "nav_row"]
+        },
+        "title_card": {
+          "type": "Card",
+          "props": { "title": "2 / 4 · Input & Action Widgets" },
+          "children": ["badge"]
+        },
+        "badge": {
+          "type": "Badge",
+          "props": { "label": "Tab between inputs & Actions", "variant": "warning" }
+        },
+        "reviewer_in": {
+          "type": "TextInput",
+          "props": { "label": "Reviewer Handle", "bind": "/reviewer", "placeholder": "name" }
+        },
+        "notes_area": {
+          "type": "Textarea",
+          "props": { "label": "Release Notes", "bind": "/notes_text", "rows": 3 }
+        },
+        "env_select": {
+          "type": "Select",
+          "props": { "label": "Target Environment", "bind": "/environment", "options": ["dev", "staging", "production"] }
+        },
+        "checks_multi": {
+          "type": "MultiSelect",
+          "props": {
+            "label": "Pre-flight Checks",
+            "bind": "/checklist",
+            "options": [
+              { "id": "clippy", "label": "Clippy clean", "description": "Zero warnings across workspace" },
+              { "id": "tests", "label": "Tests passing", "description": "Unit + E2E test suite" },
+              { "id": "docs", "label": "Docs updated", "description": "README and skill references" }
+            ]
+          }
+        },
+        "nav_row": {
+          "type": "Stack",
+          "props": { "direction": "horizontal", "gap": "sm" },
+          "children": ["btn_back", "btn_next", "btn_finish"]
+        },
+        "btn_back": {
+          "type": "Button",
+          "props": { "label": "← Back", "event": "BACK", "variant": "secondary" }
+        },
+        "btn_next": {
+          "type": "Button",
+          "props": { "label": "Next: Markdown Review →", "event": "NEXT", "variant": "primary" }
+        },
+        "btn_finish": {
+          "type": "Button",
+          "props": { "label": "Finish", "event": "FINISH", "variant": "danger" }
+        }
+      }
+    },
+    "markdown_review": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["md_rev", "btn_back"]
+        },
+        "md_rev": {
+          "type": "MarkdownReview",
+          "props": {
+            "title": "3 / 4 · MarkdownReview",
+            "markdown": { "$state": "/review_md" },
+            "agent_notes": { "$state": "/review_notes" },
+            "comments_path": "/review_comments",
+            "approve_event": "APPROVE",
+            "revise_event": "REVISE",
+            "approve_label": "Next: Diff Review →",
+            "revise_label": "Request Changes"
+          }
+        },
+        "btn_back": {
+          "type": "Button",
+          "props": { "label": "← Back", "event": "BACK", "variant": "secondary" }
+        }
+      }
+    },
+    "diff_review": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["diff_rev", "btn_back"]
+        },
+        "diff_rev": {
+          "type": "DiffReview",
+          "props": {
+            "title": "4 / 4 · DiffReview",
+            "diff": { "$state": "/patch_diff" },
+            "comments_path": "/diff_comments",
+            "approve_event": "APPROVE",
+            "revise_event": "REVISE",
+            "approve_label": "Finish Showcase",
+            "revise_label": "Request Changes"
+          }
+        },
+        "btn_back": {
+          "type": "Button",
+          "props": { "label": "← Back", "event": "BACK", "variant": "secondary" }
+        }
+      }
+    }
+  }
+}

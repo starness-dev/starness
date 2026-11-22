@@ -2665,9 +2665,9 @@ fn bluesky_radar_parallel_http_sampling_query_update_and_digest_curation() {
         }
     };
 
-    // Start instance pointed at local mock Bluesky server
+    // Start instance pointed at local mock Bluesky server with fast poll_ms for deterministic test
     let init_payload = serde_json::json!({
-        "context": { "api_base": format!("http://{mock_addr}") }
+        "context": { "api_base": format!("http://{mock_addr}"), "poll_ms": 60000 }
     })
     .to_string();
     let create_resp = send_raw(&format!(
@@ -2678,65 +2678,62 @@ fn bluesky_radar_parallel_http_sampling_query_update_and_digest_curation() {
         serde_json::from_str(create_resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     let id = created["id"].as_str().unwrap().to_owned();
 
-    // Wait for parallel `latest` + `top` sample to converge into `watching.paused`
-    let sampled = poll_until(&id, &|s| s["status"] == "waiting");
-    assert_eq!(sampled["status"], "waiting");
-    assert_eq!(sampled["context"]["sample_count"], 1);
-    assert_eq!(sampled["context"]["summary_kv"]["unique_posts"], 2); // deduplicated!
+    // Wait for initial fetch to finish -> `waiting` (note `waiting` has an `after` timer so status is `active`)
+    let sampled = poll_until(&id, &|s| {
+        s["active_states"] == serde_json::json!(["waiting"])
+            && s["context"]["ticks"].as_u64() == Some(1)
+    });
+    assert_eq!(sampled["active_states"], serde_json::json!(["waiting"]));
+    assert_eq!(sampled["context"]["summary_kv"]["posts"], 1);
     assert_eq!(sampled["ui"]["root"], "root");
-    assert!(
-        sampled["context"]["digest_md"]
-            .as_str()
-            .unwrap()
-            .contains("@alice.bsky.social")
-    );
 
-    // Send UPDATE_QUERY -> re-samples with URL-encoded new query
+    // Send UPDATE_QUERY -> clears list and fetches new URL-encoded query
     let upd = r#"{"type":"UPDATE_QUERY","query":"rust statecharts"}"#;
     let _ = send_raw(&format!(
         "POST /machines/bluesky_radar/instances/{id}/events HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{upd}",
         upd.len()
     ));
     let updated = poll_until(&id, &|s| {
-        s["status"] == "waiting" && s["context"]["query"] == "rust statecharts"
+        s["context"]["query"] == "rust statecharts" && s["context"]["ticks"].as_u64() == Some(1)
     });
-    assert_eq!(updated["context"]["summary_kv"]["unique_posts"], 1);
     assert!(
-        updated["context"]["digest_md"]
+        updated["context"]["posts_rows"][0][0]
             .as_str()
             .unwrap()
             .contains("@statechart.bsky.social")
     );
-
-    // CURATE_DIGEST -> switches view to `curating` (`MarkdownReview`)
-    let curate = r#"{"type":"CURATE_DIGEST"}"#;
-    let cur_resp = send_raw(&format!(
-        "POST /machines/bluesky_radar/instances/{id}/events HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{curate}",
-        curate.len()
-    ));
-    let curated: serde_json::Value =
-        serde_json::from_str(cur_resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    assert_eq!(curated["ui"]["elements"]["digest_review"]["type"], "MarkdownReview");
-
-    // EXPORT_DIGEST -> completes cleanly with curated notes saved
-    let export = r#"{"type":"EXPORT_DIGEST","comments":[{"line":1,"heading":"Top Posts","quote":"","comment":"Highlight this thread"}]}"#;
-    let exp_resp = send_raw(&format!(
-        "POST /machines/bluesky_radar/instances/{id}/events HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{export}",
-        export.len()
-    ));
-    let exported: serde_json::Value =
-        serde_json::from_str(exp_resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    assert_eq!(exported["status"], "completed");
-    assert_eq!(exported["output"], serde_json::json!({"status": "exported"}));
-    assert_eq!(
-        exported["context"]["curated_notes"][0]["comment"],
-        "Highlight this thread"
+    assert!(
+        updated["context"]["posts_rows"][0][0]
+            .as_str()
+            .unwrap()
+            .contains("https://bsky.app/profile/statechart.bsky.social/post/3")
     );
 
-    // Verify both `sort=latest` and `sort=top` were fetched with URL-encoded queries
+    // PAUSE -> transitions to `paused` view (`Resume (10s)` button)
+    let pause = r#"{"type":"PAUSE"}"#;
+    let pause_resp = send_raw(&format!(
+        "POST /machines/bluesky_radar/instances/{id}/events HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{pause}",
+        pause.len()
+    ));
+    let paused: serde_json::Value =
+        serde_json::from_str(pause_resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(paused["status"], "waiting");
+    assert_eq!(paused["active_states"], serde_json::json!(["paused"]));
+
+    // STOP -> completes cleanly
+    let stop = r#"{"type":"STOP"}"#;
+    let stop_resp = send_raw(&format!(
+        "POST /machines/bluesky_radar/instances/{id}/events HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{stop}",
+        stop.len()
+    ));
+    let stopped: serde_json::Value =
+        serde_json::from_str(stop_resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(stopped["status"], "completed");
+    assert_eq!(stopped["output"], serde_json::json!({"status": "stopped"}));
+
+    // Verify URL-encoded queries were sent
     let paths = seen_paths.lock().unwrap();
     assert!(paths.iter().any(|p| p.contains("q=ai%20harness") && p.contains("sort=latest")));
-    assert!(paths.iter().any(|p| p.contains("q=ai%20harness") && p.contains("sort=top")));
     assert!(paths.iter().any(|p| p.contains("q=rust%20statecharts")));
 
     let _ = child.kill();
