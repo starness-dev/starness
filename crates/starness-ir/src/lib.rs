@@ -1120,13 +1120,7 @@ pub fn collect_ui_spec_events(ui_val: &serde_json::Value) -> Vec<String> {
 
     for elem in elements.values() {
         if let Some(props) = elem.get("props").and_then(serde_json::Value::as_object) {
-            for key in [
-                "event",
-                "approve_event",
-                "revise_event",
-                "confirm_event",
-                "cancel_event",
-            ] {
+            for key in ["event", "approve_event", "revise_event"] {
                 if let Some(ev) = props.get(key).and_then(serde_json::Value::as_str) {
                     push_event(ev);
                 }
