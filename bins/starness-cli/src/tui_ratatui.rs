@@ -6,10 +6,14 @@
 //! live streaming trace drawer (`t`), live IR statechart diagram drawer (`g`), and context JSON
 //! drawer (`x`).
 
+use std::cell::RefCell;
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream, KeyCode, KeyEvent,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -20,7 +24,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, BorderType, Clear, List, ListItem, Paragraph, Row, Table as RatatuiTable, Wrap,
+    Block, BorderType, Cell, Clear, List, ListItem, Paragraph, Row, Table as RatatuiTable,
+    TableState, Wrap,
 };
 use ratatui::{Frame, Terminal};
 use serde_json::{Map, Value, json};
@@ -114,6 +119,12 @@ enum FocusWidget {
         props: Map<String, Value>,
         selected_line: usize,
     },
+    Table {
+        title: Option<String>,
+        columns: Vec<String>,
+        rows: Vec<Vec<String>>,
+        selected_row: usize,
+    },
     TextInput {
         label: String,
         bind: String,
@@ -129,11 +140,6 @@ enum FocusWidget {
         bind: String,
         options: Vec<(String, String, Option<String>)>,
         cursor: usize,
-    },
-    Confirm {
-        title: String,
-        confirm_event: String,
-        cancel_event: Option<String>,
     },
     ActionBar {
         buttons: Vec<ActionBarItem>,
@@ -162,11 +168,6 @@ enum DisplayKind {
     KeyValue {
         title: Option<String>,
         entries: Vec<(String, String)>,
-    },
-    Table {
-        title: Option<String>,
-        columns: Vec<String>,
-        rows: Vec<Vec<String>>,
     },
     Markdown {
         title: Option<String>,
@@ -214,11 +215,14 @@ struct AppModel {
     display_items: Vec<DisplayItem>,
     widgets: Vec<FocusWidget>,
     focused: usize,
+    saved_focused: usize,
+    saved_table_row: usize,
     scroll_offset: u16,
     modal: Option<InputModal>,
     modal_focus: ModalFocus,
     status_flash: Option<String>,
     last_state_key: String,
+    link_hotspot: RefCell<Option<(Rect, String)>>,
 }
 
 impl AppModel {
@@ -244,11 +248,14 @@ impl AppModel {
             display_items: Vec::new(),
             widgets: Vec::new(),
             focused: 0,
+            saved_focused: 0,
+            saved_table_row: 0,
             scroll_offset: 0,
             modal: None,
             modal_focus: ModalFocus::Input,
             status_flash: None,
             last_state_key: String::new(),
+            link_hotspot: RefCell::new(None),
         };
         model.sync_machine_state(active_states, context, Status::Running, Value::Null, None);
         model
@@ -257,6 +264,10 @@ impl AppModel {
     fn is_autonomous(&self) -> bool {
         self.status == Status::Running
             && active_states_have_autonomous_work(&self.ir, &self.active_states)
+    }
+
+    fn has_active_invoke(&self) -> bool {
+        self.status == Status::Running && active_states_have_invoke(&self.ir, &self.active_states)
     }
 
     fn sync_machine_state(
@@ -287,12 +298,20 @@ impl AppModel {
     }
 
     fn rebuild_widgets(&mut self) {
+        if !self.widgets.is_empty() {
+            self.saved_focused = self.focused;
+            for w in &self.widgets {
+                if let FocusWidget::Table { selected_row, .. } = w {
+                    self.saved_table_row = *selected_row;
+                }
+            }
+        }
         self.display_items.clear();
         self.widgets.clear();
         self.focused = 0;
         self.scroll_offset = 0;
 
-        if self.status != Status::Running || self.is_autonomous() {
+        if self.status != Status::Running {
             return;
         }
 
@@ -320,13 +339,26 @@ impl AppModel {
             });
         }
 
-        if self.widgets.is_empty() {
+        if !self.has_active_invoke() && self.widgets.is_empty() {
             let allowed = self.ir.allowed_events_for_active_states(&self.active_states);
             if !allowed.is_empty() {
                 self.widgets.push(FocusWidget::FallbackPicker {
                     events: allowed,
                     cursor: 0,
                 });
+            }
+        }
+
+        if !self.widgets.is_empty() {
+            self.focused = self.saved_focused.min(self.widgets.len() - 1);
+            for w in &mut self.widgets {
+                if let FocusWidget::Table {
+                    rows, selected_row, ..
+                } = w
+                    && !rows.is_empty()
+                {
+                    *selected_row = self.saved_table_row.min(rows.len() - 1);
+                }
             }
         }
     }
@@ -447,7 +479,7 @@ impl AppModel {
             _ => {}
         }
 
-        if self.is_autonomous() || self.widgets.is_empty() {
+        if self.widgets.is_empty() {
             return AppAction::None;
         }
 
@@ -889,6 +921,32 @@ impl AppModel {
                     _ => {}
                 }
             }
+            FocusWidget::Table {
+                rows,
+                selected_row,
+                ..
+            } => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if !rows.is_empty() && *selected_row + 1 < rows.len() {
+                        *selected_row += 1;
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *selected_row = selected_row.saturating_sub(1);
+                }
+                KeyCode::Char('o') => {
+                    if let Some(row) = rows.get(*selected_row)
+                        && let Some(url) = extract_row_urls(row).into_iter().next()
+                    {
+                        if open_url_in_browser(&url) {
+                            self.status_flash = Some(format!("Opened {url}"));
+                        } else {
+                            self.status_flash = Some(format!("Link: {url}"));
+                        }
+                    }
+                }
+                _ => {}
+            },
             FocusWidget::TextInput { label, bind } => {
                 if matches!(key.code, KeyCode::Enter | KeyCode::Char('e')) {
                     let current = self
@@ -966,30 +1024,6 @@ impl AppModel {
                             bind,
                             Value::Array(current.into_iter().map(Value::String).collect()),
                         );
-                    }
-                }
-                _ => {}
-            },
-            FocusWidget::Confirm {
-                confirm_event,
-                cancel_event,
-                ..
-            } => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => {
-                    let payload = diff_draft_payload(&Map::new(), &self.context, &self.draft_state);
-                    return AppAction::Dispatch {
-                        event_type: confirm_event.clone(),
-                        payload,
-                    };
-                }
-                KeyCode::Char('n') => {
-                    if let Some(ev) = cancel_event {
-                        let payload =
-                            diff_draft_payload(&Map::new(), &self.context, &self.draft_state);
-                        return AppAction::Dispatch {
-                            event_type: ev.clone(),
-                            payload,
-                        };
                     }
                 }
                 _ => {}
@@ -1075,7 +1109,7 @@ impl AppModel {
         if self.status != Status::Running {
             return vec![("Enter/q", "exit")];
         }
-        if self.is_autonomous() {
+        if self.is_autonomous() && self.widgets.is_empty() {
             return vec![("Running…", "waiting for state transition")];
         }
         let mut pairs: Vec<(&'static str, &'static str)> = match self.widgets.get(self.focused) {
@@ -1141,13 +1175,24 @@ impl AppModel {
                 }
                 v
             }
+            Some(FocusWidget::Table {
+                rows, selected_row, ..
+            }) => {
+                let has_url = rows
+                    .get(*selected_row)
+                    .is_some_and(|r| !extract_row_urls(r).is_empty());
+                if has_url {
+                    vec![("↑/↓", "row"), ("o", "open link")]
+                } else {
+                    vec![("↑/↓", "row")]
+                }
+            }
             Some(FocusWidget::ActionBar { .. }) => {
                 vec![("←/→", "select action"), ("Enter", "trigger")]
             }
             Some(FocusWidget::TextInput { .. }) => vec![("Enter", "edit")],
             Some(FocusWidget::Select { .. }) => vec![("↑/↓", "move"), ("Enter", "select")],
             Some(FocusWidget::MultiSelect { .. }) => vec![("↑/↓", "move"), ("Space", "toggle")],
-            Some(FocusWidget::Confirm { .. }) => vec![("y/Enter", "confirm"), ("n", "cancel")],
             Some(FocusWidget::FallbackPicker { .. }) => {
                 vec![("↑/↓", "pick"), ("Enter", "send"), ("p", "+payload")]
             }
@@ -1156,11 +1201,27 @@ impl AppModel {
         if self.widgets.len() > 1 {
             let next_label = match self.widgets.get(self.focused) {
                 Some(FocusWidget::ActionBar { .. }) => "back to content",
+                _ if self.widgets.len() > 2 => "next panel",
                 _ => "actions",
             };
             pairs.push(("Tab", next_label));
         }
         pairs
+    }
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+            && let Some((rect, url)) = self.link_hotspot.borrow().clone()
+            && mouse.column >= rect.x
+            && mouse.column < rect.x.saturating_add(rect.width)
+            && mouse.row >= rect.y
+            && mouse.row < rect.y.saturating_add(rect.height)
+        {
+            if open_url_in_browser(&url) {
+                self.status_flash = Some(format!("Opened {url}"));
+            } else {
+                self.status_flash = Some(format!("Link: {url}"));
+            }
+        }
     }
 }
 
@@ -1172,14 +1233,18 @@ pub async fn run_ratatui_app(
 ) -> anyhow::Result<std::process::ExitCode> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let run_res = run_ratatui_loop(&mut terminal, compiled, ui_sheet, actor).await;
 
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
     let _ = terminal.show_cursor();
 
     let exit_code = run_res?;
@@ -1240,32 +1305,38 @@ where
                 }
             }
             maybe_ev = term_events.next() => {
-                if let Some(Ok(TermEvent::Key(key))) = maybe_ev {
-                    model.status_flash = None;
-                    match model.handle_key(key) {
-                        AppAction::None => {}
-                        AppAction::Quit => break,
-                        AppAction::Dispatch { event_type, payload } => {
-                            let res = if payload.is_null() {
-                                actor.send(&event_type).await
-                            } else {
-                                actor.send_with_payload(&event_type, payload).await
-                            };
-                            if let Err(err) = res {
-                                model.status_flash = Some(format!("Dispatch error: {err}"));
-                            } else {
-                                let view = state_rx.borrow_and_update().clone();
-                                let ctx = actor.context().await.unwrap_or(Value::Null);
-                                model.sync_machine_state(
-                                    actor.active_states(),
-                                    ctx,
-                                    view.status,
-                                    actor.output(),
-                                    view.error,
-                                );
+                match maybe_ev {
+                    Some(Ok(TermEvent::Mouse(mouse))) => {
+                        model.handle_mouse(mouse);
+                    }
+                    Some(Ok(TermEvent::Key(key))) => {
+                        model.status_flash = None;
+                        match model.handle_key(key) {
+                            AppAction::None => {}
+                            AppAction::Quit => break,
+                            AppAction::Dispatch { event_type, payload } => {
+                                let res = if payload.is_null() {
+                                    actor.send(&event_type).await
+                                } else {
+                                    actor.send_with_payload(&event_type, payload).await
+                                };
+                                if let Err(err) = res {
+                                    model.status_flash = Some(format!("Dispatch error: {err}"));
+                                } else {
+                                    let view = state_rx.borrow_and_update().clone();
+                                    let ctx = actor.context().await.unwrap_or(Value::Null);
+                                    model.sync_machine_state(
+                                        actor.active_states(),
+                                        ctx,
+                                        view.status,
+                                        actor.output(),
+                                        view.error,
+                                    );
+                                }
                             }
                         }
                     }
+                    _ => {}
                 }
             }
         }
@@ -1279,6 +1350,7 @@ where
 }
 
 fn render_app(f: &mut Frame<'_>, model: &AppModel) {
+    *model.link_hotspot.borrow_mut() = None;
     let area = f.area();
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -1394,8 +1466,20 @@ fn render_header(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
         Style::default().fg(TEXT_MUTED).add_modifier(Modifier::BOLD),
     ));
     right_spans.push(Span::styled(" Exit ", Style::default().fg(TEXT_MUTED)));
+    let left_w = left_line.width() as u16;
     let right_line = Line::from(right_spans);
     let right_w = right_line.width() as u16;
+
+    let compact_right = Line::from(vec![
+        Span::styled("[t]", Style::default().fg(if model.drawer == DrawerMode::Trace { WARNING } else { ACCENT }).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled("[g]", Style::default().fg(if model.drawer == DrawerMode::Diagram { WARNING } else { ACCENT }).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled("[x]", Style::default().fg(if model.drawer == DrawerMode::Context { WARNING } else { ACCENT }).add_modifier(Modifier::BOLD)),
+        Span::styled(" │ ", Style::default().fg(BORDER_MUTED)),
+        Span::styled("[q] ", Style::default().fg(TEXT_MUTED).add_modifier(Modifier::BOLD)),
+    ]);
+    let compact_w = compact_right.width() as u16;
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -1403,13 +1487,20 @@ fn render_header(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if inner.width > right_w + 18 {
+    if inner.width >= left_w.saturating_add(right_w).saturating_add(2) {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(10), Constraint::Length(right_w)])
+            .constraints([Constraint::Min(left_w), Constraint::Length(right_w)])
             .split(inner);
         f.render_widget(Paragraph::new(left_line), cols[0]);
         f.render_widget(Paragraph::new(right_line), cols[1]);
+    } else if inner.width >= left_w.saturating_add(compact_w).saturating_add(1) {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(left_w), Constraint::Length(compact_w)])
+            .split(inner);
+        f.render_widget(Paragraph::new(left_line), cols[0]);
+        f.render_widget(Paragraph::new(compact_right), cols[1]);
     } else {
         f.render_widget(Paragraph::new(left_line), inner);
     }
@@ -1438,7 +1529,7 @@ fn render_main_pane(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
         return;
     }
 
-    if model.is_autonomous() {
+    if model.is_autonomous() && model.display_items.is_empty() && model.widgets.is_empty() {
         let mut lines = vec![Line::from(vec![
             Span::styled(
                 format!("{} ", SPINNER_FRAMES[model.spinner_tick]),
@@ -1466,34 +1557,16 @@ fn render_main_pane(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
         return;
     }
 
-    // Split top display items from interactive widgets.
-    // When there is no full-height review/picker widget, let display items (e.g. a live Table)
-    // take the flexible remaining height while compact inputs/ActionBar sit neatly below.
-    let has_primary_widget = model.widgets.iter().any(|w| {
-        matches!(
-            w,
-            FocusWidget::MarkdownReview { .. }
-                | FocusWidget::DiffReview { .. }
-                | FocusWidget::FallbackPicker { .. }
-        )
-    });
-    let (display_area, widgets_area) = if model.display_items.is_empty() {
-        (None, area)
-    } else if has_primary_widget {
-        let display_height = estimate_display_height(&model.display_items).min(area.height / 3);
+    // Split top display items (hugging content height) from interactive widgets below.
+    let display_height = estimate_display_height(&model.display_items).min(area.height / 2);
+    let (display_area, widgets_area) = if display_height > 0 {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(display_height), Constraint::Min(6)])
             .split(area);
         (Some(chunks[0]), chunks[1])
     } else {
-        let widgets_height = estimate_compact_widgets_height(&model.widgets, area.width)
-            .min(area.height.saturating_sub(4));
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(4), Constraint::Length(widgets_height)])
-            .split(area);
-        (Some(chunks[0]), chunks[1])
+        (None, area)
     };
 
     if let Some(d_area) = display_area {
@@ -1513,34 +1586,20 @@ fn action_bar_height(buttons: &[ActionBarItem], area_width: u16) -> u16 {
     rows + 2
 }
 
-fn estimate_compact_widgets_height(widgets: &[FocusWidget], area_width: u16) -> u16 {
-    let mut total: u16 = 0;
-    for w in widgets {
-        total = total.saturating_add(match w {
-            FocusWidget::Select { options, .. } => (options.len() as u16).min(6) + 2,
-            FocusWidget::MultiSelect { options, .. } => (options.len() as u16).min(6) + 2,
-            FocusWidget::Confirm { .. } => 4,
-            FocusWidget::TextInput { .. } => 3,
-            FocusWidget::ActionBar { buttons, .. } => action_bar_height(buttons, area_width),
-            _ => 6,
-        });
-    }
-    total
-}
-
 fn estimate_display_height(items: &[DisplayItem]) -> u16 {
     if items.is_empty() {
         return 0;
     }
     let mut rows: u16 = 2; // outer border
     let skip_first_heading = matches!(items.first().map(|i| &i.kind), Some(DisplayKind::Heading(_)));
+    let mut has_prev = false;
     for (idx, item) in items.iter().enumerate() {
         if idx == 0 && skip_first_heading {
             continue;
         }
         rows = rows.saturating_add(match &item.kind {
             DisplayKind::Heading(_) | DisplayKind::Badge(_, _) => 1,
-            DisplayKind::Alert { .. } => 2,
+            DisplayKind::Alert { .. } => 1 + u16::from(has_prev),
             DisplayKind::KeyValue { entries, title } => {
                 if is_compact_kv(entries) {
                     1 + u16::from(title.is_some())
@@ -1548,11 +1607,15 @@ fn estimate_display_height(items: &[DisplayItem]) -> u16 {
                     entries.len() as u16 + u16::from(title.is_some())
                 }
             }
-            DisplayKind::Table { rows: r, .. } => (r.len() as u16).min(5) + 2,
-            DisplayKind::Markdown { content, .. } => (content.lines().count() as u16).min(6),
+            DisplayKind::Markdown { title, content } => {
+                (content.lines().count() as u16).min(6)
+                    + u16::from(title.is_some())
+                    + u16::from(has_prev)
+            }
         });
+        has_prev = true;
     }
-    rows.clamp(3, 12)
+    rows.clamp(3, 14)
 }
 
 fn is_compact_kv(entries: &[(String, String)]) -> bool {
@@ -1592,10 +1655,14 @@ fn render_display_items(f: &mut Frame<'_>, area: Rect, items: &[DisplayItem]) {
                 message,
                 variant,
             } => {
+                if !lines.is_empty() {
+                    lines.push(Line::from(""));
+                }
                 let color = variant_color(variant);
                 lines.push(Line::from(vec![
+                    Span::styled(" ▎ ", Style::default().fg(color).add_modifier(Modifier::BOLD)),
                     Span::styled(
-                        format!(" ● {title}: "),
+                        format!("{title}: "),
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(message.clone(), Style::default().fg(TEXT_SECONDARY)),
@@ -1628,35 +1695,20 @@ fn render_display_items(f: &mut Frame<'_>, area: Rect, items: &[DisplayItem]) {
                     }
                 }
             }
-            DisplayKind::Table {
-                title,
-                columns,
-                rows,
-            } => {
-                lines.push(Line::from(""));
+            DisplayKind::Markdown { title, content } => {
+                if !lines.is_empty() {
+                    lines.push(Line::from(""));
+                }
                 if let Some(t) = title {
                     lines.push(Line::styled(
-                        format!(" {t}"),
+                        format!(" ── {t} ──"),
                         Style::default().fg(TEXT_MUTED).add_modifier(Modifier::BOLD),
                     ));
                 }
-                lines.push(Line::styled(
-                    format!("  {}", columns.join(" │ ")),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ));
-                for r in rows.iter().take(25) {
-                    lines.push(Line::styled(
-                        format!("  {}", r.join(" │ ")),
-                        Style::default().fg(TEXT_SECONDARY),
-                    ));
-                }
-            }
-            DisplayKind::Markdown { title, content } => {
-                if let Some(t) = title {
-                    lines.push(Line::styled(t.clone(), Style::default().fg(ACCENT)));
-                }
                 for ml in parse_md_lines(content) {
-                    lines.push(Line::from(render_md_line_spans(&ml.raw, ml.in_code_fence)));
+                    let mut spans = vec![Span::raw(" ")];
+                    spans.extend(render_md_line_spans(&ml.raw, ml.in_code_fence));
+                    lines.push(Line::from(spans));
                 }
             }
         }
@@ -1681,9 +1733,9 @@ fn render_interactive_widgets(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
     let mut constraints: Vec<Constraint> = Vec::with_capacity(model.widgets.len());
     for w in &model.widgets {
         constraints.push(match w {
-            FocusWidget::MarkdownReview { .. } | FocusWidget::DiffReview { .. } => {
-                Constraint::Min(10)
-            }
+            FocusWidget::MarkdownReview { .. }
+            | FocusWidget::DiffReview { .. }
+            | FocusWidget::Table { .. } => Constraint::Min(8),
             FocusWidget::FallbackPicker { events, .. } => {
                 Constraint::Min((events.len() as u16).saturating_add(3))
             }
@@ -1693,7 +1745,6 @@ fn render_interactive_widgets(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
             FocusWidget::MultiSelect { options, .. } => {
                 Constraint::Length((options.len() as u16).min(6) + 2)
             }
-            FocusWidget::Confirm { .. } => Constraint::Length(4),
             FocusWidget::TextInput { .. } => Constraint::Length(3),
             FocusWidget::ActionBar { buttons, .. } => {
                 Constraint::Length(action_bar_height(buttons, area.width))
@@ -1741,6 +1792,24 @@ fn render_interactive_widgets(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
                     *selected_line,
                     &model.draft_state,
                     border_style,
+                );
+            }
+            FocusWidget::Table {
+                title,
+                columns,
+                rows,
+                selected_row,
+            } => {
+                render_table_widget(
+                    f,
+                    rect,
+                    title.as_deref(),
+                    columns,
+                    rows,
+                    *selected_row,
+                    is_focused,
+                    border_style,
+                    &model.link_hotspot,
                 );
             }
             FocusWidget::TextInput { label, bind } => {
@@ -1837,37 +1906,6 @@ fn render_interactive_widgets(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
                         Block::bordered()
                             .border_type(BorderType::Rounded)
                             .title(format!(" {label} "))
-                            .border_style(border_style),
-                    ),
-                    rect,
-                );
-            }
-            FocusWidget::Confirm {
-                title,
-                confirm_event,
-                cancel_event,
-            } => {
-                let mut spans = vec![
-                    Span::styled(
-                        format!(" [y] {confirm_event} "),
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  "),
-                ];
-                if let Some(cev) = cancel_event {
-                    spans.push(Span::styled(
-                        format!(" [n] {cev} "),
-                        Style::default().fg(Color::White).bg(Color::DarkGray),
-                    ));
-                }
-                f.render_widget(
-                    Paragraph::new(Line::from(spans)).block(
-                        Block::bordered()
-                            .border_type(BorderType::Rounded)
-                            .title(format!(" {title} "))
                             .border_style(border_style),
                     ),
                     rect,
@@ -2157,6 +2195,146 @@ fn render_markdown_review(
             Paragraph::new(panel_lines).wrap(Wrap { trim: false }),
             ia,
         );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_table_widget(
+    f: &mut Frame<'_>,
+    area: Rect,
+    title: Option<&str>,
+    columns: &[String],
+    rows: &[Vec<String>],
+    selected_row: usize,
+    is_focused: bool,
+    border_style: Style,
+    link_hotspot: &RefCell<Option<(Rect, String)>>,
+) {
+    let title_str = match (title, rows.is_empty()) {
+        (Some(t), false) => format!(" {t} ({}/{}) ", (selected_row + 1).min(rows.len()), rows.len()),
+        (Some(t), true) => format!(" {t} (0) "),
+        (None, false) => format!(" Table ({}/{}) ", (selected_row + 1).min(rows.len()), rows.len()),
+        (None, true) => " Table (0) ".to_owned(),
+    };
+
+    let outer = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(title_str)
+        .border_style(border_style);
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+
+    let cleaned_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| r.iter().map(|c| format_table_cell(c)).collect())
+        .collect();
+
+    // Build full-text + URL detail panel at the bottom for the selected row so long posts
+    // and clickable post links are always visible without spilling off-screen.
+    let sel_urls = rows
+        .get(selected_row)
+        .map(|r| extract_row_urls(r))
+        .unwrap_or_default();
+    let detail_text = cleaned_rows
+        .get(selected_row)
+        .and_then(|r| r.last())
+        .filter(|s| s.chars().count() > 48 || !sel_urls.is_empty())
+        .cloned();
+    let has_detail = (detail_text.is_some() || !sel_urls.is_empty()) && inner.height >= 7;
+    let detail_height = if has_detail {
+        let w = inner.width.saturating_sub(2).max(20) as usize;
+        let text_rows = detail_text
+            .as_deref()
+            .map_or(0, |s| s.chars().count().div_ceil(w).max(1));
+        let url_rows = usize::from(!sel_urls.is_empty());
+        ((1 + url_rows + text_rows) as u16)
+            .clamp(3, (inner.height / 2).max(3))
+    } else {
+        0
+    };
+    let (table_area, detail_area) = if detail_height > 0 {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(4), Constraint::Length(detail_height)])
+            .split(inner);
+        (split[0], Some(split[1]))
+    } else {
+        (inner, None)
+    };
+
+    let col_count = columns.len().max(1);
+    let mut widths: Vec<Constraint> = Vec::with_capacity(col_count);
+    for col_idx in 0..col_count {
+        if col_idx + 1 == col_count {
+            widths.push(Constraint::Fill(1));
+        } else {
+            let header_len = columns.get(col_idx).map_or(4, |s| s.chars().count());
+            let max_cell = cleaned_rows
+                .iter()
+                .filter_map(|r| r.get(col_idx))
+                .map(|s| s.chars().count())
+                .max()
+                .unwrap_or(0);
+            let w = header_len.max(max_cell).clamp(4, 28) as u16 + 2;
+            widths.push(Constraint::Length(w));
+        }
+    }
+
+    let header = Row::new(
+        columns
+            .iter()
+            .map(|c| Cell::from(c.as_str()).style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
+    )
+    .bottom_margin(1);
+
+    let body_rows: Vec<Row<'_>> = cleaned_rows
+        .iter()
+        .enumerate()
+        .map(|(i, cells)| {
+            let is_sel = i == selected_row;
+            let style = if is_sel && is_focused {
+                Style::default().fg(TEXT_PRIMARY).bg(CURSOR_BG).add_modifier(Modifier::BOLD)
+            } else if is_sel {
+                Style::default().fg(TEXT_PRIMARY).bg(CURSOR_BG)
+            } else {
+                Style::default().fg(TEXT_SECONDARY)
+            };
+            Row::new(cells.iter().map(|c| Cell::from(c.as_str()))).style(style)
+        })
+        .collect();
+
+    let mut table_state = TableState::default();
+    if !cleaned_rows.is_empty() {
+        table_state.select(Some(selected_row.min(cleaned_rows.len() - 1)));
+    }
+    let table = RatatuiTable::new(body_rows, widths)
+        .header(header)
+        .column_spacing(2);
+    f.render_stateful_widget(table, table_area, &mut table_state);
+
+    if let Some(da) = detail_area {
+        let sep = "─".repeat(da.width as usize);
+        let mut lines = vec![Line::styled(sep, Style::default().fg(BORDER_MUTED))];
+        if let Some(url) = sel_urls.first() {
+            let link_rect = Rect::new(da.x, da.y.saturating_add(1), da.width, 1);
+            *link_hotspot.borrow_mut() = Some((link_rect, url.clone()));
+            lines.push(Line::from(vec![
+                Span::styled(" ↗ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    url.clone(),
+                    Style::default()
+                        .fg(ACCENT)
+                        .add_modifier(Modifier::UNDERLINED),
+                ),
+            ]));
+        }
+        if let Some(detail) = detail_text {
+            lines.push(Line::styled(
+                format!(" {detail}"),
+                Style::default().fg(TEXT_PRIMARY),
+            ));
+        }
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), da);
     }
 }
 
@@ -2596,15 +2774,14 @@ fn collect_spec_nodes(
                         .collect()
                 })
                 .unwrap_or_default();
-            display.push(DisplayItem {
-                kind: DisplayKind::Table {
-                    title: props
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    columns,
-                    rows,
-                },
+            widgets.push(FocusWidget::Table {
+                title: props
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                columns,
+                rows,
+                selected_row: 0,
             });
         }
         "Markdown" => {
@@ -2686,22 +2863,6 @@ fn collect_spec_nodes(
                     bind: bind.to_owned(),
                     options,
                     cursor: 0,
-                });
-            }
-        }
-        "Confirm" => {
-            if let Some(ev) = props.get("confirm_event").and_then(Value::as_str) {
-                widgets.push(FocusWidget::Confirm {
-                    title: props
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Confirm")
-                        .to_owned(),
-                    confirm_event: ev.to_owned(),
-                    cancel_event: props
-                        .get("cancel_event")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
                 });
             }
         }
@@ -3150,6 +3311,103 @@ fn diff_draft_payload(
     }
 }
 
+fn active_states_have_invoke(ir: &MachineDef, active_paths: &[String]) -> bool {
+    for raw_path in active_paths {
+        let trimmed = raw_path
+            .strip_prefix(&format!("{}.", ir.id))
+            .unwrap_or(raw_path.as_str());
+        let mut current_map = &ir.states;
+        for seg in trimmed.split('.') {
+            let Some(node) = current_map.get(&StateId::from(seg)) else {
+                break;
+            };
+            if !node.invoke.is_empty() {
+                return true;
+            }
+            match &node.kind {
+                StateKind::Compound { states, .. } | StateKind::Parallel { states } => {
+                    current_map = states;
+                }
+                StateKind::Atomic | StateKind::Final | StateKind::History { .. } => break,
+            }
+        }
+    }
+    false
+}
+
+/// Cleans a table cell for terminal display: replaces Markdown links `[label](https://...)` with
+/// `label` and collapses embedded newlines into single spaces so every row fits cleanly.
+fn format_table_cell(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(open_b) = rest.find('[') {
+        out.push_str(&rest[..open_b]);
+        let after_open = &rest[open_b + 1..];
+        if let Some(close_b) = after_open.find("](http") {
+            let label = &after_open[..close_b];
+            let after_mid = &after_open[close_b + 2..];
+            if let Some(close_p) = after_mid.find(')') {
+                out.push_str(label);
+                rest = &after_mid[close_p + 1..];
+                continue;
+            }
+        }
+        out.push('[');
+        rest = after_open;
+    }
+    out.push_str(rest);
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Extracts `http://` / `https://` URLs from a raw table row (both Markdown `[label](url)` links
+/// and bare URLs), deduplicated in order of appearance.
+fn extract_row_urls(row: &[String]) -> Vec<String> {
+    let mut urls = Vec::new();
+    for cell in row {
+        let mut rest = cell.as_str();
+        while let Some(pos) = rest.find("http://").or_else(|| rest.find("https://")) {
+            let candidate = &rest[pos..];
+            let end = candidate
+                .find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\''))
+                .unwrap_or(candidate.len());
+            let url = candidate[..end]
+                .trim_end_matches(['.', ',', ';', ':', '!', '?'])
+                .to_owned();
+            if !url.is_empty() && !urls.contains(&url) {
+                urls.push(url);
+            }
+            rest = &candidate[end..];
+        }
+    }
+    urls
+}
+
+fn open_url_in_browser(url: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(target_os = "linux")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use ratatui::backend::TestBackend;
@@ -3289,6 +3547,335 @@ chart = machine(
                 );
             }
             other => panic!("expected Dispatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ratatui_renders_bluesky_radar_with_after_timer_and_clean_table_links() {
+        let star_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/bluesky_radar.star");
+        let ui_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/bluesky_radar.ui.json");
+        let compiled =
+            starness_starlark::compile_starlark_file(&star_path, Some("chart")).unwrap();
+        let sheet =
+            UiViewSheet::from_json_str(&std::fs::read_to_string(&ui_path).unwrap()).unwrap();
+        assert_eq!(sheet.validate_against(&compiled.ir), Ok(()));
+
+        let ctx = json!({
+            "query": "ai harness",
+            "ticks": 1,
+            "status_label": "Tick #1 (+2 new) · polling every 10s",
+            "summary_kv": {"query": "ai harness", "ticks": 1, "posts": 2},
+            "posts_rows": [
+                ["[@alice.bsky.social](https://bsky.app/profile/alice.bsky.social/post/1)", "12", "Line one\nLine two with [link](https://example.com)"],
+                ["[@bob.bsky.social](https://bsky.app/profile/bob.bsky.social/post/2)", "5", "Second post"]
+            ]
+        });
+
+        let mut model = AppModel::new(
+            compiled.ir.clone(),
+            Some(sheet),
+            vec!["waiting".to_owned()],
+            ctx,
+        );
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_app(f, &model)).unwrap();
+        let screen: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        // Must render the waiting UI even though `waiting` has an `after` timer!
+        assert!(screen.contains("Bluesky Live Feed"));
+        assert!(screen.contains("@alice.bsky.social"));
+        assert!(screen.contains("@bob.bsky.social"));
+        assert!(!screen.contains("](https://")); // Markdown links stripped cleanly in table cells
+        assert!(screen.contains("https://bsky.app/profile/alice.bsky.social/post/1")); // Post link shown in detail strip!
+        assert!(screen.contains("Search Query"));
+        assert!(screen.contains("Update Query"));
+        assert!(screen.contains("Pause"));
+        assert!(screen.contains("Stop"));
+
+        // Tab to Table, move Down to row 2, verify focus + row survive a `fetching` -> `waiting` poll tick!
+        model.handle_key(KeyEvent::from(KeyCode::Tab));
+        model.handle_key(KeyEvent::from(KeyCode::Down));
+        model.sync_machine_state(
+            vec!["fetching".to_owned()],
+            model.context.clone(),
+            Status::Running,
+            Value::Null,
+            None,
+        );
+        model.sync_machine_state(
+            vec!["waiting".to_owned()],
+            model.context.clone(),
+            Status::Running,
+            Value::Null,
+            None,
+        );
+        term.draw(|f| render_app(f, &model)).unwrap();
+        let screen_after_poll: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen_after_poll.contains("https://bsky.app/profile/bob.bsky.social/post/2"));
+        assert!(screen_after_poll.contains("open link"));
+
+        // Shift+Tab back to Search Query, edit via modal, save with Ctrl+S, Tab twice to Actions -> Enter triggers UPDATE_QUERY
+        model.handle_key(KeyEvent::from(KeyCode::BackTab));
+        model.handle_key(KeyEvent::from(KeyCode::Enter));
+        for _ in 0.."ai harness".len() {
+            model.handle_key(KeyEvent::from(KeyCode::Backspace));
+        }
+        for ch in "cats".chars() {
+            model.handle_key(KeyEvent::from(KeyCode::Char(ch)));
+        }
+        model.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        model.handle_key(KeyEvent::from(KeyCode::Tab)); // -> Table
+        model.handle_key(KeyEvent::from(KeyCode::Tab)); // -> ActionBar
+        let action = model.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            match action {
+                AppAction::Dispatch {
+                    event_type,
+                    payload,
+                } => (event_type, payload["query"].as_str().map(str::to_owned)),
+                other => panic!("expected Dispatch, got {other:?}"),
+            },
+            ("UPDATE_QUERY".to_owned(), Some("cats".to_owned()))
+        );
+    }
+
+    #[test]
+    fn ratatui_after_timer_state_without_ui_shows_fallback_picker() {
+        let star_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/bluesky_radar.star");
+        let compiled =
+            starness_starlark::compile_starlark_file(&star_path, Some("chart")).unwrap();
+
+        // In `fetching` (has `invoke`), shows Running spinner
+        let model_fetch = AppModel::new(
+            compiled.ir.clone(),
+            None,
+            vec!["fetching".to_owned()],
+            compiled.ir.context.clone(),
+        );
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_app(f, &model_fetch)).unwrap();
+        let fetch_screen: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(fetch_screen.contains("Running in [fetching]"));
+        assert!(fetch_screen.contains("[fetching]")); // not chopped on 80-col header!
+
+        // In `waiting` (no `invoke`, only `after` timer + `on` events), shows FallbackPicker!
+        let mut model_wait = AppModel::new(
+            compiled.ir.clone(),
+            None,
+            vec!["waiting".to_owned()],
+            compiled.ir.context.clone(),
+        );
+        term.draw(|f| render_app(f, &model_wait)).unwrap();
+        let wait_screen: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(wait_screen.contains("Choose Event"));
+        assert!(wait_screen.contains("REFRESH"));
+        assert!(wait_screen.contains("PAUSE"));
+
+        // Move down 2x to PAUSE and press Enter
+        model_wait.handle_key(KeyEvent::from(KeyCode::Down));
+        model_wait.handle_key(KeyEvent::from(KeyCode::Down));
+        let action = model_wait.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            action,
+            AppAction::Dispatch { event_type, .. } if event_type == "PAUSE"
+        ));
+    }
+
+    fn xterm256_to_hex(idx: u8) -> String {
+        match idx {
+            0 => "#18181b".to_owned(),
+            1 => "#f43f5e".to_owned(),
+            2 => "#22c55e".to_owned(),
+            3 => "#eab308".to_owned(),
+            4 => "#3b82f6".to_owned(),
+            5 => "#a855f7".to_owned(),
+            6 => "#06b6d4".to_owned(),
+            7 => "#d4d4d8".to_owned(),
+            8 => "#71717a".to_owned(),
+            9 => "#fb7185".to_owned(),
+            10 => "#4ade80".to_owned(),
+            11 => "#fde047".to_owned(),
+            12 => "#60a5fa".to_owned(),
+            13 => "#c084fc".to_owned(),
+            14 => "#22d3ee".to_owned(),
+            15 => "#fafafa".to_owned(),
+            16..=231 => {
+                let n = idx - 16;
+                let r = n / 36;
+                let g = (n % 36) / 6;
+                let b = n % 6;
+                let comp = |c: u8| if c == 0 { 0u8 } else { 55 + c * 40 };
+                format!("#{:02x}{:02x}{:02x}", comp(r), comp(g), comp(b))
+            }
+            232..=255 => {
+                let v = 8 + (idx - 232) * 10;
+                format!("#{v:02x}{v:02x}{v:02x}")
+            }
+        }
+    }
+
+    fn color_to_hex(color: Color, default_hex: &str) -> String {
+        match color {
+            Color::Reset => default_hex.to_owned(),
+            Color::Black => "#09090b".to_owned(),
+            Color::Red => "#f43f5e".to_owned(),
+            Color::Green => "#4ade80".to_owned(),
+            Color::Yellow => "#facc15".to_owned(),
+            Color::Blue => "#60a5fa".to_owned(),
+            Color::Magenta => "#c084fc".to_owned(),
+            Color::Cyan => "#22d3ee".to_owned(),
+            Color::Gray => "#a1a1aa".to_owned(),
+            Color::DarkGray => "#52525b".to_owned(),
+            Color::LightRed => "#fb7185".to_owned(),
+            Color::LightGreen => "#86efac".to_owned(),
+            Color::LightYellow => "#fef08a".to_owned(),
+            Color::LightBlue => "#93c5fd".to_owned(),
+            Color::LightMagenta => "#d8b4fe".to_owned(),
+            Color::LightCyan => "#67e8f9".to_owned(),
+            Color::White => "#f4f4f5".to_owned(),
+            Color::Indexed(i) => xterm256_to_hex(i),
+            Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+        }
+    }
+
+    fn escape_xml(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+
+    /// Renders a Ratatui `TestBackend` buffer into a crisp standalone dark-mode SVG screenshot
+    /// with zero external dependencies (~2ms per frame).
+    fn buffer_to_svg(buf: &ratatui::buffer::Buffer) -> String {
+        let cell_w = 8.4_f32;
+        let cell_h = 18.0_f32;
+        let pad = 14.0_f32;
+        let width = (buf.area.width as f32 * cell_w + pad * 2.0).ceil() as u32;
+        let height = (buf.area.height as f32 * cell_h + pad * 2.0).ceil() as u32;
+        let bg_default = "#09090b";
+        let fg_default = "#e4e4e7";
+
+        let mut svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\">\n\
+             <rect width=\"100%\" height=\"100%\" rx=\"10\" fill=\"{bg_default}\"/>\n\
+             <g font-family=\"ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace\" font-size=\"13.5\">\n"
+        );
+
+        for y in 0..buf.area.height {
+            let py = pad + (y as f32) * cell_h;
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                let bg = color_to_hex(cell.bg, bg_default);
+                if bg != bg_default {
+                    let px = pad + (x as f32) * cell_w;
+                    svg.push_str(&format!(
+                        "<rect x=\"{px:.1}\" y=\"{py:.1}\" width=\"{:.1}\" height=\"{cell_h:.1}\" fill=\"{bg}\"/>\n",
+                        cell_w + 0.4
+                    ));
+                }
+                let sym = cell.symbol();
+                if sym.is_empty() || sym == " " {
+                    continue;
+                }
+                let px = pad + (x as f32) * cell_w;
+                let fg = color_to_hex(cell.fg, fg_default);
+                let bold = if cell.modifier.contains(Modifier::BOLD) {
+                    " font-weight=\"700\""
+                } else {
+                    ""
+                };
+                let underline = if cell.modifier.contains(Modifier::UNDERLINED) {
+                    " text-decoration=\"underline\""
+                } else {
+                    ""
+                };
+                svg.push_str(&format!(
+                    "<text x=\"{px:.1}\" y=\"{:.1}\" fill=\"{fg}\"{bold}{underline}>{}</text>\n",
+                    py + 13.5,
+                    escape_xml(sym)
+                ));
+            }
+        }
+        svg.push_str("</g>\n</svg>\n");
+        svg
+    }
+
+    #[test]
+    fn ratatui_renders_all_15_showcase_widgets_and_exports_svg_snapshots() {
+        let star_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/ui_showcase.star");
+        let ui_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/ui_showcase.ui.json");
+        let compiled =
+            starness_starlark::compile_starlark_file(&star_path, Some("chart")).unwrap();
+        let sheet =
+            UiViewSheet::from_json_str(&std::fs::read_to_string(&ui_path).unwrap()).unwrap();
+        assert_eq!(sheet.validate_against(&compiled.ir), Ok(()));
+
+        let snap_dir = std::env::var("STARNESS_TUI_SNAPSHOT_DIR").ok();
+        let screens = [
+            ("display", "showcase_1_display.svg", "Workspace Crates"),
+            ("inputs", "showcase_2_inputs.svg", "Pre-flight Checks"),
+            ("markdown_review", "showcase_3_markdown.svg", "Release Checklist"),
+            ("diff_review", "showcase_4_diff.svg", "route_event"),
+        ];
+
+        for (state_name, filename, expected_text) in screens {
+            let model = AppModel::new(
+                compiled.ir.clone(),
+                Some(sheet.clone()),
+                vec![state_name.to_owned()],
+                compiled.ir.context.clone(),
+            );
+            let backend = TestBackend::new(118, 34);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| render_app(f, &model)).unwrap();
+            let text: String = term
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(
+                text.contains(expected_text),
+                "screen `{state_name}` missing `{expected_text}`"
+            );
+            let svg = buffer_to_svg(term.backend().buffer());
+            assert!(svg.starts_with("<svg ") && svg.contains("</svg>"));
+            if let Some(dir) = &snap_dir {
+                let out_path = std::path::Path::new(dir).join(filename);
+                std::fs::write(out_path, svg).unwrap();
+            }
         }
     }
 }

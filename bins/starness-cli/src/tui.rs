@@ -362,36 +362,6 @@ fn render_element_tree<R: BufRead, W: Write>(
                 }
             }
         }
-        "Confirm" => {
-            let title = props.get("title").and_then(Value::as_str).unwrap_or("Confirm");
-            let msg = props.get("message").and_then(Value::as_str).unwrap_or("");
-            writeln!(writer, "{pad}{title}")?;
-            if !msg.is_empty() {
-                writeln!(writer, "{pad}{msg}")?;
-            }
-            if let Some(ev) = props.get("confirm_event").and_then(Value::as_str) {
-                actions.push(ActionChoice {
-                    label: props
-                        .get("confirm_label")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Confirm")
-                        .to_owned(),
-                    event: ev.to_owned(),
-                    payload: Map::new(),
-                });
-            }
-            if let Some(ev) = props.get("cancel_event").and_then(Value::as_str) {
-                actions.push(ActionChoice {
-                    label: props
-                        .get("cancel_label")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Cancel")
-                        .to_owned(),
-                    event: ev.to_owned(),
-                    payload: Map::new(),
-                });
-            }
-        }
         "Button" => {
             if let Some(ev) = props.get("event").and_then(Value::as_str) {
                 actions.push(ActionChoice {
