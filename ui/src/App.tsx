@@ -249,8 +249,8 @@ export function App() {
 
           {selectedMachine && (
             <section className="space-y-2.5">
-              <div className="flex items-center justify-between">
-                <h2 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
+              <div className="flex items-center justify-between gap-1">
+                <h2 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400 truncate">
                   Instances ({instances.length})
                 </h2>
                 <div className="flex items-center gap-1.5">
@@ -320,16 +320,21 @@ export function App() {
                     }`}
                   >
                     <div className="flex items-center justify-between gap-2">
-                      <span className="font-mono text-[11px] text-zinc-200 truncate">{inst.id}</span>
+                      <span className="font-mono text-[11px] font-medium text-sky-300 truncate">
+                        {inst.machine || selectedMachine}
+                      </span>
                       <span
-                        className={`rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${
+                        className={`rounded-full border px-1.5 py-0.5 text-[10px] font-medium shrink-0 ${
                           STATUS_BADGE[inst.status] ?? STATUS_BADGE.cancelled
                         }`}
                       >
                         {inst.status}
                       </span>
                     </div>
-                    <div className="mt-1 font-mono text-[10px] text-zinc-400 truncate">
+                    <div className="mt-0.5 font-mono text-[10px] text-zinc-400 truncate">
+                      {inst.id}
+                    </div>
+                    <div className="mt-0.5 font-mono text-[10px] text-zinc-500 truncate">
                       {inst.active_states.join(", ") || "—"}
                     </div>
                   </button>

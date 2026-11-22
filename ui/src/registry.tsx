@@ -36,7 +36,7 @@ export const { registry: starnessRegistry } = defineRegistry(starnessCatalog, {
     Stack: ({ props, children }) => {
       const dir = props.direction === "horizontal" ? "flex-row flex-wrap items-center" : "flex-col";
       const gap = GAP_CLASSES[props.gap ?? "md"] ?? "gap-4";
-      return <div className={`flex ${dir} ${gap}`}>{children}</div>;
+      return <div className={`flex min-w-0 ${dir} ${gap}`}>{children}</div>;
     },
 
     Card: ({ props, children }) => (
@@ -116,11 +116,19 @@ export const { registry: starnessRegistry } = defineRegistry(starnessCatalog, {
                 <tr key={idx}>
                   {Array.isArray(row)
                     ? row.map((cell, cIdx) => (
-                        <td key={cIdx} className="py-2 pr-4 text-zinc-200">{String(cell ?? "")}</td>
+                        <td
+                          key={cIdx}
+                          className="py-2 pr-4 align-top text-zinc-200 whitespace-pre-wrap [overflow-wrap:anywhere]"
+                        >
+                          {renderInlineMarkdown(String(cell ?? ""))}
+                        </td>
                       ))
                     : props.columns.map((col) => (
-                        <td key={col} className="py-2 pr-4 text-zinc-200">
-                          {String((row as Record<string, unknown>)?.[col] ?? "")}
+                        <td
+                          key={col}
+                          className="py-2 pr-4 align-top text-zinc-200 whitespace-pre-wrap [overflow-wrap:anywhere]"
+                        >
+                          {renderInlineMarkdown(String((row as Record<string, unknown>)?.[col] ?? ""))}
                         </td>
                       ))}
                 </tr>
@@ -247,36 +255,6 @@ export const { registry: starnessRegistry } = defineRegistry(starnessCatalog, {
                 </label>
               );
             })}
-          </div>
-        </div>
-      );
-    },
-
-    Confirm: ({ props }) => {
-      const { execute } = useActions();
-      return (
-        <div className="rounded-xl border border-amber-500/30 bg-amber-950/20 p-4 space-y-3">
-          <div className="space-y-1">
-            <h4 className="text-sm font-semibold text-amber-200">{props.title}</h4>
-            {props.message && <p className="text-xs text-zinc-300">{props.message}</p>}
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => execute({ action: "send_event", params: { event: props.confirm_event } })}
-              className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 cursor-pointer"
-            >
-              {props.confirm_label || "Confirm"}
-            </button>
-            {props.cancel_event && (
-              <button
-                type="button"
-                onClick={() => execute({ action: "send_event", params: { event: props.cancel_event } })}
-                className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-xs font-medium text-zinc-200 hover:bg-zinc-700 cursor-pointer"
-              >
-                {props.cancel_label || "Cancel"}
-              </button>
-            )}
           </div>
         </div>
       );

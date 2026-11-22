@@ -103,17 +103,6 @@ export const starnessCatalog = defineCatalog(schema, {
       }),
       description: "Checklist of toggleable options bound to a list of IDs.",
     },
-    Confirm: {
-      props: z.object({
-        title: z.string(),
-        message: z.string().optional(),
-        confirm_label: z.string().optional(),
-        cancel_label: z.string().optional(),
-        confirm_event: z.string(),
-        cancel_event: z.string().optional(),
-      }),
-      description: "Confirmation card that dispatches confirm_event or cancel_event.",
-    },
     Button: {
       props: z.object({
         label: z.string(),

@@ -111,10 +111,10 @@ function notesForLine(notes: AgentNote[], ml: MdLine): AgentNote[] {
   });
 }
 
-/** Renders inline Markdown (`code`, **bold**) as clean React nodes. */
+/** Renders inline Markdown (`code`, **bold**, [links](https://...), and bare https:// URLs). */
 export function renderInlineMarkdown(text: string): ReactNode {
   const tokens: ReactNode[] = [];
-  const regex = /(`[^`]+`|\*\*[^*]+\*\*)/g;
+  const regex = /(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\(https?:\/\/[^\s)]+\)|https?:\/\/[^\s<>()]+[^\s<>().,;:!?"'])/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
   let key = 0;
@@ -138,6 +138,37 @@ export function renderInlineMarkdown(text: string): ReactNode {
         <strong key={key++} className="font-semibold text-zinc-50">
           {token.slice(2, -2)}
         </strong>,
+      );
+    } else if (token.startsWith("[")) {
+      const linkMatch = /^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/.exec(token);
+      if (linkMatch) {
+        tokens.push(
+          <a
+            key={key++}
+            href={linkMatch[2]}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            className="text-sky-400 hover:text-sky-300 underline underline-offset-2 break-all"
+          >
+            {linkMatch[1]}
+          </a>,
+        );
+      } else {
+        tokens.push(<Fragment key={key++}>{token}</Fragment>);
+      }
+    } else {
+      tokens.push(
+        <a
+          key={key++}
+          href={token}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={(e) => e.stopPropagation()}
+          className="text-sky-400 hover:text-sky-300 underline underline-offset-2 break-all"
+        >
+          {token}
+        </a>,
       );
     }
     lastIndex = regex.lastIndex;
