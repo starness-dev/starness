@@ -1,6 +1,7 @@
-//! Built-in `@starness/*` runtime drivers (`http`, `exec`, `acp`, `mcp`, `decide`, `llm`, `secrets`).
+//! Built-in `@starness/*` runtime drivers (`http`, `exec`, `acp`, `mcp`, `decide`, `llm`, `batch`, `secrets`).
 
 pub mod acp;
+pub mod batch;
 pub mod decide;
 pub mod exec;
 pub mod http;
@@ -9,13 +10,13 @@ pub mod mcp;
 pub mod secrets;
 
 use starness_starlark::{
-    BUILTIN_ACP_SERVICE, BUILTIN_DECIDE_SERVICE, BUILTIN_EXEC_SERVICE, BUILTIN_HTTP_SERVICE,
-    BUILTIN_LLM_SERVICE, BUILTIN_MCP_SERVICE,
+    BUILTIN_ACP_SERVICE, BUILTIN_BATCH_SERVICE, BUILTIN_DECIDE_SERVICE, BUILTIN_EXEC_SERVICE,
+    BUILTIN_HTTP_SERVICE, BUILTIN_LLM_SERVICE, BUILTIN_MCP_SERVICE,
 };
 
 use crate::HostCallbacks;
 
-/// Registers all built-in `@starness/*` async drivers (`http`, `exec`, `acp`, `mcp`, `decide`, `llm`) onto `callbacks`.
+/// Registers all built-in `@starness/*` async drivers (`http`, `exec`, `acp`, `mcp`, `decide`, `llm`, `batch`) onto `callbacks`.
 pub fn register_builtin_drivers(callbacks: HostCallbacks) -> HostCallbacks {
     callbacks
         .on_async_service(BUILTIN_HTTP_SERVICE, http::execute_http_request)
@@ -24,4 +25,5 @@ pub fn register_builtin_drivers(callbacks: HostCallbacks) -> HostCallbacks {
         .on_async_service(BUILTIN_MCP_SERVICE, mcp::execute_mcp_client_call)
         .on_async_service(BUILTIN_DECIDE_SERVICE, decide::execute_decision)
         .on_async_service(BUILTIN_LLM_SERVICE, llm::execute_llm)
+        .on_async_service(BUILTIN_BATCH_SERVICE, batch::execute_batch)
 }
