@@ -1120,7 +1120,13 @@ pub fn collect_ui_spec_events(ui_val: &serde_json::Value) -> Vec<String> {
 
     for elem in elements.values() {
         if let Some(props) = elem.get("props").and_then(serde_json::Value::as_object) {
-            for key in ["event", "approve_event", "revise_event"] {
+            for key in [
+                "event",
+                "approve_event",
+                "revise_event",
+                "submit_event",
+                "interrupt_event",
+            ] {
                 if let Some(ev) = props.get(key).and_then(serde_json::Value::as_str) {
                     push_event(ev);
                 }
@@ -1671,5 +1677,24 @@ mod tests {
             IrValidationError::UnknownUiEvent { state, event, .. }
             if state.as_str() == "review" && event == "NOPE"
         )));
+    }
+
+    #[test]
+    fn collect_ui_spec_events_covers_prompt_input() {
+        let spec = json!({
+            "root": "prompt",
+            "elements": {
+                "prompt": {
+                    "type": "PromptInput",
+                    "props": {
+                        "submit_event": "PROMPT",
+                        "interrupt_event": "INTERRUPT",
+                        "placeholder": "Ask something..."
+                    }
+                }
+            }
+        });
+        let events = collect_ui_spec_events(&spec);
+        assert_eq!(events, vec!["PROMPT".to_owned(), "INTERRUPT".to_owned()]);
     }
 }
