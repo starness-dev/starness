@@ -486,6 +486,70 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
         })
     }
 
+    /// Constructs one item for `invoke_all(...)`: `batch_item(id = "...", spec = ..., kind = None)`.
+    fn batch_item<'v>(
+        #[starlark(require = named)] id: &str,
+        #[starlark(require = named)] spec: Value<'v>,
+        #[starlark(require = named, default = NoneOr::None)] kind: NoneOr<SymbolOrEnum>,
+        heap: starlark::values::Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        if id.trim().is_empty() {
+            bail!("batch_item `id` must not be empty");
+        }
+        let kind_val = match kind.into_option() {
+            Some(k) => heap.alloc_str(&k.0).to_value(),
+            None => Value::new_none(),
+        };
+        let mut dict = starlark::collections::SmallMap::with_capacity(3);
+        dict.insert_hashed(
+            heap.alloc_str("id").get_hashed(),
+            heap.alloc_str(id).to_value(),
+        );
+        dict.insert_hashed(heap.alloc_str("kind").get_hashed(), kind_val);
+        dict.insert_hashed(heap.alloc_str("spec").get_hashed(), spec);
+        Ok(heap.alloc(starlark::values::dict::AllocDict(dict)))
+    }
+
+    /// Declares a bounded-concurrency fan-out/fan-in invocation over `exec`, `http`, or `mcp` items.
+    fn invoke_all<'v>(
+        #[starlark(require = named)] items: Value<'v>,
+        #[starlark(require = named, default = NoneOr::None)] id: NoneOr<&str>,
+        #[starlark(require = named, default = 4)] max_concurrency: i32,
+        #[starlark(require = named, default = NoneOr::None)] on_done: NoneOr<
+            InvokeOutcomesInput<'v>,
+        >,
+        #[starlark(require = named, default = NoneOr::None)] on_error: NoneOr<
+            InvokeOutcomesInput<'v>,
+        >,
+    ) -> anyhow::Result<StarlarkInvoke<'v>> {
+        if max_concurrency <= 0 {
+            bail!("invoke_all `max_concurrency` must be > 0");
+        }
+        let id_opt = id.into_option();
+        if let Some(explicit_id) = id_opt
+            && explicit_id.trim().is_empty()
+        {
+            bail!("invoke_all `id` must not be empty");
+        }
+        let items_input = unpack_invoke_input_value(items)?;
+        let input_data = InvokeInputGen::Object(vec![
+            ("items".to_owned(), items_input),
+            (
+                "max_concurrency".to_owned(),
+                InvokeInputGen::Json(JsonHolder(serde_json::json!(max_concurrency))),
+            ),
+        ]);
+        Ok(StarlarkInvoke {
+            data: InvokeDataGen {
+                id: id_opt.map(str::to_owned),
+                src: crate::stdlib::BUILTIN_BATCH_SERVICE.to_owned(),
+                input: input_data,
+                on_done: on_done.into_option().map(|o| o.0).unwrap_or_default(),
+                on_error: on_error.into_option().map(|o| o.0).unwrap_or_default(),
+            },
+        })
+    }
+
     /// Declares an atomic leaf state node.
     fn state<'v>(
         #[starlark(require = named, default = UnpackList::default())] on: UnpackList<

@@ -18,6 +18,9 @@ pub const BUILTIN_DECIDE_SERVICE: &str = "__starness_builtin_decide__";
 /// Built-in runtime service identifier for `@starness/llm` (`genai`).
 pub const BUILTIN_LLM_SERVICE: &str = "__starness_builtin_llm__";
 
+/// Built-in runtime service identifier for the prelude `invoke_all` fan-out driver.
+pub const BUILTIN_BATCH_SERVICE: &str = "__starness_builtin_batch__";
+
 /// Virtual Starlark module source for `@starness/secrets`.
 pub const SECRETS_MODULE_ID: &str = "@starness/secrets.star";
 pub const SECRETS_MODULE_SOURCE: &str = r#"
@@ -1120,5 +1123,6 @@ pub fn is_builtin_service(service_name: &str) -> bool {
             | BUILTIN_MCP_SERVICE
             | BUILTIN_DECIDE_SERVICE
             | BUILTIN_LLM_SERVICE
+            | BUILTIN_BATCH_SERVICE
     )
 }
