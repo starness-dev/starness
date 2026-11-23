@@ -26,6 +26,7 @@ import {
 import { starnessRegistry } from "./registry";
 import { MermaidDiagram } from "./components/MermaidDiagram";
 import { FallbackEventForm } from "./components/FallbackEventForm";
+import { LiveServiceStream } from "./components/AiElements";
 
 const STATUS_BADGE: Record<string, string> = {
   active: "bg-sky-500/15 text-sky-300 border-sky-500/40",
@@ -433,18 +434,24 @@ export function App() {
                       onSend={handleDispatchEvent}
                     />
                   ) : snapshot.status === "active" ? (
-                    <div className="rounded-xl border border-sky-500/30 bg-sky-950/20 p-6 flex items-center gap-3 text-sm text-sky-200">
-                      <Loader2 className="h-4 w-4 animate-spin text-sky-400 shrink-0" />
-                      <div>
-                        <div className="font-medium">
-                          Running in <code className="font-mono text-sky-300">{snapshot.active_states.join(", ")}</code>…
-                        </div>
-                        <div className="text-xs text-zinc-400 mt-0.5">
-                          Waiting for state transition to complete.
+                    <div className="space-y-3">
+                      <div className="rounded-xl border border-sky-500/30 bg-sky-950/20 p-5 flex items-center gap-3 text-sm text-sky-200">
+                        <Loader2 className="h-4 w-4 animate-spin text-sky-400 shrink-0" />
+                        <div>
+                          <div className="font-medium">
+                            Running in <code className="font-mono text-sky-300">{snapshot.active_states.join(", ")}</code>…
+                          </div>
+                          <div className="text-xs text-zinc-400 mt-0.5">
+                            Waiting for state transition to complete.
+                          </div>
                         </div>
                       </div>
+                      <LiveServiceStream traces={traces} />
                     </div>
                   ) : null}
+                  {snapshot.ui && snapshot.status === "active" && (
+                    <LiveServiceStream traces={traces} />
+                  )}
               </div>
             </>
           ) : (
@@ -536,12 +543,29 @@ export function App() {
                       </span>
                     </div>
                   )}
-                  {rec.kind === "service_progress" && (
-                    <div className="text-[11px] text-zinc-300 whitespace-pre-wrap break-words">
-                      <span className="text-indigo-400 mr-1">[{String(rec.stream ?? "log")}]</span>
-                      {String(rec.chunk ?? "")}
-                    </div>
-                  )}
+                  {rec.kind === "service_progress" && (() => {
+                    const stream = String(rec.stream ?? "log");
+                    const pill =
+                      stream === "agent_thought"
+                        ? "text-indigo-300 bg-indigo-500/15 border-indigo-500/30"
+                        : stream === "tool_call"
+                          ? "text-amber-300 bg-amber-500/15 border-amber-500/30"
+                          : stream === "plan"
+                            ? "text-emerald-300 bg-emerald-500/15 border-emerald-500/30"
+                            : stream === "stderr"
+                              ? "text-rose-300 bg-rose-500/15 border-rose-500/30"
+                              : stream === "agent_text"
+                                ? "text-sky-300 bg-sky-500/15 border-sky-500/30"
+                                : "text-zinc-300 bg-zinc-800 border-zinc-700";
+                    return (
+                      <div className="text-[11px] text-zinc-300 whitespace-pre-wrap break-words flex items-start gap-1.5">
+                        <span className={`rounded border px-1.5 py-0.2 text-[10px] font-mono shrink-0 ${pill}`}>
+                          {stream}
+                        </span>
+                        <span className="min-w-0 flex-1">{String(rec.chunk ?? "")}</span>
+                      </div>
+                    );
+                  })()}
                   {rec.kind === "error" && (
                     <div className="text-[11px] text-rose-300">{String(rec.message ?? "")}</div>
                   )}

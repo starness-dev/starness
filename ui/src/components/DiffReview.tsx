@@ -5,6 +5,7 @@ import { Check, FileCode, MessageSquarePlus, RotateCcw, Sparkles, Trash2 } from 
 export interface DiffComment {
   file: string;
   line: number;
+  side?: "add" | "del" | "ctx";
   quote: string;
   comment: string;
 }
@@ -108,7 +109,12 @@ export function DiffReviewView({ props }: { props: DiffReviewProps }) {
     ? (rawComments as DiffComment[])
     : [];
 
-  const [draftTarget, setDraftTarget] = useState<{ file: string; line: number; quote: string } | null>(null);
+  const [draftTarget, setDraftTarget] = useState<{
+    file: string;
+    line: number;
+    side: "add" | "del" | "ctx";
+    quote: string;
+  } | null>(null);
   const [draftText, setDraftText] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -119,6 +125,7 @@ export function DiffReviewView({ props }: { props: DiffReviewProps }) {
       {
         file: draftTarget.file,
         line: draftTarget.line,
+        side: draftTarget.side,
         quote: draftTarget.quote,
         comment: draftText.trim(),
       },
@@ -198,18 +205,34 @@ export function DiffReviewView({ props }: { props: DiffReviewProps }) {
                       : dl.kind === "hunk"
                         ? "bg-sky-950/30 text-sky-300"
                         : "text-zinc-300";
-                const lineComments = comments
-                  .map((c, idx) => ({ c, idx }))
-                  .filter(({ c }) => c.file === fb.file && c.line === dl.lineNum);
-                const lineNotes = agentNotes.filter(
-                  (n) => (!n.file || n.file === fb.file) && n.line === dl.lineNum,
-                );
+                const lineComments =
+                  dl.kind === "hunk"
+                    ? []
+                    : comments
+                        .map((c, idx) => ({ c, idx }))
+                        .filter(
+                          ({ c }) =>
+                            c.file === fb.file &&
+                            c.line === dl.lineNum &&
+                            (c.side ? c.side === dl.kind : !c.quote || c.quote === dl.text),
+                        );
+                const lineNotes =
+                  dl.kind === "hunk"
+                    ? []
+                    : agentNotes.filter(
+                        (n) => (!n.file || n.file === fb.file) && n.line === dl.lineNum,
+                      );
                 return (
                   <div key={lIdx}>
                     <div
                       onClick={() =>
                         dl.kind !== "hunk" &&
-                        setDraftTarget({ file: fb.file, line: dl.lineNum, quote: dl.text })
+                        setDraftTarget({
+                          file: fb.file,
+                          line: dl.lineNum,
+                          side: dl.kind,
+                          quote: dl.text,
+                        })
                       }
                       className={`group flex items-center gap-3 px-4 py-0.5 hover:brightness-125 ${bg} ${
                         dl.kind !== "hunk" ? "cursor-pointer" : ""

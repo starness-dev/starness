@@ -2,6 +2,14 @@ import { defineRegistry, useActions, useStateStore } from "@json-render/react";
 import { starnessCatalog } from "./catalog";
 import { MarkdownReviewView, renderInlineMarkdown } from "./components/MarkdownReview";
 import { DiffReviewView } from "./components/DiffReview";
+import {
+  ConversationView,
+  PromptInputView,
+  ReasoningView,
+  TaskListView,
+  TerminalView,
+  ToolCallView,
+} from "./components/AiElements";
 
 const ALERT_VARIANTS: Record<string, string> = {
   info: "border-sky-500/40 bg-sky-950/30 text-sky-200",
@@ -281,6 +289,69 @@ export const { registry: starnessRegistry } = defineRegistry(starnessCatalog, {
 
     MarkdownReview: ({ props }) => <MarkdownReviewView props={props} />,
     DiffReview: ({ props }) => <DiffReviewView props={props} />,
+
+    Conversation: ({ props }) => (
+      <ConversationView
+        title={props.title}
+        messages={props.messages}
+        emptyText={props.empty_text}
+      />
+    ),
+
+    PromptInput: ({ props }) => {
+      const { execute } = useActions();
+      return (
+        <PromptInputView
+          label={props.label}
+          placeholder={props.placeholder}
+          submitEvent={props.submit_event}
+          submitLabel={props.submit_label}
+          fieldName={props.field_name ?? "text"}
+          interruptEvent={props.interrupt_event}
+          interruptLabel={props.interrupt_label}
+          onDispatch={async (event, payload) => {
+            await execute({
+              action: "send_event",
+              params: { event, payload },
+            });
+          }}
+        />
+      );
+    },
+
+    ToolCall: ({ props }) => (
+      <ToolCallView
+        name={props.name}
+        status={props.status}
+        argumentsVal={props.arguments}
+        output={props.output}
+        error={props.error}
+        defaultExpanded={props.expanded}
+      />
+    ),
+
+    Reasoning: ({ props }) => (
+      <ReasoningView
+        title={props.title}
+        content={props.content}
+        durationMs={props.duration_ms}
+        defaultExpanded={props.expanded}
+      />
+    ),
+
+    TaskList: ({ props }) => (
+      <TaskListView title={props.title} tasks={props.tasks} />
+    ),
+
+    Terminal: ({ props }) => (
+      <TerminalView
+        title={props.title}
+        command={props.command}
+        stdout={props.stdout}
+        stderr={props.stderr}
+        exitCode={props.exit_code}
+      />
+    ),
   },
   actions: {
     send_event: async () => {},

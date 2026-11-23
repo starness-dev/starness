@@ -140,6 +140,69 @@ export const starnessCatalog = defineCatalog(schema, {
       description:
         "Interactive unified diff reviewer with file & line-anchored comments and approve/revise actions.",
     },
+    Conversation: {
+      props: z.object({
+        title: z.string().optional(),
+        messages: z.unknown(),
+        empty_text: z.string().optional(),
+      }),
+      description:
+        "AI conversation transcript supporting user, assistant, reasoning, and tool messages (including @starness/llm message envelopes).",
+    },
+    PromptInput: {
+      props: z.object({
+        label: z.string().optional(),
+        placeholder: z.string().optional(),
+        submit_event: z.string(),
+        submit_label: z.string().optional(),
+        field_name: z.string().optional(),
+        interrupt_event: z.string().optional(),
+        interrupt_label: z.string().optional(),
+      }),
+      description:
+        "AI prompt input bar dispatching a statechart event with the entered text and optional interrupt button.",
+    },
+    ToolCall: {
+      props: z.object({
+        name: z.string(),
+        status: z.string().optional(),
+        arguments: z.unknown().optional(),
+        output: z.unknown().optional(),
+        error: z.unknown().optional(),
+        expanded: z.boolean().optional(),
+      }),
+      description:
+        "Collapsible MCP/LLM/ACP tool call card displaying status, arguments, and output or error.",
+    },
+    Reasoning: {
+      props: z.object({
+        title: z.string().optional(),
+        content: z.unknown(),
+        duration_ms: z.unknown().optional(),
+        expanded: z.boolean().optional(),
+      }),
+      description:
+        "Collapsible model reasoning or decision rationale trace block.",
+    },
+    TaskList: {
+      props: z.object({
+        title: z.string().optional(),
+        tasks: z.unknown(),
+      }),
+      description:
+        "Step-by-step agent plan or orchestrator checklist with per-task status.",
+    },
+    Terminal: {
+      props: z.object({
+        title: z.string().optional(),
+        command: z.string().optional(),
+        stdout: z.unknown().optional(),
+        stderr: z.unknown().optional(),
+        exit_code: z.unknown().optional(),
+      }),
+      description:
+        "Command header and monospace stdout/stderr output viewer with exit code badge.",
+    },
   },
   actions: {
     send_event: {
