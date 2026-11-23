@@ -327,11 +327,23 @@ pub fn resolve_secret_descriptor(
         "env" => match std::env::var(name) {
             Ok(v) if !v.is_empty() => Some(SecretString::from(v)),
             Ok(_) | Err(std::env::VarError::NotPresent) => {
-                if desc.optional {
+                // Fall back to OS Keychain (e.g. stored via `starness secrets set <NAME>`).
+                let service = if desc.service.trim().is_empty() {
+                    DEFAULT_KEYCHAIN_SERVICE
+                } else {
+                    desc.service.trim()
+                };
+                let active_machine =
+                    crate::trace::current_scope().map(|s| s.hub.machine_id().to_owned());
+                if let Ok(Some(sec)) =
+                    keychain_get_scoped(service, name, active_machine.as_deref())
+                {
+                    Some(sec)
+                } else if desc.optional {
                     None
                 } else {
                     bail!(
-                        "missing required secret `{name}`: environment variable `{name}` is not set"
+                        "missing required secret `{name}`: environment variable `{name}` is not set and no OS keychain entry was found (run `starness secrets set {name}`)"
                     );
                 }
             }

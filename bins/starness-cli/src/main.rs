@@ -408,15 +408,13 @@ fn run_secrets(action: SecretsCommand) -> ExitCode {
             let account = scoped_keychain_account(machine.as_deref(), &name);
             let secret_val: SecretString = match value {
                 Some(v) => SecretString::from(v),
-                None => {
-                    let mut line = String::new();
-                    if let Err(err) = std::io::stdin().read_line(&mut line) {
+                None => match read_secret_from_stdin(&account) {
+                    Ok(v) => SecretString::from(v),
+                    Err(err) => {
                         eprintln!("ERROR reading secret from stdin: {err}");
                         return ExitCode::from(1);
                     }
-                    let trimmed = line.trim_end_matches(['\r', '\n']).to_owned();
-                    SecretString::from(trimmed)
-                }
+                },
             };
             if secret_val.expose_secret().is_empty() {
                 eprintln!("ERROR secret value for `{account}` must not be empty");
@@ -480,6 +478,78 @@ fn run_secrets(action: SecretsCommand) -> ExitCode {
             }
         }
     }
+}
+
+/// Reads a secret from stdin. When stdin is an interactive TTY, prompts on stderr and disables
+/// terminal echo via raw mode so the secret is never printed to the screen; when piped, reads a
+/// single trimmed line from stdin.
+fn read_secret_from_stdin(account: &str) -> std::io::Result<String> {
+    use std::io::{IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        return Ok(line.trim_end_matches(['\r', '\n']).to_owned());
+    }
+
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, read};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    struct RawModeGuard;
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+        }
+    }
+
+    eprint!("Enter secret for `{account}` (hidden): ");
+    let _ = std::io::stderr().flush();
+
+    enable_raw_mode()?;
+    let _guard = RawModeGuard;
+    let mut buf = String::new();
+
+    loop {
+        match read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Enter => break,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    drop(_guard);
+                    eprintln!();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled",
+                    ));
+                }
+                KeyCode::Esc => {
+                    drop(_guard);
+                    eprintln!();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled",
+                    ));
+                }
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    buf.push(c);
+                }
+                _ => {}
+            },
+            Event::Paste(text) => {
+                buf.push_str(text.trim_end_matches(['\r', '\n']));
+            }
+            _ => {}
+        }
+    }
+
+    drop(_guard);
+    eprintln!();
+    Ok(buf)
 }
 
 fn run_mcp_bridge(addr: &str, token: &str) -> ExitCode {
