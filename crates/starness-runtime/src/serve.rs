@@ -15,13 +15,19 @@
 //! - `GET /machines/:machine/instances/:id/trace` — per-instance SSE (`text/event-stream`) or JSONL (`?format=jsonl`)
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
 use indexmap::IndexMap;
+use rmcp::transport::streamable_http_server::StreamableHttpService;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use starness_ir::{MachineDef, StateId, StateKind, StateNodeDef, UiViewSheet};
@@ -29,8 +35,14 @@ use starness_starlark::CompiledChart;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio_util::sync::CancellationToken;
 use xstate_statemachine::core::Status;
 
+use crate::mcp_server::{
+    DEFAULT_MCP_SETTLE_TIMEOUT, McpInstanceView, McpMachineBackend, McpMachineEntry,
+    StarnessMcpHandler, build_stateless_http_mcp_service, run_ephemeral_event,
+    wait_actor_until_settled,
+};
 use crate::store::{InstanceSnapshot, InstanceStatus, SqliteStore};
 use crate::{
     HostCallbacks, StarnessActor, active_states_have_autonomous_work, machine_is_completable,
@@ -214,6 +226,14 @@ struct LiveInstance {
     finalized: AtomicBool,
 }
 
+type HttpMcpService = StreamableHttpService<StarnessMcpHandler, LocalSessionManager>;
+
+struct McpEndpoints {
+    root: Arc<HttpMcpService>,
+    per_machine: HashMap<String, Arc<HttpMcpService>>,
+    cancel: CancellationToken,
+}
+
 struct ServerState {
     machines: IndexMap<String, Arc<RegisteredMachine>>,
     store: Arc<SqliteStore>,
@@ -222,6 +242,7 @@ struct ServerState {
     next_id_counter: AtomicU64,
     global_trace_notify: Notify,
     shutdown: Arc<Notify>,
+    mcp: Mutex<Option<Arc<McpEndpoints>>>,
 }
 
 impl LiveInstance {
@@ -379,7 +400,53 @@ pub async fn serve_charts_http(
         next_id_counter: AtomicU64::new(0),
         global_trace_notify: Notify::new(),
         shutdown: Arc::clone(&shutdown),
+        mcp: Mutex::new(None),
     });
+
+    // Build stateless (2026-07-28) Streamable HTTP MCP endpoints for `/mcp` and `/machines/:m/mcp`.
+    {
+        let mcp_cancel = CancellationToken::new();
+        let all_entries: Vec<McpMachineEntry> = state
+            .machines
+            .iter()
+            .map(|(id, reg)| McpMachineEntry {
+                machine_id: id.clone(),
+                chart: reg.chart.clone(),
+                diagram: reg.diagram.clone(),
+            })
+            .collect();
+        let root_backend: Arc<dyn McpMachineBackend> = Arc::new(ServeMcpBackend {
+            server: Arc::downgrade(&state),
+            machines: all_entries.clone(),
+        });
+        let root_svc = Arc::new(build_stateless_http_mcp_service(
+            root_backend,
+            mcp_cancel.child_token(),
+        ));
+        let mut per_machine = HashMap::with_capacity(all_entries.len());
+        for entry in all_entries {
+            let mid = entry.machine_id.clone();
+            let backend: Arc<dyn McpMachineBackend> = Arc::new(ServeMcpBackend {
+                server: Arc::downgrade(&state),
+                machines: vec![entry],
+            });
+            per_machine.insert(
+                mid,
+                Arc::new(build_stateless_http_mcp_service(
+                    backend,
+                    mcp_cancel.child_token(),
+                )),
+            );
+        }
+        *state
+            .mcp
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(McpEndpoints {
+            root: root_svc,
+            per_machine,
+            cancel: mcp_cancel,
+        }));
+    }
 
     // Rehydrate any `active` or `waiting` instances stored in SQLite across restarts.
     let resumable = state.store.list_resumable_instances()?;
@@ -393,6 +460,14 @@ pub async fn serve_charts_http(
     loop {
         tokio::select! {
             _ = shutdown.notified() => {
+                if let Some(mcp) = state
+                    .mcp
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                {
+                    mcp.cancel.cancel();
+                }
                 break;
             }
             accept_res = listener.accept() => {
@@ -624,6 +699,7 @@ async fn handle_http_connection(
     let mut content_length: usize = 0;
     let mut accept_header = String::new();
     let mut last_event_id: Option<u64> = None;
+    let mut raw_headers: Vec<(String, String)> = Vec::new();
     let mut line = String::new();
     loop {
         line.clear();
@@ -637,6 +713,7 @@ async fn handle_http_connection(
         if let Some((k, v)) = trimmed.split_once(':') {
             let key = k.trim().to_ascii_lowercase();
             let val = v.trim();
+            raw_headers.push((key.clone(), val.to_owned()));
             match key.as_str() {
                 "content-length" => content_length = val.parse::<usize>().unwrap_or(0),
                 "accept" => accept_header = val.to_ascii_lowercase(),
@@ -662,7 +739,7 @@ async fn handle_http_connection(
     }
 
     if method == "OPTIONS" {
-        let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Last-Event-ID\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Last-Event-ID, Mcp-Session-Id, Mcp-Protocol-Version, Mcp-Method, Mcp-Name\r\nAccess-Control-Expose-Headers: Mcp-Session-Id, Mcp-Protocol-Version\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         write_half.write_all(resp.as_bytes()).await?;
         write_half.flush().await?;
         return Ok(());
@@ -678,6 +755,55 @@ async fn handle_http_connection(
     let seg_refs: Vec<&str> = segments.iter().map(String::as_str).collect();
 
     match (method.as_str(), seg_refs.as_slice()) {
+        // Stateless (2026-07-28) Streamable HTTP MCP endpoints
+        (_, ["mcp"]) => {
+            let svc = state
+                .mcp
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|m| Arc::clone(&m.root));
+            if let Some(svc) = svc {
+                handle_mcp_http_request(
+                    &mut write_half,
+                    &svc,
+                    &method,
+                    raw_target,
+                    &raw_headers,
+                    body_bytes,
+                )
+                .await?;
+            } else {
+                write_not_found(&mut write_half, "MCP service is not initialized".to_owned())
+                    .await?;
+            }
+        }
+        (_, ["machines", machine_id, "mcp"]) => {
+            let svc = state
+                .mcp
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(|m| m.per_machine.get(*machine_id).cloned());
+            if let Some(svc) = svc {
+                handle_mcp_http_request(
+                    &mut write_half,
+                    &svc,
+                    &method,
+                    raw_target,
+                    &raw_headers,
+                    body_bytes,
+                )
+                .await?;
+            } else {
+                write_not_found(
+                    &mut write_half,
+                    format!("machine `{machine_id}` is not registered"),
+                )
+                .await?;
+            }
+        }
+
         // GET /ui or GET /ui/* — embedded / static Web Studio
         ("GET", ["ui"]) => {
             serve_web_ui(&mut write_half, "").await?;
@@ -1633,4 +1759,297 @@ fn hex_val(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+// ============================================================================
+// Stateless Streamable HTTP MCP Adapter (`/mcp` & `/machines/:machine/mcp`)
+// ============================================================================
+
+struct ServeMcpBackend {
+    server: Weak<ServerState>,
+    machines: Vec<McpMachineEntry>,
+}
+
+impl ServeMcpBackend {
+    fn upgrade_server(&self) -> anyhow::Result<Arc<ServerState>> {
+        self.server
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("starness serve daemon has shut down"))
+    }
+}
+
+fn instance_snapshot_to_mcp_view(reg: &RegisteredMachine, snap: InstanceSnapshot) -> McpInstanceView {
+    let allowed_events = if snap.status.is_terminal() {
+        Vec::new()
+    } else {
+        reg.chart
+            .ir
+            .allowed_events_for_active_states(&snap.active_states)
+    };
+    McpInstanceView {
+        machine: snap.machine,
+        instance_id: Some(snap.id),
+        status: snap.status.as_str().to_owned(),
+        done: snap.done,
+        active_states: snap.active_states,
+        allowed_events,
+        context: snap.context,
+        output: snap.output,
+        error: snap.error,
+    }
+}
+
+impl McpMachineBackend for ServeMcpBackend {
+    fn machines(&self) -> &[McpMachineEntry] {
+        &self.machines
+    }
+
+    fn start_instance<'a>(
+        &'a self,
+        machine_id: &'a str,
+        requested_id: Option<String>,
+        initial_context: Option<Value>,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<McpInstanceView>> + Send + 'a>> {
+        Box::pin(async move {
+            let server = self.upgrade_server()?;
+            let reg = server
+                .machines
+                .get(machine_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("machine `{machine_id}` is not registered"))?;
+            let id = match requested_id {
+                Some(explicit) => explicit,
+                None => server.generate_instance_id(),
+            };
+            let ctx_patch = initial_context.as_ref().and_then(Value::as_object);
+            let snap = {
+                let _create_guard = server.create_lock.lock().await;
+                spawn_or_rehydrate_instance(&server, &reg, id.clone(), ctx_patch, None).await?
+            };
+            if let Some(live) = server.get_live(machine_id, &id) {
+                let _ = wait_actor_until_settled(
+                    &live.actor,
+                    &live.ir,
+                    DEFAULT_MCP_SETTLE_TIMEOUT,
+                )
+                .await;
+                let settled = sync_and_maybe_finalize(&server, &live, None).await?;
+                return Ok(instance_snapshot_to_mcp_view(&reg, settled));
+            }
+            Ok(instance_snapshot_to_mcp_view(&reg, snap))
+        })
+    }
+
+    fn get_state<'a>(
+        &'a self,
+        machine_id: &'a str,
+        instance_id: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<McpInstanceView>> + Send + 'a>> {
+        Box::pin(async move {
+            let server = self.upgrade_server()?;
+            let reg = server
+                .machines
+                .get(machine_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("machine `{machine_id}` is not registered"))?;
+            let Some(inst_id) = instance_id else {
+                let ir = &reg.chart.ir;
+                let initial_path = format!("{}.{}", ir.id, ir.initial);
+                let allowed_events =
+                    ir.allowed_events_for_active_states(std::slice::from_ref(&initial_path));
+                return Ok(McpInstanceView {
+                    machine: ir.id.clone(),
+                    instance_id: None,
+                    status: "ephemeral".to_owned(),
+                    done: false,
+                    active_states: vec![initial_path],
+                    allowed_events,
+                    context: ir.context.clone(),
+                    output: Value::Null,
+                    error: None,
+                });
+            };
+            if let Some(live) = server.get_live(machine_id, inst_id) {
+                let snap = sync_and_maybe_finalize(&server, &live, None).await?;
+                return Ok(instance_snapshot_to_mcp_view(&reg, snap));
+            }
+            let Some(snap) = server.store.get_instance(machine_id, inst_id)? else {
+                bail!("instance `{inst_id}` not found for machine `{machine_id}`");
+            };
+            Ok(instance_snapshot_to_mcp_view(&reg, snap))
+        })
+    }
+
+    fn dispatch_event<'a>(
+        &'a self,
+        machine_id: &'a str,
+        instance_id: Option<&'a str>,
+        event_type: &'a str,
+        payload: Value,
+        initial_context: Option<Value>,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<McpInstanceView>> + Send + 'a>> {
+        Box::pin(async move {
+            let server = self.upgrade_server()?;
+            let reg = server
+                .machines
+                .get(machine_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("machine `{machine_id}` is not registered"))?;
+
+            // Stateless / ephemeral execution when `instance_id` is omitted.
+            let Some(inst_id) = instance_id else {
+                return run_ephemeral_event(
+                    &reg.chart,
+                    &reg.callbacks,
+                    event_type,
+                    payload,
+                    initial_context,
+                    DEFAULT_MCP_SETTLE_TIMEOUT,
+                )
+                .await;
+            };
+
+            let live = match ensure_live_instance(&server, &reg, machine_id, inst_id).await? {
+                EnsureLiveResult::Live(l) => l,
+                EnsureLiveResult::Terminal(snap) => {
+                    bail!(
+                        "instance `{inst_id}` is `{}` and no longer accepts events",
+                        snap.status.as_str()
+                    );
+                }
+                EnsureLiveResult::NotFound => {
+                    let _create_guard = server.create_lock.lock().await;
+                    let ctx_patch = initial_context.as_ref().and_then(Value::as_object);
+                    let _ = spawn_or_rehydrate_instance(
+                        &server,
+                        &reg,
+                        inst_id.to_owned(),
+                        ctx_patch,
+                        None,
+                    )
+                    .await?;
+                    match ensure_live_instance(&server, &reg, machine_id, inst_id).await? {
+                        EnsureLiveResult::Live(l) => l,
+                        EnsureLiveResult::Terminal(snap) => {
+                            return Ok(instance_snapshot_to_mcp_view(&reg, *snap));
+                        }
+                        EnsureLiveResult::NotFound => {
+                            bail!("failed to initialize instance `{inst_id}`");
+                        }
+                    }
+                }
+            };
+
+            let _ev_guard = live.event_lock.lock().await;
+            if payload.is_null() {
+                live.actor.send(event_type).await?;
+            } else {
+                live.actor.send_with_payload(event_type, payload).await?;
+            }
+            let _ = wait_actor_until_settled(&live.actor, &live.ir, DEFAULT_MCP_SETTLE_TIMEOUT).await;
+            let snap = sync_and_maybe_finalize(&server, &live, None).await?;
+            Ok(instance_snapshot_to_mcp_view(&reg, snap))
+        })
+    }
+}
+
+async fn handle_mcp_http_request(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    service: &HttpMcpService,
+    method: &str,
+    raw_target: &str,
+    raw_headers: &[(String, String)],
+    body_bytes: Vec<u8>,
+) -> anyhow::Result<()> {
+    let http_method = http::Method::from_bytes(method.as_bytes()).unwrap_or(http::Method::POST);
+    let mut req_builder = http::Request::builder()
+        .method(http_method)
+        .uri(raw_target);
+    for (k, v) in raw_headers {
+        if let (Ok(name), Ok(val)) = (
+            http::header::HeaderName::from_bytes(k.as_bytes()),
+            http::header::HeaderValue::from_str(v),
+        ) {
+            req_builder = req_builder.header(name, val);
+        }
+    }
+    let http_req = req_builder
+        .body(Full::new(Bytes::from(body_bytes)))
+        .context("failed constructing HTTP request for MCP service")?;
+
+    let resp = service.handle(http_req).await;
+    let status = resp.status();
+    let status_line = format!(
+        "{} {}",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("OK")
+    );
+    let is_sse = resp
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"));
+
+    if is_sse {
+        let mut head = format!(
+            "HTTP/1.1 {status_line}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nConnection: close\r\n"
+        );
+        for (name, value) in resp.headers() {
+            if name == http::header::CONNECTION
+                || name == http::header::CONTENT_LENGTH
+                || name == http::header::TRANSFER_ENCODING
+            {
+                continue;
+            }
+            if let Ok(val_str) = value.to_str() {
+                head.push_str(&format!("{name}: {val_str}\r\n"));
+            }
+        }
+        head.push_str("\r\n");
+        writer.write_all(head.as_bytes()).await?;
+        writer.flush().await?;
+
+        let mut body = resp.into_body();
+        while let Some(frame_res) = body.frame().await {
+            if let Ok(frame) = frame_res
+                && let Some(data) = frame.data_ref()
+                && !data.is_empty()
+            {
+                if writer.write_all(data).await.is_err() {
+                    break;
+                }
+                let _ = writer.flush().await;
+            }
+        }
+    } else {
+        let (parts, body) = resp.into_parts();
+        let bytes = body
+            .collect()
+            .await
+            .map(|c| c.to_bytes())
+            .unwrap_or_default();
+        let mut head = format!(
+            "HTTP/1.1 {status_line}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n",
+            bytes.len()
+        );
+        for (name, value) in &parts.headers {
+            if name == http::header::CONNECTION
+                || name == http::header::CONTENT_LENGTH
+                || name == http::header::TRANSFER_ENCODING
+            {
+                continue;
+            }
+            if let Ok(val_str) = value.to_str() {
+                head.push_str(&format!("{name}: {val_str}\r\n"));
+            }
+        }
+        head.push_str("\r\n");
+        writer.write_all(head.as_bytes()).await?;
+        if !bytes.is_empty() {
+            writer.write_all(&bytes).await?;
+        }
+        writer.flush().await?;
+    }
+
+    Ok(())
 }

@@ -16,6 +16,17 @@ use crate::trace::register_scope_redaction;
 /// Default OS keychain service namespace used when `secret(..., source = "keychain")` omits `service`.
 pub const DEFAULT_KEYCHAIN_SERVICE: &str = "starness";
 
+/// OS keychain service namespace used for MCP OAuth 2.1 credentials (`starness auth login`).
+pub const MCP_OAUTH_KEYCHAIN_SERVICE: &str = "starness.mcp.oauth";
+
+/// Formats a Keychain account name, prefixing `<machine_id>/` when scoped to a specific machine.
+pub fn scoped_keychain_account(machine_id: Option<&str>, key: &str) -> String {
+    match machine_id.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(m) => format!("{m}/{}", key.trim()),
+        None => key.trim().to_owned(),
+    }
+}
+
 /// Optional JSON file override (`{"<service>:<name>": "<secret>"}`) enabling headless CI and
 /// integration tests to exercise `source = "keychain"` without triggering OS Keychain modal dialogs.
 pub const KEYCHAIN_MOCK_FILE_ENV: &str = "STARNESS_KEYCHAIN_MOCK_FILE";
@@ -214,7 +225,24 @@ pub fn keychain_exists(service: &str, name: &str) -> anyhow::Result<bool> {
     Ok(keychain_get_optional(service, name)?.is_some())
 }
 
-fn keychain_get_optional(service: &str, name: &str) -> anyhow::Result<Option<SecretString>> {
+/// Looks up a secret in the OS Keychain, checking `<machine_id>/<name>` first (when `machine_id`
+/// is provided) and falling back to the global `<name>` entry.
+pub fn keychain_get_scoped(
+    service: &str,
+    name: &str,
+    machine_id: Option<&str>,
+) -> anyhow::Result<Option<SecretString>> {
+    if let Some(m) = machine_id.map(str::trim).filter(|m| !m.is_empty()) {
+        let scoped = scoped_keychain_account(Some(m), name);
+        if let Some(found) = keychain_get_optional(service, &scoped)? {
+            return Ok(Some(found));
+        }
+    }
+    keychain_get_optional(service, name)
+}
+
+/// Reads an optional secret from the OS Keychain (or `STARNESS_KEYCHAIN_MOCK_FILE` in tests).
+pub fn keychain_get_optional(service: &str, name: &str) -> anyhow::Result<Option<SecretString>> {
     let svc = normalize_service(service)?;
     let key = normalize_name(name)?;
     if let Some(mock_path) = mock_keychain_path() {
@@ -335,7 +363,8 @@ pub fn resolve_secret_descriptor(
             } else {
                 desc.service.trim()
             };
-            match keychain_get_optional(service, name)? {
+            let active_machine = crate::trace::current_scope().map(|s| s.hub.machine_id().to_owned());
+            match keychain_get_scoped(service, name, active_machine.as_deref())? {
                 Some(sec) => Some(sec),
                 None if desc.optional => None,
                 None => {

@@ -2,9 +2,21 @@
 //! bridging pure frozen Starlark guards, delays & reducers with effectful Rust host callbacks.
 
 pub mod builtins;
+pub mod mcp_auth;
+pub mod mcp_server;
 pub mod serve;
 pub mod store;
 pub mod trace;
+
+pub use mcp_auth::{
+    KeychainCredentialStore, McpOAuthLoginSummary, mcp_oauth_login, mcp_oauth_logout,
+    mcp_oauth_status, normalize_mcp_url,
+};
+
+pub use mcp_server::{
+    McpInstanceView, McpMachineBackend, McpMachineEntry, McpServerOptions, StarnessMcpHandler,
+    build_stateless_http_mcp_service, serve_chart_as_mcp_io, serve_chart_as_mcp_stdio,
+};
 
 pub use serve::{
     PersistedChartState, ServeDefinition, ServeOptions, apply_persisted_state_to_ir,
@@ -3775,6 +3787,10 @@ chart = machine(
                 tokio::spawn(async move {
                     let (rh, mut wh) = stream.into_split();
                     let mut reader = BufReader::new(rh);
+                    let mut req_line = String::new();
+                    if reader.read_line(&mut req_line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
                     let mut content_len = 0usize;
                     let mut session_hdr = String::new();
                     let mut line = String::new();
@@ -3795,14 +3811,36 @@ chart = machine(
                             }
                         }
                     }
+                    if req_line.starts_with("GET ") {
+                        let _ = wh
+                            .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        return;
+                    }
+                    if req_line.starts_with("DELETE ") {
+                        let _ = wh
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        return;
+                    }
                     let mut body = vec![0_u8; content_len];
                     if content_len > 0 {
                         let _ = reader.read_exact(&mut body).await;
                     }
                     let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+                    let req_id = req.get("id").cloned().unwrap_or(json!(1));
                     if method == "initialize" {
-                        let b = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"mock-http-mcp","version":"1.0"}}}"#;
+                        let b = json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": {
+                                "protocolVersion": "2025-03-26",
+                                "capabilities": {"tools": {}},
+                                "serverInfo": {"name": "mock-http-mcp", "version": "1.0"}
+                            }
+                        })
+                        .to_string();
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sess-http-42\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
                             b.len()
@@ -3817,7 +3855,7 @@ chart = machine(
                         let pr_url = req["params"]["arguments"]["pr_url"].as_str().unwrap_or("");
                         let rpc = json!({
                             "jsonrpc": "2.0",
-                            "id": 2,
+                            "id": req_id,
                             "result": {
                                 "content": [{"type": "text", "text": json!({"ticket": "LIN-99", "linked": pr_url}).to_string()}],
                                 "isError": false

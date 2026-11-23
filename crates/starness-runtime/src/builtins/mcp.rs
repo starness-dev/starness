@@ -898,6 +898,7 @@ async fn execute_mcp_client_call_inner(
                     tool_name,
                     &resolved_args,
                     timeout_ms,
+                    scrubber,
                 ),
             )
             .await
@@ -935,13 +936,38 @@ async fn execute_mcp_client_call_inner(
     Ok(normalized)
 }
 
+#[derive(Clone, Default)]
+struct StarnessMcpClientHandler;
+
+impl rmcp::ClientHandler for StarnessMcpClientHandler {
+    fn get_info(&self) -> rmcp::model::ClientConfig {
+        let mut info = rmcp::model::ClientConfig::default();
+        info.client_info = rmcp::model::Implementation::new("starness", env!("CARGO_PKG_VERSION"));
+        info
+    }
+
+    async fn on_progress(
+        &self,
+        params: rmcp::model::ProgressNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) {
+        if let Ok(encoded) = serde_json::to_string(&params) {
+            report_progress(ProgressKind::Log, encoded);
+        }
+    }
+}
+
 async fn call_stdio_mcp_server(
     server: &Map<String, Value>,
     resolved_envs: &indexmap::IndexMap<String, secrecy::SecretString>,
     tool_name: &str,
     arguments: &Value,
 ) -> anyhow::Result<Value> {
+    use rmcp::ServiceExt;
+    use rmcp::model::CallToolRequestParams;
+    use rmcp::transport::TokioChildProcess;
     use secrecy::ExposeSecret;
+
     let command_prog = server
         .get("command")
         .and_then(Value::as_str)
@@ -959,11 +985,7 @@ async fn call_stdio_mcp_server(
         .unwrap_or_default();
 
     let mut cmd = tokio::process::Command::new(command_prog);
-    cmd.args(&args)
-        .kill_on_drop(true)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    cmd.args(&args);
 
     if let Some(cwd) = server
         .get("cwd")
@@ -976,105 +998,26 @@ async fn call_stdio_mcp_server(
         cmd.env(k, vs.expose_secret());
     }
 
-    let mut child = cmd
-        .spawn()
+    let transport = TokioChildProcess::new(cmd)
         .with_context(|| format!("failed to spawn MCP server `{command_prog}`"))?;
 
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("failed to open stdin to MCP server"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("failed to open stdout from MCP server"))?;
-    let mut reader = BufReader::new(stdout).lines();
-
-    // 1. `initialize`
-    write_json_line(
-        &mut stdin,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": DEFAULT_MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "starness",
-                    "version": env!("CARGO_PKG_VERSION"),
-                }
-            }
-        }),
-    )
-    .await?;
-    let _init = await_mcp_stdio_response(&mut reader, 1)
+    let client = StarnessMcpClientHandler
+        .serve(transport)
         .await
-        .context("MCP `initialize` failed")?;
+        .with_context(|| format!("MCP stdio handshake failed for `{command_prog}`"))?;
 
-    // 2. `notifications/initialized`
-    write_json_line(
-        &mut stdin,
-        &json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-        }),
-    )
-    .await?;
+    let mut params = CallToolRequestParams::new(tool_name.to_owned());
+    if let Some(arg_map) = arguments.as_object() {
+        params = params.with_arguments(arg_map.clone());
+    }
 
-    // 3. `tools/call`
-    write_json_line(
-        &mut stdin,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": arguments,
-            }
-        }),
-    )
-    .await?;
-    let call_res = await_mcp_stdio_response(&mut reader, 2)
+    let call_res = client
+        .call_tool(params)
         .await
         .with_context(|| format!("MCP `tools/call` (`{tool_name}`) failed"))?;
 
-    drop(stdin);
-    let _ = child.kill().await;
-    Ok(call_res)
-}
-
-async fn await_mcp_stdio_response(
-    reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    expected_id: u64,
-) -> anyhow::Result<Value> {
-    while let Some(line) = reader.next_line().await? {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(msg) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        if let Some(method) = msg.get("method").and_then(Value::as_str)
-            && msg.get("id").is_none()
-        {
-            if matches!(method, "notifications/message" | "notifications/progress")
-                && let Some(params) = msg.get("params")
-            {
-                report_progress(ProgressKind::Log, params.to_string());
-            }
-            continue;
-        }
-        if msg.get("id").and_then(Value::as_u64) == Some(expected_id) {
-            if let Some(err) = msg.get("error") {
-                bail!("MCP JSON-RPC error: {err}");
-            }
-            return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
-        }
-    }
-    bail!("MCP server closed stdout before replying to request id {expected_id}")
+    let _ = client.cancel().await;
+    serde_json::to_value(&call_res).context("failed serializing MCP `tools/call` result")
 }
 
 async fn call_http_mcp_server(
@@ -1083,148 +1026,88 @@ async fn call_http_mcp_server(
     tool_name: &str,
     arguments: &Value,
     timeout_ms: u64,
+    scrubber: &mut crate::builtins::secrets::SecretScrubber,
 ) -> anyhow::Result<Value> {
+    use http::header::{HeaderName, HeaderValue};
+    use rmcp::ServiceExt;
+    use rmcp::model::CallToolRequestParams;
+    use rmcp::transport::StreamableHttpClientTransport;
+    use rmcp::transport::auth::AuthClient;
+    use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+    use secrecy::ExposeSecret;
+
     let url = server
         .get("url")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!("HTTP McpServer missing `url`"))?;
 
-    let client = reqwest::Client::builder()
+    let reqwest_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(timeout_ms))
         .build()
         .context("failed building HTTP MCP client")?;
 
-    // 1. `initialize`
-    let (init_msg, session_id) = send_http_mcp_rpc(
-        &client,
-        url,
-        custom_headers,
-        None,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "starness",
-                    "version": env!("CARGO_PKG_VERSION"),
-                }
-            }
-        }),
-        Some(1),
-    )
-    .await
-    .context("HTTP MCP `initialize` failed")?;
-    let _ = init_msg;
-
-    // 2. `notifications/initialized` (202 Accepted or empty 200 OK)
-    let _ = send_http_mcp_rpc(
-        &client,
-        url,
-        custom_headers,
-        session_id.as_deref(),
-        &json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-        }),
-        None,
-    )
-    .await;
-
-    // 3. `tools/call`
-    let (call_res, _) = send_http_mcp_rpc(
-        &client,
-        url,
-        custom_headers,
-        session_id.as_deref(),
-        &json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": arguments,
-            }
-        }),
-        Some(2),
-    )
-    .await
-    .with_context(|| format!("HTTP MCP `tools/call` (`{tool_name}`) failed"))?;
-
-    Ok(call_res)
-}
-
-async fn send_http_mcp_rpc(
-    client: &reqwest::Client,
-    url: &str,
-    headers: &indexmap::IndexMap<String, secrecy::SecretString>,
-    session_id: Option<&str>,
-    body: &Value,
-    expected_id: Option<u64>,
-) -> anyhow::Result<(Value, Option<String>)> {
-    use secrecy::ExposeSecret;
-    let mut req = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        .json(body);
-
-    if let Some(sid) = session_id {
-        req = req.header("Mcp-Session-Id", sid);
-    }
-    for (k, vs) in headers {
-        req = req.header(k.as_str(), vs.expose_secret());
+    let mut has_explicit_auth = false;
+    let mut header_map = HashMap::with_capacity(custom_headers.len());
+    for (k, vs) in custom_headers {
+        if k.eq_ignore_ascii_case("authorization") {
+            has_explicit_auth = true;
+        }
+        let name = HeaderName::from_bytes(k.as_bytes())
+            .with_context(|| format!("invalid HTTP MCP header name `{k}`"))?;
+        let val = HeaderValue::from_str(vs.expose_secret())
+            .with_context(|| format!("invalid HTTP MCP header value for `{k}`"))?;
+        header_map.insert(name, val);
     }
 
-    let resp = req.send().await?;
-    let status = resp.status();
-    let returned_sid = resp
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-        .or_else(|| session_id.map(str::to_owned));
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let text = resp.text().await?;
-
-    if !status.is_success() {
-        bail!("HTTP MCP server returned {status}: {text}");
+    let mut config = StreamableHttpClientTransportConfig::with_uri(url);
+    if !header_map.is_empty() {
+        config = config.custom_headers(header_map);
     }
 
-    let Some(req_id) = expected_id else {
-        return Ok((Value::Null, returned_sid));
+    let mut params = CallToolRequestParams::new(tool_name.to_owned());
+    if let Some(arg_map) = arguments.as_object() {
+        params = params.with_arguments(arg_map.clone());
+    }
+
+    let active_machine = trace::current_scope().map(|s| s.hub.machine_id().to_owned());
+    let oauth_opt = if has_explicit_auth {
+        None
+    } else {
+        crate::mcp_auth::maybe_build_oauth_manager(url, active_machine.as_deref()).await?
     };
 
-    if content_type.contains("text/event-stream") {
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if let Some(data) = trimmed.strip_prefix("data:")
-                && let Ok(msg) = serde_json::from_str::<Value>(data.trim())
-                && msg.get("id").and_then(Value::as_u64) == Some(req_id)
-            {
-                if let Some(err) = msg.get("error") {
-                    bail!("HTTP MCP JSON-RPC error: {err}");
-                }
-                return Ok((msg.get("result").cloned().unwrap_or(Value::Null), returned_sid));
-            }
+    let call_res = if let Some((auth_manager, access_token)) = oauth_opt {
+        if let Some(tok) = access_token {
+            scrubber.register("MCP_OAUTH_TOKEN", &tok);
         }
-        bail!("HTTP MCP SSE stream did not contain response for id {req_id}");
-    }
+        let auth_client = AuthClient::new(reqwest_client, auth_manager);
+        let transport = StreamableHttpClientTransport::with_client(auth_client, config);
+        let client = StarnessMcpClientHandler
+            .serve(transport)
+            .await
+            .with_context(|| format!("HTTP MCP (OAuth) handshake failed for `{url}`"))?;
+        let res = client
+            .call_tool(params)
+            .await
+            .with_context(|| format!("HTTP MCP (OAuth) `tools/call` (`{tool_name}`) failed"))?;
+        let _ = client.cancel().await;
+        res
+    } else {
+        let transport = StreamableHttpClientTransport::with_client(reqwest_client, config);
+        let client = StarnessMcpClientHandler
+            .serve(transport)
+            .await
+            .with_context(|| format!("HTTP MCP handshake failed for `{url}`"))?;
+        let res = client
+            .call_tool(params)
+            .await
+            .with_context(|| format!("HTTP MCP `tools/call` (`{tool_name}`) failed"))?;
+        let _ = client.cancel().await;
+        res
+    };
 
-    let msg: Value =
-        serde_json::from_str(text.trim()).context("invalid JSON response from HTTP MCP server")?;
-    if let Some(err) = msg.get("error") {
-        bail!("HTTP MCP JSON-RPC error: {err}");
-    }
-    Ok((msg.get("result").cloned().unwrap_or(Value::Null), returned_sid))
+    serde_json::to_value(&call_res).context("failed serializing HTTP MCP `tools/call` result")
 }
 
 fn normalize_mcp_call_result(tool_name: &str, result: &Value) -> Value {
