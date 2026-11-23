@@ -1,17 +1,23 @@
-# Zero-compile interactive multi-turn coding harness using `@starness/llm` + `@starness/exec`:
+# Interactive multi-turn coding harness powered by `@starness/llm` + `invoke_all` + `@starness/exec`:
 # - Maintains full conversation history in typed `SessionCtx.messages`, round-tripping assistant
 #   messages via `assistant_msg(ev)` so tool calls, reasoning blocks, and thought signatures are
 #   preserved across turns and across providers (`genai`).
-# - Uses a hierarchical Harel `compound_state` (`working { thinking <-> acting }`) so a single
-#   `INTERRUPT` event cancels either an in-flight LLM stream or a running `bash` subprocess
-#   automatically (`kill_on_drop`) and returns cleanly to `gather_input`.
+# - Uses a Safe-First + Batch Human Permission Gate inside `working`:
+#     1. `thinking` classifies incoming tool calls into `safe_calls` (read-only inspection) and
+#        `risky_calls` (mutating / shell writes / unknown commands).
+#     2. `acting_safe` executes all `safe_calls` concurrently via `invoke_all` (bounded parallelism)
+#        with per-call error isolation and structured `{code, stdout, stderr, hint}` recovery.
+#     3. If `risky_calls` remain, `awaiting_approval` pauses with all safe outputs already visible
+#        in `Conversation` so a human can `APPROVE` or `DENY` the batch at once.
+#     4. `acting_approved` runs approved `risky_calls` via `invoke_all` before returning to `thinking`.
+# - A single `INTERRUPT` event on `working` cancels any in-flight LLM stream, parallel batch, or
+#   pending approval cleanly and returns to `gather_input`.
 #
 # Try interactively:
-#   starness run examples/coding_session_llm.star --events-stdin --trace -
-#   > {"type":"PROMPT","text":"Check the current working directory with bash"}
-#   > {"type":"PROMPT","text":"/exit"}
+#   starness serve examples/coding_session_llm.star --ui examples/coding_session_llm.ui.json --bind 127.0.0.1:8080
+#   starness run -i examples/coding_session_llm.star --ui examples/coding_session_llm.ui.json
 
-load("@starness/exec", "ExecSpec", "exec_spec", "invoke_cmd")
+load("@starness/exec", "exec_spec")
 load(
     "@starness/llm",
     "CachePolicy",
@@ -29,7 +35,7 @@ load(
 )
 load("@starness/secrets", "secret")
 
-SessionEvent = enum("PROMPT", "INTERRUPT", "EXIT")
+SessionEvent = enum("PROMPT", "APPROVE", "DENY", "INTERRUPT", "EXIT")
 
 BashArgs = record(
     command = str,
@@ -40,10 +46,13 @@ SessionCtx = record(
     llm_endpoint = field(str, ""),
     cwd = field(str, ""),
     messages = field(list[dict], []),
-    pending_calls = field(list[dict], []),
+    safe_calls = field(list[dict], []),
+    risky_calls = field(list[dict], []),
+    approval_rows = field(list[list[str]], []),
     last_reply = field(str, ""),
     turns = field(int, 0),
     tool_runs = field(int, 0),
+    tool_errors = field(int, 0),
     reason = field(str, ""),
 )
 
@@ -51,10 +60,84 @@ S = state_space(
     "gather_input",
     "working",
     "thinking",
-    "acting",
+    "acting_safe",
+    "awaiting_approval",
+    "acting_approved",
     "done",
     "failed",
 )
+
+SAFE_PREFIXES = [
+    "ls",
+    "pwd",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "find",
+    "rg",
+    "grep",
+    "uname",
+    "sw_vers",
+    "whoami",
+    "which",
+    "echo",
+    "printf",
+    "date",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git branch",
+    "git ls-files",
+    "git rev-parse",
+    "cargo check",
+    "cargo test",
+    "cargo clippy",
+    "rustc",
+]
+
+def is_safe_segment(seg: str) -> bool:
+    s = seg.strip()
+    if s == "":
+        return True
+    # Block redirections, subshells, and backgrounding in auto-approved commands
+    for forbidden in [">", "`", "$(", "&&", "||"]:
+        if forbidden in s:
+            return False
+    for prefix in SAFE_PREFIXES:
+        if s == prefix or s.startswith(prefix + " "):
+            return True
+    return False
+
+def classify_bash_command(cmd: str) -> (bool, str):
+    trimmed = cmd.strip()
+    if trimmed == "":
+        return (False, "empty command")
+    # Allow simple read-only pipelines / semicolon lists only if every segment is safe
+    if ">" in trimmed and not ("2>/dev/null" in trimmed and trimmed.replace("2>/dev/null", "").find(">") == -1):
+        return (False, "contains output redirection")
+    cleaned = trimmed.replace("2>/dev/null", "").replace("2>&1", "")
+    for part in cleaned.split(";"):
+        for pipe_seg in part.split("|"):
+            if not is_safe_segment(pipe_seg):
+                return (False, "mutating or non-allowlisted command")
+    return (True, "read-only command")
+
+def partition_calls(calls: list[dict]) -> (list[dict], list[dict], list[list[str]]):
+    safe = []
+    risky = []
+    rows = []
+    for call in calls:
+        args = call.get("args", {})
+        cmd = str(args.get("command", ""))
+        ok, why = classify_bash_command(cmd)
+        if ok:
+            safe.append(call)
+        else:
+            risky.append(call)
+            rows.append([str(call.get("name", "bash")), cmd, why])
+    return (safe, risky, rows)
 
 def select_model(ctx: SessionCtx) -> LlmModel:
     if ctx.llm_endpoint != "":
@@ -79,65 +162,168 @@ def append_user_prompt(ctx: SessionCtx, ev: dict) -> SessionCtx:
     return update(
         ctx,
         messages = ctx.messages + [user_msg(txt)],
-        pending_calls = [],
+        safe_calls = [],
+        risky_calls = [],
+        approval_rows = [],
     )
 
-def record_tool_calls(ctx: SessionCtx, ev: dict) -> SessionCtx:
+def has_any_safe_calls(_ctx: SessionCtx, ev: dict) -> bool:
+    if not has_tool_calls(ev):
+        return False
+    safe, _risky, _rows = partition_calls(llm_tool_calls(ev))
+    return len(safe) > 0
+
+def has_only_risky_calls(_ctx: SessionCtx, ev: dict) -> bool:
+    if not has_tool_calls(ev):
+        return False
+    safe, risky, _rows = partition_calls(llm_tool_calls(ev))
+    return len(safe) == 0 and len(risky) > 0
+
+def record_classified_calls(ctx: SessionCtx, ev: dict) -> SessionCtx:
+    safe, risky, rows = partition_calls(llm_tool_calls(ev))
     return update(
         ctx,
         messages = ctx.messages + [assistant_msg(ev)],
-        pending_calls = llm_tool_calls(ev),
+        safe_calls = safe,
+        risky_calls = risky,
+        approval_rows = rows,
     )
 
 def record_final_reply(ctx: SessionCtx, ev: dict) -> SessionCtx:
     return update(
         ctx,
         messages = ctx.messages + [assistant_msg(ev)],
-        pending_calls = [],
+        safe_calls = [],
+        risky_calls = [],
+        approval_rows = [],
         last_reply = llm_text(ev),
         turns = ctx.turns + 1,
     )
 
-def has_more_tool_calls(ctx: SessionCtx, _ev: dict) -> bool:
-    return len(ctx.pending_calls) > 1
+def build_batch_for_calls(calls: list[dict], cwd: str) -> list[dict]:
+    items = []
+    for call in calls:
+        args = call.get("args", {})
+        cmd_str = str(args.get("command", "true"))
+        items.append(
+            batch_item(
+                id = str(call.get("id", "bash")),
+                kind = "exec",
+                spec = exec_spec(
+                    cmd = ["sh", "-c", cmd_str],
+                    cwd = cwd if cwd != "" else None,
+                    timeout_ms = 30000,
+                    check = False,
+                ),
+            ),
+        )
+    return items
 
-def build_bash_spec(ctx: SessionCtx) -> ExecSpec:
-    call = ctx.pending_calls[0] if len(ctx.pending_calls) > 0 else None
-    args = call.get("args", {}) if call != None else {}
-    cmd_str = str(args.get("command", "true"))
-    return exec_spec(
-        cmd = ["sh", "-c", cmd_str],
-        cwd = ctx.cwd if ctx.cwd != "" else None,
-        timeout_ms = 30000,
-        check = False,
-    )
+def build_safe_batch(ctx: SessionCtx) -> list[dict]:
+    return build_batch_for_calls(ctx.safe_calls, ctx.cwd)
 
-def record_bash_output(ctx: SessionCtx, ev: dict) -> SessionCtx:
-    call = ctx.pending_calls[0] if len(ctx.pending_calls) > 0 else None
-    rest = ctx.pending_calls[1:] if len(ctx.pending_calls) > 1 else []
+def build_approved_batch(ctx: SessionCtx) -> list[dict]:
+    return build_batch_for_calls(ctx.risky_calls, ctx.cwd)
+
+MAX_TOOL_STREAM_CHARS = 16000
+
+def truncate_stream(text: str, limit: int = MAX_TOOL_STREAM_CHARS) -> str:
+    n = len(text)
+    if n <= limit:
+        return text
+    head = int(limit * 3 / 4)
+    tail = limit - head
+    omitted = n - head - tail
+    return text[:head] + "\n... [truncated " + str(omitted) + " chars; refine command or pipe through head/tail] ...\n" + text[n - tail:]
+
+def format_batch_tool_results(calls: list[dict], ev: dict) -> (list[dict], int, int):
     out = ev.get("output", {})
-    tr = tool_result(call if call != None else "bash", out)
+    results = out.get("results", []) if type(out) == "dict" else []
+    by_id = {}
+    for r in results:
+        if type(r) == "dict" and "id" in r:
+            by_id[str(r["id"])] = r
+
+    new_msgs = []
+    err_count = 0
+    for call in calls:
+        cid = str(call.get("id", "bash"))
+        res = by_id.get(cid)
+        if res == None:
+            err_count += 1
+            new_msgs.append(tool_result(call, {"error": "missing batch result"}))
+        elif not res.get("ok", False):
+            err_count += 1
+            new_msgs.append(
+                tool_result(
+                    call,
+                    {
+                        "error": truncate_stream(str(res.get("error", "exec_failed"))),
+                        "hint": "Inspect the error and retry with corrected arguments.",
+                    },
+                ),
+            )
+        else:
+            cmd_out = res.get("output", {})
+            if type(cmd_out) == "dict":
+                sanitized = dict(cmd_out)
+                if "stdout" in sanitized:
+                    sanitized["stdout"] = truncate_stream(str(sanitized["stdout"]))
+                if "stderr" in sanitized:
+                    sanitized["stderr"] = truncate_stream(str(sanitized["stderr"]))
+                if int(sanitized.get("code", 0)) != 0:
+                    err_count += 1
+                    sanitized["hint"] = "Command exited non-zero; inspect stderr and adjust command or arguments."
+                new_msgs.append(tool_result(call, sanitized))
+            else:
+                new_msgs.append(tool_result(call, truncate_stream(str(cmd_out))))
+    return (new_msgs, len(calls), err_count)
+
+def record_safe_batch_results(ctx: SessionCtx, ev: dict) -> SessionCtx:
+    new_msgs, ran, errs = format_batch_tool_results(ctx.safe_calls, ev)
     return update(
         ctx,
-        messages = ctx.messages + [tr],
-        pending_calls = rest,
-        tool_runs = ctx.tool_runs + 1,
+        messages = ctx.messages + new_msgs,
+        safe_calls = [],
+        tool_runs = ctx.tool_runs + ran,
+        tool_errors = ctx.tool_errors + errs,
     )
 
-def record_bash_error(ctx: SessionCtx, ev: dict) -> SessionCtx:
-    call = ctx.pending_calls[0] if len(ctx.pending_calls) > 0 else None
-    rest = ctx.pending_calls[1:] if len(ctx.pending_calls) > 1 else []
-    tr = tool_result(call if call != None else "bash", {"error": str(ev.get("error", "exec_failed"))})
+def record_approved_batch_results(ctx: SessionCtx, ev: dict) -> SessionCtx:
+    new_msgs, ran, errs = format_batch_tool_results(ctx.risky_calls, ev)
     return update(
         ctx,
-        messages = ctx.messages + [tr],
-        pending_calls = rest,
-        tool_runs = ctx.tool_runs + 1,
+        messages = ctx.messages + new_msgs,
+        risky_calls = [],
+        approval_rows = [],
+        tool_runs = ctx.tool_runs + ran,
+        tool_errors = ctx.tool_errors + errs,
     )
+
+def deny_risky_calls(ctx: SessionCtx, _ev: dict) -> SessionCtx:
+    denied_msgs = [
+        tool_result(
+            call,
+            {
+                "status": "denied",
+                "error": "User denied permission to run this command.",
+            },
+        )
+        for call in ctx.risky_calls
+    ]
+    return update(
+        ctx,
+        messages = ctx.messages + denied_msgs,
+        risky_calls = [],
+        approval_rows = [],
+    )
+
+def has_pending_risky_calls(ctx: SessionCtx, _ev: dict) -> bool:
+    return len(ctx.risky_calls) > 0
 
 chart: StateMachine = machine(
     id = "coding_session_llm",
-    description = "Interactive multi-turn coding agent harness powered by @starness/llm and @starness/exec",
+    description = "Interactive multi-turn coding agent with parallel invoke_all, safe-first split, and human approval gate",
     initial = S.gather_input,
     context = SessionCtx(),
     states = {
@@ -166,7 +352,12 @@ chart: StateMachine = machine(
                 transition(
                     event = SessionEvent.INTERRUPT,
                     target = S.gather_input,
-                    assign = lambda ctx, _ev: update(ctx, pending_calls = []),
+                    assign = lambda ctx, _ev: update(
+                        ctx,
+                        safe_calls = [],
+                        risky_calls = [],
+                        approval_rows = [],
+                    ),
                 ),
             ],
             states = {
@@ -189,9 +380,14 @@ chart: StateMachine = machine(
                         timeout_ms = 60000,
                         on_done = [
                             outcome(
-                                target = S.acting,
-                                guard = lambda _ctx, ev: has_tool_calls(ev),
-                                assign = record_tool_calls,
+                                target = S.acting_safe,
+                                guard = has_any_safe_calls,
+                                assign = record_classified_calls,
+                            ),
+                            outcome(
+                                target = S.awaiting_approval,
+                                guard = has_only_risky_calls,
+                                assign = record_classified_calls,
                             ),
                             outcome(
                                 target = S.gather_input,
@@ -204,32 +400,54 @@ chart: StateMachine = machine(
                         ),
                     ),
                 ),
-                S.acting: state(
-                    invoke = invoke_cmd(
-                        id = "run_bash",
-                        cmd = build_bash_spec,
+                S.acting_safe: state(
+                    invoke = invoke_all(
+                        id = "run_safe_tools",
+                        items = build_safe_batch,
+                        max_concurrency = 4,
                         on_done = [
                             outcome(
-                                target = S.acting,
-                                guard = has_more_tool_calls,
-                                assign = record_bash_output,
+                                target = S.awaiting_approval,
+                                guard = has_pending_risky_calls,
+                                assign = record_safe_batch_results,
                             ),
                             outcome(
                                 target = S.thinking,
-                                assign = record_bash_output,
+                                assign = record_safe_batch_results,
                             ),
                         ],
-                        on_error = [
-                            outcome(
-                                target = S.acting,
-                                guard = has_more_tool_calls,
-                                assign = record_bash_error,
-                            ),
-                            outcome(
-                                target = S.thinking,
-                                assign = record_bash_error,
-                            ),
-                        ],
+                        on_error = outcome(
+                            target = S.failed,
+                            assign = lambda ctx, ev: update(ctx, reason = str(ev.get("error", "batch_failed"))),
+                        ),
+                    ),
+                ),
+                S.awaiting_approval: state(
+                    on = [
+                        transition(
+                            event = SessionEvent.APPROVE,
+                            target = S.acting_approved,
+                        ),
+                        transition(
+                            event = SessionEvent.DENY,
+                            target = S.thinking,
+                            assign = deny_risky_calls,
+                        ),
+                    ],
+                ),
+                S.acting_approved: state(
+                    invoke = invoke_all(
+                        id = "run_approved_tools",
+                        items = build_approved_batch,
+                        max_concurrency = 4,
+                        on_done = outcome(
+                            target = S.thinking,
+                            assign = record_approved_batch_results,
+                        ),
+                        on_error = outcome(
+                            target = S.failed,
+                            assign = lambda ctx, ev: update(ctx, reason = str(ev.get("error", "batch_failed"))),
+                        ),
                     ),
                 ),
             },

@@ -2296,9 +2296,10 @@ fn coding_session_llm_example_runs_multiturn_tool_loop_and_exits() {
 
     let recs = parse_jsonl(&stdout);
     assert!(
-        recs.iter()
-            .any(|r| r["kind"] == "transition" && r["to"] == serde_json::json!(["working.acting"])),
-        "expected transition into `working.acting`:\n{stdout}"
+        recs.iter().any(|r| {
+            r["kind"] == "transition" && r["to"] == serde_json::json!(["working.acting_safe"])
+        }),
+        "expected transition into `working.acting_safe`:\n{stdout}"
     );
     assert!(
         recs.iter()
@@ -2310,6 +2311,160 @@ fn coding_session_llm_example_runs_multiturn_tool_loop_and_exits() {
     assert_eq!(final_tr["context"]["tool_runs"], 1);
     assert_eq!(final_tr["context"]["turns"], 1);
     assert_eq!(final_tr["context"]["last_reply"], "Observed starness_repl_ok");
+}
+
+#[test]
+fn coding_session_llm_runs_safe_calls_in_parallel_then_gates_risky_call_for_approval() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Stdio;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    std::thread::spawn(move || {
+        // Turn 1: emit 1 safe read-only tool call + 1 risky tool call in the same batch
+        if let Ok((mut s1, _)) = listener.accept() {
+            let mut buf = [0_u8; 16384];
+            let _ = s1.read(&mut buf);
+            let f1 = serde_json::json!({
+                "id": "chatcmpl-gate-1",
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_safe_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": "{\"command\":\"echo safe_batch_ok\"}"
+                                }
+                            },
+                            {
+                                "index": 1,
+                                "id": "call_risky_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": "{\"command\":\"sh -c 'echo approved_risky_ok'\"}"
+                                }
+                            }
+                        ]
+                    }
+                }]
+            });
+            let f2 = serde_json::json!({
+                "id": "chatcmpl-gate-1",
+                "model": "gpt-4o-mini",
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }],
+                "usage": { "prompt_tokens": 40, "completion_tokens": 20, "total_tokens": 60 }
+            });
+            let sse = format!("data: {f1}\n\ndata: {f2}\n\ndata: [DONE]\n\n");
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            let _ = s1.write_all(resp.as_bytes());
+        }
+
+        // Turn 2: verify BOTH tool results (safe + approved risky) arrived in order
+        if let Ok((mut s2, _)) = listener.accept() {
+            let mut buf = [0_u8; 32768];
+            let n2 = s2.read(&mut buf).unwrap_or(0);
+            let req2 = String::from_utf8_lossy(&buf[..n2]);
+            assert!(
+                req2.contains("safe_batch_ok") && req2.contains("approved_risky_ok"),
+                "expected both safe and approved risky outputs in turn 2:\n{req2}"
+            );
+            let f1 = serde_json::json!({
+                "id": "chatcmpl-gate-2",
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "content": "Both safe and approved commands completed." }
+                }]
+            });
+            let f2 = serde_json::json!({
+                "id": "chatcmpl-gate-2",
+                "model": "gpt-4o-mini",
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+                "usage": { "prompt_tokens": 80, "completion_tokens": 10, "total_tokens": 90 }
+            });
+            let sse = format!("data: {f1}\n\ndata: {f2}\n\ndata: [DONE]\n\n");
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            let _ = s2.write_all(resp.as_bytes());
+        }
+    });
+
+    let input_json = serde_json::json!({
+        "model": "openai::gpt-4o-mini",
+        "llm_endpoint": format!("http://127.0.0.1:{port}/v1")
+    })
+    .to_string();
+
+    let mut child = Command::new(bin_path())
+        .arg("run")
+        .arg(workspace_file("examples/coding_session_llm.star"))
+        .arg("--context")
+        .arg(&input_json)
+        .arg("--events-stdin")
+        .arg("--trace")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn starness run coding_session_llm");
+
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, r#"{{"type":"PROMPT","text":"Run both commands"}}"#).unwrap();
+        writeln!(stdin, "sleep:250").unwrap();
+        writeln!(stdin, r#"{{"type":"APPROVE"}}"#).unwrap();
+        writeln!(stdin, "sleep:300").unwrap();
+        writeln!(stdin, r#"{{"type":"PROMPT","text":"/exit"}}"#).unwrap();
+    }
+
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let recs = parse_jsonl(&stdout);
+    assert!(
+        recs.iter().any(|r| {
+            r["kind"] == "transition" && r["to"] == serde_json::json!(["working.acting_safe"])
+        }),
+        "expected safe-first transition into `working.acting_safe`:\n{stdout}"
+    );
+    assert!(
+        recs.iter().any(|r| {
+            r["kind"] == "transition"
+                && r["to"] == serde_json::json!(["working.awaiting_approval"])
+        }),
+        "expected pause in `working.awaiting_approval`:\n{stdout}"
+    );
+    assert!(
+        recs.iter().any(|r| {
+            r["kind"] == "transition" && r["to"] == serde_json::json!(["working.acting_approved"])
+        }),
+        "expected transition into `working.acting_approved` after APPROVE:\n{stdout}"
+    );
+    let final_tr = recs.iter().rfind(|r| r["kind"] == "transition").unwrap();
+    assert_eq!(final_tr["to"], serde_json::json!(["done"]));
+    assert_eq!(final_tr["context"]["tool_runs"], 2);
+    assert_eq!(final_tr["context"]["turns"], 1);
+    assert_eq!(
+        final_tr["context"]["last_reply"],
+        "Both safe and approved commands completed."
+    );
 }
 
 #[test]

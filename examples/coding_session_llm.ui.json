@@ -11,7 +11,7 @@
         },
         "header_card": {
           "type": "Card",
-          "props": { "title": "Coding Agent Harness (@starness/llm + @starness/exec)" },
+          "props": { "title": "Coding Agent Harness (@starness/llm + invoke_all + @starness/exec)" },
           "children": ["meta_kv"]
         },
         "meta_kv": {
@@ -20,7 +20,8 @@
             "items": {
               "model": { "$state": "/model" },
               "turns": { "$state": "/turns" },
-              "tool_runs": { "$state": "/tool_runs" }
+              "tool_runs": { "$state": "/tool_runs" },
+              "tool_errors": { "$state": "/tool_errors" }
             }
           }
         },
@@ -53,6 +54,56 @@
         }
       }
     },
+    "awaiting_approval": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["warn_alert", "transcript", "pending_table", "actions"]
+        },
+        "warn_alert": {
+          "type": "Alert",
+          "props": {
+            "title": "Tool Permission Required",
+            "message": "Read-only commands have already run. Review the mutating/non-allowlisted commands below before approving.",
+            "variant": "warning"
+          }
+        },
+        "transcript": {
+          "type": "Conversation",
+          "props": {
+            "title": "Conversation",
+            "messages": { "$state": "/messages" }
+          }
+        },
+        "pending_table": {
+          "type": "Table",
+          "props": {
+            "title": "Commands Awaiting Approval",
+            "columns": ["Tool", "Command", "Reason"],
+            "rows": { "$state": "/approval_rows" }
+          }
+        },
+        "actions": {
+          "type": "Stack",
+          "props": { "direction": "horizontal", "gap": "sm" },
+          "children": ["btn_approve", "btn_deny", "btn_interrupt"]
+        },
+        "btn_approve": {
+          "type": "Button",
+          "props": { "label": "Approve & Run", "event": "APPROVE", "variant": "primary" }
+        },
+        "btn_deny": {
+          "type": "Button",
+          "props": { "label": "Deny", "event": "DENY", "variant": "danger" }
+        },
+        "btn_interrupt": {
+          "type": "Button",
+          "props": { "label": "Interrupt", "event": "INTERRUPT", "variant": "secondary" }
+        }
+      }
+    },
     "working": {
       "root": "root",
       "elements": {
@@ -68,7 +119,7 @@
         },
         "status_badge": {
           "type": "Badge",
-          "props": { "label": "Thinking / executing tools", "variant": "info" }
+          "props": { "label": "Thinking / executing tools in parallel", "variant": "info" }
         },
         "transcript": {
           "type": "Conversation",
