@@ -381,8 +381,9 @@ Every example in `examples/` is pure Starlark (no custom Rust required) and pass
 
 | Example | Modules Used | Highlights |
 | :--- | :--- | :--- |
-| [`examples/bluesky_radar.star`](examples/bluesky_radar.star) + [`bluesky_radar.ui.json`](examples/bluesky_radar.ui.json) | `http`, `--ui` | **Live zero-auth showcase**: polls Bluesky's public API every 10s for `"ai harness"`, deduplicating and appending new posts to a live list with `Pause`/`Resume` and dynamic query updates in Web Studio & Ratatui TUI |
-| [`examples/coding_session_llm.star`](examples/coding_session_llm.star) | `llm`, `exec`, `secrets` | Interactive multi-turn coding REPL (`working { thinking <-> acting }`), native `bash` tool calling, `assistant_msg(ev)` lossless round-tripping, and `INTERRUPT` cancellation |
+| [`examples/bluesky_radar.star`](examples/bluesky_radar.star) + [`bluesky_radar.ui.json`](examples/bluesky_radar.ui.json) | `http`, `--ui` | **Live zero-auth showcase**: polls Bluesky's public API every 10s for `"ai harness"`, prepending up to 10 deduplicated posts with clickable links, `Pause`/`Resume`, and dynamic query updates in Web Studio & Ratatui TUI |
+| [`examples/coding_session_llm.star`](examples/coding_session_llm.star) + [`coding_session_llm.ui.json`](examples/coding_session_llm.ui.json) | `llm`, `exec`, `invoke_all`, `secrets`, `--ui` | Interactive multi-turn coding harness with parallel `invoke_all` execution, safe-first split (read-only commands run immediately; mutating commands pause in `awaiting_approval`), output truncation, `INTERRUPT` cancellation, and shadcn AI Elements + Ratatui TUI parity |
+| [`examples/ui_showcase.star`](examples/ui_showcase.star) + [`ui_showcase.ui.json`](examples/ui_showcase.ui.json) | `--ui` | 5-step catalog showcase exercising all 20 dual-target Web Studio (shadcn AI Elements) & Ratatui TUI widgets (`Conversation`, `PromptInput`, `ToolCall`, `Reasoning`, `TaskList`, `Terminal`, `MarkdownReview`, `DiffReview`, `Table`, and form controls) |
 | [`examples/plan_review.star`](examples/plan_review.star) + [`plan_review.ui.json`](examples/plan_review.ui.json) | `ui` | Pure headless Markdown plan review statechart paired with an external `*.ui.json` view-sheet (`MarkdownReview`, per-line comments, `REQUEST_CHANGES` / `APPROVE` loop) in Web Studio (`starness serve --ui`) and Ratatui TUI (`starness run -i --ui`) |
 | [`examples/release_notes_llm.star`](examples/release_notes_llm.star) | `llm`, `exec`, `secrets` | Constrained-decoding Starlark `Record` + nested `Enum` extraction (`ReleaseSummary`), SSE streaming, and breaking-change approval gate |
 | [`examples/parallel_review_llm.star`](examples/parallel_review_llm.star) | `llm` | `parallel_state` fanning out a PR review across two models (`gpt-6-luna` + `gemini-2.5-flash`) with `on_done` consensus convergence |
@@ -404,3 +405,26 @@ Every example in `examples/` is pure Starlark (no custom Rust required) and pass
 - **Deterministic & sandboxed**: Evaluation cannot perform arbitrary filesystem or network I/O at load time — all side effects happen explicitly through Starness `invoke` declarations.
 - **Modular via `load(...)`**: Keep small workflows in a single `.star` file, or share reusable `record` schemas, `enum` types, model configs, and guard helpers across files with `load("common.star", ...)`.
 - **Ahead-of-time typechecked**: Starness runs static typechecking on every module and top-level DSL call before evaluation, catching structural bugs before a single token or API call is spent.
+
+---
+
+## Development Tips
+
+### Rebuilding Embedded Web Studio
+Web Studio (`ui/`) uses Vite code-splitting + shadcn AI Elements and embeds `crates/starness-runtime/ui_dist/` into the `starness` binary via `rust-embed`:
+
+```bash
+cd ui && npm run build
+```
+
+### Avoiding Repeated macOS Keychain Prompts During Local Dev
+On macOS, Keychain **"Always Allow"** permissions are bound to a binary's code-signature hash. Because `cargo build` produces an ad-hoc signed binary whose hash changes on every recompile, macOS will re-prompt for Keychain access after each rebuild unless you sign dev builds with a stable local certificate:
+
+1. Open **Keychain Access** → *Certificate Assistant* → *Create a Certificate…*
+   - Choose **Self Signed Root** and **Code Signing** (stored in your **login** keychain; e.g. 3650 days validity).
+2. Double-click the new certificate under **My Certificates** → expand **Trust** → set **Code Signing** to **Always Trust**.
+3. Sign your local dev binary after building (replace `<Cert Name>` with the certificate's Common Name):
+   ```bash
+   codesign --force --sign "<Cert Name>" --identifier com.starness.cli target/debug/starness
+   ```
+4. Run `./target/debug/starness serve ...` once and click **Always Allow** — macOS will remember it across all future rebuilds without touching any runtime code or weakening Keychain ACLs.

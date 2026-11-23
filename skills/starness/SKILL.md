@@ -40,7 +40,8 @@ Never use a heavyweight autonomous agent for work that belongs to a lighter, fas
 | External tool server | `@starness/mcp` | Deterministic MCP tool calls over `stdio` or Streamable HTTP |
 | REST API / webhook | `@starness/http` | Async HTTP/JSON requests cancelled automatically on state exit |
 | Shell command / build / test / CLI | `@starness/exec` | Subprocess execution with automatic `kill_on_drop` cancellation on state exit |
-| Human-in-the-loop UI (Web & TUI) | `*.ui.json` (`--ui`) | Keep `.star` files 100% pure headless statecharts; attach optional external `json-render` view-sheets (`views`, `tag_views`, `{"$state": "/ptr"}`) with static event verification (`starness check --ui`), embedded Web Studio (`/ui`), Ratatui TUI (`starness run -i --ui`), or custom `TraceHub`/SSE observers |
+| Dynamic parallel tool/service fan-out | `invoke_all` / `batch_item` *(prelude)* | Bounded-concurrency fan-out over mixed `exec`, `http`, and `mcp` specs with per-item `{id, ok, output, error}` isolation, deterministic ordering, and one-shot `INTERRUPT` cancellation |
+| Human-in-the-loop UI (Web & TUI) | `*.ui.json` (`--ui`) | Keep `.star` files 100% pure headless statecharts; attach optional external `json-render` view-sheets (20 widgets including shadcn AI Elements `Conversation`, `PromptInput`, `ToolCall`, `Reasoning`, `TaskList`, `Terminal`) with static event verification (`starness check --ui`), embedded Web Studio (`/ui`), and Ratatui TUI (`starness run -i --ui`) |
 | API keys & tokens | `@starness/secrets` | Late-bound `env` / `file` / OS `keychain` secrets scrubbed as `<secret:NAME>` from traces & errors |
 
 > Read [`references/modules.md`](references/modules.md) for when, why, and how to use each `@starness/*` module with full idioms and signatures.
