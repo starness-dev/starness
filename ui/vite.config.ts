@@ -2,10 +2,10 @@ import { fileURLToPath, URL } from "node:url";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
-import { viteSingleFile } from "vite-plugin-singlefile";
 
 export default defineConfig({
-  plugins: [react(), tailwindcss(), viteSingleFile()],
+  base: "/ui/",
+  plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
@@ -21,7 +21,7 @@ export default defineConfig({
   },
   build: {
     target: "es2022",
-    outDir: "dist",
+    outDir: "../crates/starness-runtime/ui_dist",
     emptyOutDir: true,
   },
 });

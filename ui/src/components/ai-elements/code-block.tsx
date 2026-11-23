@@ -21,13 +21,20 @@ import {
   useRef,
   useState,
 } from "react";
-import type {
-  BundledLanguage,
-  BundledTheme,
-  HighlighterGeneric,
-  ThemedToken,
-} from "shiki";
-import { createHighlighter } from "shiki";
+import type { BundledLanguage } from "shiki";
+import type { HighlighterCore, ThemedToken } from "shiki/core";
+import { createHighlighterCore } from "shiki/core";
+import { createJavaScriptRegexEngine } from "shiki/engine/javascript";
+import githubDark from "@shikijs/themes/github-dark";
+import githubLight from "@shikijs/themes/github-light";
+import langBash from "@shikijs/langs/bash";
+import langDiff from "@shikijs/langs/diff";
+import langJavascript from "@shikijs/langs/javascript";
+import langJson from "@shikijs/langs/json";
+import langMarkdown from "@shikijs/langs/markdown";
+import langPython from "@shikijs/langs/python";
+import langRust from "@shikijs/langs/rust";
+import langTypescript from "@shikijs/langs/typescript";
 
 // Shiki uses bitflags for font styles: 1=italic, 2=bold, 4=underline
 // oxlint-disable-next-line eslint(no-bitwise)
@@ -129,11 +136,8 @@ const CodeBlockContext = createContext<CodeBlockContextType>({
   code: "",
 });
 
-// Highlighter cache (singleton per language)
-const highlighterCache = new Map<
-  string,
-  Promise<HighlighterGeneric<BundledLanguage, BundledTheme>>
->();
+// Shared lightweight highlighter singleton (only core languages & github themes)
+let sharedHighlighter: Promise<HighlighterCore> | null = null;
 
 // Token cache
 const tokensCache = new Map<string, TokenizedCode>();
@@ -147,21 +151,27 @@ const getTokensCacheKey = (code: string, language: BundledLanguage) => {
   return `${language}:${code.length}:${start}:${end}`;
 };
 
-const getHighlighter = (
-  language: BundledLanguage
-): Promise<HighlighterGeneric<BundledLanguage, BundledTheme>> => {
-  const cached = highlighterCache.get(language);
-  if (cached) {
-    return cached;
+const getHighlighter = (_language: BundledLanguage): Promise<HighlighterCore> => {
+  if (sharedHighlighter) {
+    return sharedHighlighter;
   }
 
-  const highlighterPromise = createHighlighter({
-    langs: [language],
-    themes: ["github-light", "github-dark"],
+  sharedHighlighter = createHighlighterCore({
+    themes: [githubLight, githubDark],
+    langs: [
+      langJson,
+      langBash,
+      langRust,
+      langPython,
+      langTypescript,
+      langJavascript,
+      langMarkdown,
+      langDiff,
+    ],
+    engine: createJavaScriptRegexEngine(),
   });
 
-  highlighterCache.set(language, highlighterPromise);
-  return highlighterPromise;
+  return sharedHighlighter;
 };
 
 // Create raw tokens for immediate display while highlighting loads

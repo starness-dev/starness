@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { createContext, useContext, useState } from "react";
 import {
   CheckCircle2,
   Circle,
@@ -540,6 +540,65 @@ export function TerminalView({
   );
 }
 
+export interface LiveTracesContextValue {
+  traces: TraceRecord[];
+  isActive: boolean;
+}
+
+export const LiveTracesContext = createContext<LiveTracesContextValue>({
+  traces: [],
+  isActive: false,
+});
+
+function extractActiveStream(traces: TraceRecord[]) {
+  let startIdx = -1;
+  for (let i = traces.length - 1; i >= 0; i--) {
+    if (traces[i].kind === "service_finished") {
+      // Latest invocation already finished; no in-flight stream
+      return null;
+    }
+    if (traces[i].kind === "service_started") {
+      startIdx = i;
+      break;
+    }
+  }
+  if (startIdx < 0) return null;
+
+  const recent = traces.slice(startIdx).filter((r) => r.kind === "service_progress");
+  if (recent.length === 0) return null;
+
+  let agentText = "";
+  let agentThought = "";
+  let stdout = "";
+  let stderr = "";
+  const toolCalls: string[] = [];
+  const planLines: string[] = [];
+
+  for (const r of recent) {
+    const stream = String(r.stream ?? "log");
+    const chunk = String(r.chunk ?? "");
+    if (stream === "agent_text") agentText += chunk;
+    else if (stream === "agent_thought") agentThought += chunk;
+    else if (stream === "stdout") stdout += (stdout ? "\n" : "") + chunk;
+    else if (stream === "stderr") stderr += (stderr ? "\n" : "") + chunk;
+    else if (stream === "tool_call") toolCalls.push(chunk);
+    else if (stream === "plan") planLines.push(chunk);
+  }
+
+  if (
+    !agentText &&
+    !agentThought &&
+    !stdout &&
+    !stderr &&
+    toolCalls.length === 0 &&
+    planLines.length === 0
+  ) {
+    return null;
+  }
+
+  return { agentText, agentThought, stdout, stderr, toolCalls, planLines };
+}
+
 // ── 5. Conversation (shadcn AI Elements <Conversation> + <Message>) ──────────
 
 export function ConversationView({
@@ -552,6 +611,9 @@ export function ConversationView({
   emptyText?: string;
 }) {
   const normalized = normalizeMessages(messages);
+  const { traces, isActive } = useContext(LiveTracesContext);
+  const live = isActive ? extractActiveStream(traces) : null;
+  const hasContent = normalized.length > 0 || live !== null;
 
   return (
     <div className="rounded-xl border border-border bg-card/40 overflow-hidden flex flex-col">
@@ -567,53 +629,86 @@ export function ConversationView({
       )}
       <Conversation
         className={
-          normalized.length === 0 ? "h-40 flex-none" : "h-[28rem] min-h-0 flex-none"
+          !hasContent ? "h-40 flex-none" : "h-[28rem] min-h-0 flex-none"
         }
       >
         <ConversationContent className="gap-5 p-4">
-          {normalized.length === 0 ? (
+          {!hasContent ? (
             <ConversationEmptyState
               icon={<MessageSquare className="size-8" />}
               title="No messages yet"
               description={emptyText || "Send a prompt to begin."}
             />
           ) : (
-            normalized.map((msg, idx) => {
-              if (msg.role === "tool") {
+            <>
+              {normalized.map((msg, idx) => {
+                if (msg.role === "tool") {
+                  return (
+                    <ToolCallView
+                      key={idx}
+                      name={msg.toolName || "tool"}
+                      status="ok"
+                      output={msg.text}
+                    />
+                  );
+                }
                 return (
-                  <ToolCallView
-                    key={idx}
-                    name={msg.toolName || "tool"}
-                    status="ok"
-                    output={msg.text}
-                  />
+                  <Message key={idx} from={msg.role}>
+                    <MessageContent>
+                      {msg.reasoning && (
+                        <ReasoningView title="Thinking" content={msg.reasoning} />
+                      )}
+                      {msg.text && <MessageResponse>{msg.text}</MessageResponse>}
+                      {msg.toolCalls.length > 0 && (
+                        <div className="flex flex-col gap-2 w-full">
+                          {msg.toolCalls.map((tc, tIdx) => (
+                            <ToolCallView
+                              key={tc.id ?? tIdx}
+                              name={tc.name}
+                              status={tc.status}
+                              argumentsVal={tc.arguments}
+                              output={tc.output}
+                              error={tc.error}
+                            />
+                          ))}
+                        </div>
+                      )}
+                    </MessageContent>
+                  </Message>
                 );
-              }
-              return (
-                <Message key={idx} from={msg.role}>
+              })}
+
+              {live && (
+                <Message from="assistant">
                   <MessageContent>
-                    {msg.reasoning && (
-                      <ReasoningView title="Thinking" content={msg.reasoning} />
+                    {live.agentThought && (
+                      <ReasoningView
+                        title="Thinking"
+                        content={live.agentThought}
+                        defaultExpanded
+                        isStreaming
+                      />
                     )}
-                    {msg.text && <MessageResponse>{msg.text}</MessageResponse>}
-                    {msg.toolCalls.length > 0 && (
+                    {live.agentText && <MessageResponse>{live.agentText}</MessageResponse>}
+                    {live.toolCalls.length > 0 && (
                       <div className="flex flex-col gap-2 w-full">
-                        {msg.toolCalls.map((tc, tIdx) => (
-                          <ToolCallView
-                            key={tc.id ?? tIdx}
-                            name={tc.name}
-                            status={tc.status}
-                            argumentsVal={tc.arguments}
-                            output={tc.output}
-                            error={tc.error}
-                          />
+                        {live.toolCalls.slice(-6).map((tc, idx) => (
+                          <ToolCallView key={idx} name={tc} status="running" />
                         ))}
                       </div>
                     )}
+                    {(live.stdout || live.stderr) && (
+                      <TerminalView
+                        title="Live Output"
+                        stdout={live.stdout || undefined}
+                        stderr={live.stderr || undefined}
+                        isStreaming
+                      />
+                    )}
                   </MessageContent>
                 </Message>
-              );
-            })
+              )}
+            </>
           )}
         </ConversationContent>
         <ConversationScrollButton />

@@ -1356,33 +1356,59 @@ async fn ensure_live_instance(
     }
 }
 
-/// Embedded single-file Web Studio HTML built from `ui/` (`npm run build`).
-const EMBEDDED_UI_HTML: &str = include_str!("../ui_dist/index.html");
+/// Embedded code-split Web Studio assets built from `ui/` (`npm run build`).
+#[derive(rust_embed::RustEmbed)]
+#[folder = "ui_dist/"]
+struct EmbeddedUiAssets;
 
 /// Serves a static UI asset from `STARNESS_UI_DIR` (if set) or falls back to the embedded Web Studio.
 async fn serve_web_ui<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     sub_path: &str,
 ) -> anyhow::Result<()> {
+    let rel = sub_path.trim_start_matches('/');
+    let rel = if rel.is_empty() { "index.html" } else { rel };
+
     if let Ok(ui_dir) = std::env::var("STARNESS_UI_DIR")
         && !ui_dir.trim().is_empty()
+        && !rel.contains("..")
     {
-        let rel = sub_path.trim_start_matches('/');
-        let rel = if rel.is_empty() { "index.html" } else { rel };
-        if !rel.contains("..") {
-            let candidate = std::path::Path::new(ui_dir.trim()).join(rel);
-            let target = if candidate.is_file() {
-                candidate
-            } else {
-                std::path::Path::new(ui_dir.trim()).join("index.html")
-            };
-            if let Ok(bytes) = tokio::fs::read(&target).await {
-                let ct = guess_content_type(&target);
-                return write_bytes_response(writer, "200 OK", ct, &bytes).await;
-            }
+        let candidate = std::path::Path::new(ui_dir.trim()).join(rel);
+        let target = if candidate.is_file() {
+            candidate
+        } else {
+            std::path::Path::new(ui_dir.trim()).join("index.html")
+        };
+        if let Ok(bytes) = tokio::fs::read(&target).await {
+            let ct = guess_content_type(&target);
+            return write_bytes_response(writer, "200 OK", ct, &bytes).await;
         }
     }
-    write_text_response(writer, "200 OK", "text/html; charset=utf-8", EMBEDDED_UI_HTML).await
+
+    if !rel.contains("..")
+        && let Some(file) = EmbeddedUiAssets::get(rel)
+    {
+        let ct = guess_content_type(std::path::Path::new(rel));
+        return write_bytes_response(writer, "200 OK", ct, file.data.as_ref()).await;
+    }
+
+    if let Some(index) = EmbeddedUiAssets::get("index.html") {
+        return write_bytes_response(
+            writer,
+            "200 OK",
+            "text/html; charset=utf-8",
+            index.data.as_ref(),
+        )
+        .await;
+    }
+
+    write_text_response(
+        writer,
+        "404 Not Found",
+        "text/plain; charset=utf-8",
+        "Embedded Web Studio assets not found (run `cd ui && npm run build`).",
+    )
+    .await
 }
 
 fn guess_content_type(path: &std::path::Path) -> &'static str {
