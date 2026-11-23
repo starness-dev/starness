@@ -379,6 +379,37 @@ fn render_element_tree<R: BufRead, W: Write>(
                 });
             }
         }
+        "PromptInput" => {
+            if let Some(ev) = props.get("submit_event").and_then(Value::as_str) {
+                let label = props
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Prompt");
+                let field = props
+                    .get("field_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("text");
+                eprint!("{label}: ");
+                let _ = std::io::stderr().flush();
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line).is_ok() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        let mut payload = Map::new();
+                        payload.insert(field.to_owned(), Value::String(trimmed.to_owned()));
+                        actions.push(ActionChoice {
+                            label: props
+                                .get("submit_label")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Send")
+                                .to_owned(),
+                            event: ev.to_owned(),
+                            payload,
+                        });
+                    }
+                }
+            }
+        }
         "MarkdownReview" => {
             *review_elem = Some(Value::Object(props));
         }

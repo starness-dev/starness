@@ -31,7 +31,7 @@ use ratatui::{Frame, Terminal};
 use serde_json::{Map, Value, json};
 use starness_ir::{MachineDef, StateId, StateKind, StateNodeDef, UiViewSheet};
 use starness_runtime::{
-    StarnessActor, TraceEvent, TraceRecord, active_states_have_autonomous_work,
+    ProgressKind, StarnessActor, TraceEvent, TraceRecord, active_states_have_autonomous_work,
 };
 use starness_starlark::CompiledChart;
 use xstate_statemachine::core::Status;
@@ -110,6 +110,31 @@ struct ActionBarItem {
 }
 
 #[derive(Debug, Clone)]
+struct TuiToolCall {
+    id: Option<String>,
+    name: String,
+    status: String,
+    arguments: Option<String>,
+    output: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TuiChatMessage {
+    role: String,
+    text: String,
+    reasoning: Option<String>,
+    tool_calls: Vec<TuiToolCall>,
+    tool_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TuiTaskItem {
+    title: String,
+    status: String,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 enum FocusWidget {
     MarkdownReview {
         props: Map<String, Value>,
@@ -124,6 +149,44 @@ enum FocusWidget {
         columns: Vec<String>,
         rows: Vec<Vec<String>>,
         selected_row: usize,
+    },
+    Conversation {
+        title: Option<String>,
+        messages: Vec<TuiChatMessage>,
+        empty_text: String,
+        scroll: usize,
+    },
+    PromptInput {
+        label: Option<String>,
+        placeholder: String,
+        submit_event: String,
+        submit_label: String,
+        field_name: String,
+        interrupt_event: Option<String>,
+        interrupt_label: String,
+        buffer: String,
+    },
+    ToolCall {
+        name: String,
+        status: String,
+        arguments: Option<String>,
+        output: Option<String>,
+        error: Option<String>,
+        expanded: bool,
+    },
+    Reasoning {
+        title: String,
+        content: String,
+        duration_label: Option<String>,
+        expanded: bool,
+    },
+    Terminal {
+        title: Option<String>,
+        command: Option<String>,
+        stdout: String,
+        stderr: String,
+        exit_code: Option<i64>,
+        scroll: usize,
     },
     TextInput {
         label: String,
@@ -173,6 +236,10 @@ enum DisplayKind {
         title: Option<String>,
         content: String,
     },
+    TaskList {
+        title: Option<String>,
+        tasks: Vec<TuiTaskItem>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -211,7 +278,7 @@ struct AppModel {
     drawer: DrawerMode,
     spinner_tick: usize,
     traces: Vec<String>,
-    live_progress: Vec<String>,
+    live_progress: Vec<(ProgressKind, String)>,
     display_items: Vec<DisplayItem>,
     widgets: Vec<FocusWidget>,
     focused: usize,
@@ -380,7 +447,7 @@ impl AppModel {
             }
             TraceEvent::ServiceProgress { stream, chunk, .. } => {
                 let s = format!("[{stream:?}] {chunk}");
-                self.live_progress.push(s.clone());
+                self.live_progress.push((*stream, chunk.clone()));
                 if self.live_progress.len() > 200 {
                     self.live_progress.remove(0);
                 }
@@ -437,18 +504,23 @@ impl AppModel {
             };
         }
 
-        // Global shortcuts (when not inside a modal)
+        let typing_prompt = matches!(
+            self.widgets.get(self.focused),
+            Some(FocusWidget::PromptInput { .. })
+        );
+
+        // Global shortcuts (when not inside a modal or actively typing in PromptInput)
         match key.code {
-            KeyCode::Char('q') => return AppAction::Quit,
-            KeyCode::Char('t') => {
+            KeyCode::Char('q') if !typing_prompt => return AppAction::Quit,
+            KeyCode::Char('t') if !typing_prompt => {
                 self.toggle_drawer(DrawerMode::Trace);
                 return AppAction::None;
             }
-            KeyCode::Char('g') => {
+            KeyCode::Char('g') if !typing_prompt => {
                 self.toggle_drawer(DrawerMode::Diagram);
                 return AppAction::None;
             }
-            KeyCode::Char('x') => {
+            KeyCode::Char('x') if !typing_prompt => {
                 self.toggle_drawer(DrawerMode::Context);
                 return AppAction::None;
             }
@@ -947,6 +1019,75 @@ impl AppModel {
                 }
                 _ => {}
             },
+            FocusWidget::Conversation { scroll, .. } => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *scroll = scroll.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *scroll = scroll.saturating_sub(1);
+                }
+                _ => {}
+            },
+            FocusWidget::PromptInput {
+                submit_event,
+                field_name,
+                interrupt_event,
+                buffer,
+                ..
+            } => match key.code {
+                KeyCode::Enter => {
+                    let trimmed = buffer.trim().to_owned();
+                    if !trimmed.is_empty() {
+                        let ev = submit_event.clone();
+                        let field = field_name.clone();
+                        buffer.clear();
+                        let mut map = Map::new();
+                        map.insert(field, Value::String(trimmed));
+                        return AppAction::Dispatch {
+                            event_type: ev,
+                            payload: Value::Object(map),
+                        };
+                    }
+                }
+                KeyCode::Esc => {
+                    if let Some(ev) = interrupt_event.clone() {
+                        return AppAction::Dispatch {
+                            event_type: ev,
+                            payload: json!({}),
+                        };
+                    }
+                    buffer.clear();
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    buffer.push(c);
+                }
+                _ => {}
+            },
+            FocusWidget::ToolCall { expanded, .. } => {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                    *expanded = !*expanded;
+                }
+            }
+            FocusWidget::Reasoning { expanded, .. } => {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                    *expanded = !*expanded;
+                }
+            }
+            FocusWidget::Terminal { scroll, .. } => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *scroll = scroll.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *scroll = scroll.saturating_sub(1);
+                }
+                _ => {}
+            },
             FocusWidget::TextInput { label, bind } => {
                 if matches!(key.code, KeyCode::Enter | KeyCode::Char('e')) {
                     let current = self
@@ -1187,6 +1328,23 @@ impl AppModel {
                     vec![("↑/↓", "row")]
                 }
             }
+            Some(FocusWidget::Conversation { .. }) => vec![("↑/↓", "scroll")],
+            Some(FocusWidget::PromptInput {
+                interrupt_event, ..
+            }) => {
+                let mut v = vec![("Type", "prompt"), ("Enter", "send")];
+                if interrupt_event.is_some() {
+                    v.push(("Esc", "stop"));
+                }
+                v
+            }
+            Some(FocusWidget::ToolCall { expanded, .. }) => {
+                vec![("Enter", if *expanded { "collapse" } else { "expand" })]
+            }
+            Some(FocusWidget::Reasoning { expanded, .. }) => {
+                vec![("Enter", if *expanded { "collapse" } else { "expand" })]
+            }
+            Some(FocusWidget::Terminal { .. }) => vec![("↑/↓", "scroll")],
             Some(FocusWidget::ActionBar { .. }) => {
                 vec![("←/→", "select action"), ("Enter", "trigger")]
             }
@@ -1543,8 +1701,22 @@ fn render_main_pane(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
             ),
         ])];
         lines.push(Line::from(""));
-        for p in model.live_progress.iter().rev().take(20).rev() {
-            lines.push(Line::styled(p.as_str(), Style::default().fg(TEXT_SECONDARY)));
+        for (kind, chunk) in model.live_progress.iter().rev().take(24).rev() {
+            let (prefix, color) = match kind {
+                ProgressKind::AgentThought => ("◆ ", NOTE_ACCENT),
+                ProgressKind::ToolCall => ("⚙ ", WARNING),
+                ProgressKind::Plan => ("▸ ", SUCCESS),
+                ProgressKind::AgentText => ("  ", TEXT_PRIMARY),
+                ProgressKind::Stdout => ("$ ", CODE_FG),
+                ProgressKind::Stderr => ("! ", DANGER),
+                ProgressKind::Artifact => ("★ ", ACCENT),
+                ProgressKind::Http => ("↗ ", TEXT_MUTED),
+                ProgressKind::Log => ("· ", TEXT_SECONDARY),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(color)),
+                Span::styled(chunk.as_str(), Style::default().fg(color)),
+            ]));
         }
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -1609,6 +1781,11 @@ fn estimate_display_height(items: &[DisplayItem]) -> u16 {
             }
             DisplayKind::Markdown { title, content } => {
                 (content.lines().count() as u16).min(6)
+                    + u16::from(title.is_some())
+                    + u16::from(has_prev)
+            }
+            DisplayKind::TaskList { title, tasks } => {
+                (tasks.len() as u16).clamp(1, 6)
                     + u16::from(title.is_some())
                     + u16::from(has_prev)
             }
@@ -1711,6 +1888,49 @@ fn render_display_items(f: &mut Frame<'_>, area: Rect, items: &[DisplayItem]) {
                     lines.push(Line::from(spans));
                 }
             }
+            DisplayKind::TaskList { title, tasks } => {
+                if !lines.is_empty() {
+                    lines.push(Line::from(""));
+                }
+                let done_n = tasks.iter().filter(|t| t.status == "done").count();
+                let header = match title {
+                    Some(t) => format!(" ── {t} ({done_n}/{}) ──", tasks.len()),
+                    None => format!(" ── Plan ({done_n}/{}) ──", tasks.len()),
+                };
+                lines.push(Line::styled(
+                    header,
+                    Style::default().fg(TEXT_MUTED).add_modifier(Modifier::BOLD),
+                ));
+                for task in tasks {
+                    let (icon, color, text_style) = match task.status.as_str() {
+                        "done" => (" ✓ ", SUCCESS, Style::default().fg(TEXT_MUTED)),
+                        "running" => (
+                            " ⠋ ",
+                            ACCENT,
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ),
+                        "failed" => (
+                            " ✖ ",
+                            DANGER,
+                            Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+                        ),
+                        _ => (" ○ ", TEXT_MUTED, Style::default().fg(TEXT_PRIMARY)),
+                    };
+                    let mut spans = vec![
+                        Span::styled(icon, Style::default().fg(color)),
+                        Span::styled(task.title.clone(), text_style),
+                    ];
+                    if let Some(det) = &task.detail
+                        && !det.is_empty()
+                    {
+                        spans.push(Span::styled(
+                            format!("  — {det}"),
+                            Style::default().fg(TEXT_MUTED),
+                        ));
+                    }
+                    lines.push(Line::from(spans));
+                }
+            }
         }
     }
     let block = Block::bordered()
@@ -1735,7 +1955,38 @@ fn render_interactive_widgets(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
         constraints.push(match w {
             FocusWidget::MarkdownReview { .. }
             | FocusWidget::DiffReview { .. }
-            | FocusWidget::Table { .. } => Constraint::Min(8),
+            | FocusWidget::Table { .. }
+            | FocusWidget::Conversation { .. } => Constraint::Min(8),
+            FocusWidget::Terminal { stdout, stderr, .. } => {
+                let line_count = stdout.lines().count() + stderr.lines().count();
+                Constraint::Length((line_count as u16).clamp(2, 8) + 2)
+            }
+            FocusWidget::ToolCall {
+                expanded,
+                arguments,
+                output,
+                error,
+                ..
+            } => {
+                if *expanded {
+                    let body_lines = arguments.as_deref().map_or(0, |s| s.lines().count().min(4) + 1)
+                        + output.as_deref().map_or(0, |s| s.lines().count().min(4) + 1)
+                        + error.as_deref().map_or(0, |s| s.lines().count().min(3) + 1);
+                    Constraint::Length((body_lines as u16).clamp(2, 10) + 3)
+                } else {
+                    Constraint::Length(3)
+                }
+            }
+            FocusWidget::Reasoning {
+                expanded, content, ..
+            } => {
+                if *expanded {
+                    Constraint::Length((content.lines().count() as u16).clamp(1, 6) + 3)
+                } else {
+                    Constraint::Length(3)
+                }
+            }
+            FocusWidget::PromptInput { .. } => Constraint::Length(3),
             FocusWidget::FallbackPicker { events, .. } => {
                 Constraint::Min((events.len() as u16).saturating_add(3))
             }
@@ -1810,6 +2061,100 @@ fn render_interactive_widgets(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
                     is_focused,
                     border_style,
                     &model.link_hotspot,
+                );
+            }
+            FocusWidget::Conversation {
+                title,
+                messages,
+                empty_text,
+                scroll,
+            } => {
+                render_conversation_widget(
+                    f,
+                    rect,
+                    title.as_deref(),
+                    messages,
+                    empty_text,
+                    *scroll,
+                    border_style,
+                );
+            }
+            FocusWidget::PromptInput {
+                label,
+                placeholder,
+                submit_label,
+                interrupt_event,
+                interrupt_label,
+                buffer,
+                ..
+            } => {
+                render_prompt_input_widget(
+                    f,
+                    rect,
+                    label.as_deref(),
+                    placeholder,
+                    submit_label,
+                    interrupt_event.is_some(),
+                    interrupt_label,
+                    buffer,
+                    is_focused,
+                    border_style,
+                );
+            }
+            FocusWidget::ToolCall {
+                name,
+                status,
+                arguments,
+                output,
+                error,
+                expanded,
+            } => {
+                render_tool_call_widget(
+                    f,
+                    rect,
+                    name,
+                    status,
+                    arguments.as_deref(),
+                    output.as_deref(),
+                    error.as_deref(),
+                    *expanded,
+                    border_style,
+                );
+            }
+            FocusWidget::Reasoning {
+                title,
+                content,
+                duration_label,
+                expanded,
+            } => {
+                render_reasoning_widget(
+                    f,
+                    rect,
+                    title,
+                    content,
+                    duration_label.as_deref(),
+                    *expanded,
+                    border_style,
+                );
+            }
+            FocusWidget::Terminal {
+                title,
+                command,
+                stdout,
+                stderr,
+                exit_code,
+                scroll,
+            } => {
+                render_terminal_widget(
+                    f,
+                    rect,
+                    title.as_deref(),
+                    command.as_deref(),
+                    stdout,
+                    stderr,
+                    *exit_code,
+                    *scroll,
+                    border_style,
                 );
             }
             FocusWidget::TextInput { label, bind } => {
@@ -2196,6 +2541,389 @@ fn render_markdown_review(
             ia,
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_conversation_widget(
+    f: &mut Frame<'_>,
+    area: Rect,
+    title: Option<&str>,
+    messages: &[TuiChatMessage],
+    empty_text: &str,
+    scroll: usize,
+    border_style: Style,
+) {
+    let header = match title {
+        Some(t) => format!(" {t} ({}) ", messages.len()),
+        None => format!(" Conversation ({}) ", messages.len()),
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if messages.is_empty() {
+        lines.push(Line::styled(
+            format!(" {empty_text}"),
+            Style::default().fg(TEXT_MUTED),
+        ));
+    } else {
+        for (idx, msg) in messages.iter().enumerate() {
+            if idx > 0 {
+                lines.push(Line::from(""));
+            }
+            match msg.role.as_str() {
+                "user" => {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            " You ",
+                            Style::default()
+                                .fg(ACCENT)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                }
+                "tool" => {
+                    let name = msg.tool_name.as_deref().unwrap_or("tool");
+                    lines.push(Line::from(vec![
+                        Span::styled(" ⚙ ", Style::default().fg(WARNING)),
+                        Span::styled(
+                            format!("Tool: {name}"),
+                            Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                }
+                "system" => {
+                    lines.push(Line::styled(
+                        " System",
+                        Style::default().fg(TEXT_MUTED).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                _ => {
+                    lines.push(Line::styled(
+                        " Assistant",
+                        Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+                    ));
+                }
+            }
+            if let Some(reasoning) = &msg.reasoning
+                && !reasoning.trim().is_empty()
+            {
+                let preview = reasoning
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(80)
+                    .collect::<String>();
+                lines.push(Line::from(vec![
+                    Span::styled("   ◆ Thinking: ", Style::default().fg(NOTE_ACCENT)),
+                    Span::styled(preview, Style::default().fg(TEXT_MUTED)),
+                ]));
+            }
+            if !msg.text.trim().is_empty() {
+                let text_color = if msg.role == "tool" {
+                    CODE_FG
+                } else {
+                    TEXT_PRIMARY
+                };
+                for l in msg.text.lines().take(12) {
+                    lines.push(Line::styled(
+                        format!("   {l}"),
+                        Style::default().fg(text_color),
+                    ));
+                }
+            }
+            for tc in &msg.tool_calls {
+                let args_preview = tc
+                    .arguments
+                    .as_deref()
+                    .map(|a| {
+                        let compact = a.replace('\n', " ");
+                        let clipped: String = compact.chars().take(60).collect();
+                        format!("({clipped})")
+                    })
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled("   ⚙ ", Style::default().fg(WARNING)),
+                    Span::styled(
+                        tc.name.clone(),
+                        Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(args_preview, Style::default().fg(TEXT_MUTED)),
+                    Span::styled(
+                        format!(" [{}]", tc.status),
+                        Style::default().fg(if tc.status == "error" { DANGER } else { SUCCESS }),
+                    ),
+                ]));
+                if let Some(out_text) = &tc.output
+                    && !out_text.trim().is_empty()
+                {
+                    let compact_out: String = out_text
+                        .replace('\n', " ")
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .chars()
+                        .take(90)
+                        .collect();
+                    lines.push(Line::styled(
+                        format!("     ↳ {compact_out}"),
+                        Style::default().fg(CODE_FG),
+                    ));
+                }
+            }
+        }
+    }
+
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(inner_h);
+    let effective_scroll = if scroll == 0 {
+        max_scroll
+    } else {
+        scroll.min(max_scroll)
+    };
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(header)
+        .border_style(border_style);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((effective_scroll as u16, 0))
+            .block(block),
+        area,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_prompt_input_widget(
+    f: &mut Frame<'_>,
+    area: Rect,
+    label: Option<&str>,
+    placeholder: &str,
+    submit_label: &str,
+    has_interrupt: bool,
+    interrupt_label: &str,
+    buffer: &str,
+    is_focused: bool,
+    border_style: Style,
+) {
+    let title = match label {
+        Some(l) if !l.is_empty() => format!(" {l} "),
+        _ => " Prompt ".to_owned(),
+    };
+    let mut spans = vec![Span::styled(" › ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))];
+    if buffer.is_empty() {
+        spans.push(Span::styled(
+            placeholder.to_owned(),
+            Style::default().fg(TEXT_MUTED),
+        ));
+    } else {
+        spans.push(Span::styled(
+            buffer.to_owned(),
+            Style::default().fg(TEXT_PRIMARY),
+        ));
+    }
+    if is_focused {
+        spans.push(Span::styled("█", Style::default().fg(ACCENT)));
+    }
+    spans.push(Span::styled(
+        format!("   [Enter: {submit_label}]"),
+        Style::default().fg(TEXT_MUTED),
+    ));
+    if has_interrupt {
+        spans.push(Span::styled(
+            format!("  [Esc: {interrupt_label}]"),
+            Style::default().fg(DANGER),
+        ));
+    }
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(title)
+        .border_style(border_style);
+    f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_tool_call_widget(
+    f: &mut Frame<'_>,
+    area: Rect,
+    name: &str,
+    status: &str,
+    arguments: Option<&str>,
+    output: Option<&str>,
+    error: Option<&str>,
+    expanded: bool,
+    border_style: Style,
+) {
+    let arrow = if expanded { "▾" } else { "▸" };
+    let status_color = match status {
+        "running" => ACCENT,
+        "error" | "failed" => DANGER,
+        "pending" => TEXT_MUTED,
+        _ => SUCCESS,
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!(" {arrow} ⚙ "), Style::default().fg(WARNING)),
+        Span::styled(
+            name.to_owned(),
+            Style::default()
+                .fg(TEXT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("[{status}]"),
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])];
+
+    if expanded {
+        if let Some(args) = arguments
+            && !args.trim().is_empty()
+        {
+            lines.push(Line::styled(
+                "   Arguments:",
+                Style::default().fg(TEXT_MUTED).add_modifier(Modifier::BOLD),
+            ));
+            for l in args.lines().take(4) {
+                lines.push(Line::styled(
+                    format!("     {l}"),
+                    Style::default().fg(TEXT_SECONDARY),
+                ));
+            }
+        }
+        if let Some(out) = output
+            && !out.trim().is_empty()
+        {
+            lines.push(Line::styled(
+                "   Output:",
+                Style::default().fg(TEXT_MUTED).add_modifier(Modifier::BOLD),
+            ));
+            for l in out.lines().take(4) {
+                lines.push(Line::styled(
+                    format!("     {l}"),
+                    Style::default().fg(CODE_FG),
+                ));
+            }
+        }
+        if let Some(err) = error
+            && !err.trim().is_empty()
+        {
+            lines.push(Line::styled(
+                "   Error:",
+                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+            ));
+            for l in err.lines().take(3) {
+                lines.push(Line::styled(
+                    format!("     {l}"),
+                    Style::default().fg(DANGER),
+                ));
+            }
+        }
+    }
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(" Tool Call ")
+        .border_style(border_style);
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
+        area,
+    );
+}
+
+fn render_reasoning_widget(
+    f: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    content: &str,
+    duration_label: Option<&str>,
+    expanded: bool,
+    border_style: Style,
+) {
+    let arrow = if expanded { "▾" } else { "▸" };
+    let mut header_spans = vec![
+        Span::styled(format!(" {arrow} ◆ "), Style::default().fg(NOTE_ACCENT)),
+        Span::styled(
+            title.to_owned(),
+            Style::default()
+                .fg(NOTE_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(dur) = duration_label {
+        header_spans.push(Span::styled(
+            format!("  ({dur})"),
+            Style::default().fg(TEXT_MUTED),
+        ));
+    }
+    let mut lines = vec![Line::from(header_spans)];
+    if expanded {
+        for l in content.lines().take(6) {
+            lines.push(Line::styled(
+                format!("   {l}"),
+                Style::default().fg(TEXT_SECONDARY),
+            ));
+        }
+    }
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(" Reasoning ")
+        .border_style(border_style);
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
+        area,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_terminal_widget(
+    f: &mut Frame<'_>,
+    area: Rect,
+    title: Option<&str>,
+    command: Option<&str>,
+    stdout: &str,
+    stderr: &str,
+    exit_code: Option<i64>,
+    scroll: usize,
+    border_style: Style,
+) {
+    let header_cmd = match (command, title) {
+        (Some(cmd), _) if !cmd.is_empty() => format!(" $ {cmd} "),
+        (_, Some(t)) if !t.is_empty() => format!(" {t} "),
+        _ => " Terminal ".to_owned(),
+    };
+    let title_str = match exit_code {
+        Some(code) => format!("{header_cmd}[exit {code}] "),
+        None => header_cmd,
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for l in stdout.lines() {
+        lines.push(Line::styled(format!(" {l}"), Style::default().fg(CODE_FG)));
+    }
+    for l in stderr.lines() {
+        lines.push(Line::styled(format!(" {l}"), Style::default().fg(DANGER)));
+    }
+    if lines.is_empty() {
+        lines.push(Line::styled(" (no output)", Style::default().fg(TEXT_MUTED)));
+    }
+
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(inner_h);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(title_str)
+        .border_style(border_style);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll.min(max_scroll) as u16, 0))
+            .block(block),
+        area,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2795,6 +3523,174 @@ fn collect_spec_nodes(
                 },
             });
         }
+        "TaskList" => {
+            let raw_tasks = resolve_val(props.get("tasks"), draft_state);
+            let tasks = parse_tui_tasks(&raw_tasks);
+            display.push(DisplayItem {
+                kind: DisplayKind::TaskList {
+                    title: props
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    tasks,
+                },
+            });
+        }
+        "Conversation" => {
+            let raw_msgs = resolve_val(props.get("messages"), draft_state);
+            let messages = parse_tui_messages(&raw_msgs);
+            widgets.push(FocusWidget::Conversation {
+                title: props
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                messages,
+                empty_text: props
+                    .get("empty_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("No messages yet. Type a prompt below to begin.")
+                    .to_owned(),
+                scroll: 0,
+            });
+        }
+        "PromptInput" => {
+            if let Some(submit_event) = props.get("submit_event").and_then(Value::as_str) {
+                widgets.push(FocusWidget::PromptInput {
+                    label: props
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    placeholder: props
+                        .get("placeholder")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Type a prompt…")
+                        .to_owned(),
+                    submit_event: submit_event.to_owned(),
+                    submit_label: props
+                        .get("submit_label")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Send")
+                        .to_owned(),
+                    field_name: props
+                        .get("field_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("text")
+                        .to_owned(),
+                    interrupt_event: props
+                        .get("interrupt_event")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    interrupt_label: props
+                        .get("interrupt_label")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Stop")
+                        .to_owned(),
+                    buffer: String::new(),
+                });
+            }
+        }
+        "ToolCall" => {
+            let name = resolve_str(props.get("name"), draft_state);
+            let error_val = props.get("error").map(|v| resolve_val(Some(v), draft_state));
+            let error = error_val.and_then(|v| {
+                if v.is_null() {
+                    None
+                } else {
+                    Some(format_json_compact(&v))
+                }
+            });
+            let status_raw = props
+                .get("status")
+                .map(|v| resolve_str(Some(v), draft_state))
+                .unwrap_or_else(|| if error.is_some() { "error".to_owned() } else { "ok".to_owned() });
+            let arguments = props
+                .get("arguments")
+                .map(|v| resolve_val(Some(v), draft_state))
+                .and_then(|v| if v.is_null() { None } else { Some(format_json_compact(&v)) });
+            let output = props
+                .get("output")
+                .map(|v| resolve_val(Some(v), draft_state))
+                .and_then(|v| if v.is_null() { None } else { Some(format_json_compact(&v)) });
+            let expanded = props
+                .get("expanded")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| error.is_some());
+            widgets.push(FocusWidget::ToolCall {
+                name: if name.is_empty() { "tool".to_owned() } else { name },
+                status: status_raw,
+                arguments,
+                output,
+                error,
+                expanded,
+            });
+        }
+        "Reasoning" => {
+            let title = props
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("Reasoning")
+                .to_owned();
+            let content_val = resolve_val(props.get("content"), draft_state);
+            let content = if let Some(arr) = content_val.as_array() {
+                arr.iter()
+                    .map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                format_json_compact(&content_val)
+            };
+            let duration_label = props
+                .get("duration_ms")
+                .map(|v| resolve_val(Some(v), draft_state))
+                .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .map(|ms| {
+                    if ms >= 1000.0 {
+                        format!("{:.1}s", ms / 1000.0)
+                    } else {
+                        format!("{}ms", ms.round() as i64)
+                    }
+                });
+            let expanded = props
+                .get("expanded")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            widgets.push(FocusWidget::Reasoning {
+                title,
+                content,
+                duration_label,
+                expanded,
+            });
+        }
+        "Terminal" => {
+            let title = props
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let command = props
+                .get("command")
+                .map(|v| resolve_str(Some(v), draft_state))
+                .filter(|s| !s.is_empty());
+            let stdout = props
+                .get("stdout")
+                .map(|v| resolve_str(Some(v), draft_state))
+                .unwrap_or_default();
+            let stderr = props
+                .get("stderr")
+                .map(|v| resolve_str(Some(v), draft_state))
+                .unwrap_or_default();
+            let exit_code = props
+                .get("exit_code")
+                .map(|v| resolve_val(Some(v), draft_state))
+                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+            widgets.push(FocusWidget::Terminal {
+                title,
+                command,
+                stdout,
+                stderr,
+                exit_code,
+                scroll: 0,
+            });
+        }
         "TextInput" | "Textarea" => {
             if let Some(bind) = props.get("bind").and_then(Value::as_str) {
                 widgets.push(FocusWidget::TextInput {
@@ -3260,6 +4156,293 @@ fn resolve_str(prop: Option<&Value>, state: &Value) -> String {
         Value::Null => String::new(),
         other => other.to_string(),
     }
+}
+
+fn format_json_compact(val: &Value) -> String {
+    match val {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+fn parse_tui_tasks(raw: &Value) -> Vec<TuiTaskItem> {
+    let Some(arr) = raw.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        if let Some(s) = item.as_str() {
+            if !s.is_empty() {
+                out.push(TuiTaskItem {
+                    title: s.to_owned(),
+                    status: "pending".to_owned(),
+                    detail: None,
+                });
+            }
+            continue;
+        }
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let title = obj
+            .get("title")
+            .or_else(|| obj.get("label"))
+            .or_else(|| obj.get("text"))
+            .or_else(|| obj.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if title.is_empty() {
+            continue;
+        }
+        let status_raw = obj
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                if obj.get("done").and_then(Value::as_bool).unwrap_or(false) {
+                    "done"
+                } else {
+                    "pending"
+                }
+            })
+            .to_ascii_lowercase();
+        let status = match status_raw.as_str() {
+            "done" | "completed" | "ok" | "passed" => "done",
+            "running" | "in_progress" | "active" => "running",
+            "failed" | "error" => "failed",
+            _ => "pending",
+        }
+        .to_owned();
+        let detail = obj
+            .get("detail")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        out.push(TuiTaskItem {
+            title,
+            status,
+            detail,
+        });
+    }
+    out
+}
+
+fn attach_tui_tool_result(
+    msgs: &mut [TuiChatMessage],
+    call_id: Option<&str>,
+    tool_name: &str,
+    content: &Value,
+) -> bool {
+    let is_err = content.as_object().is_some_and(|o| o.contains_key("error"));
+    let formatted = format_json_compact(content);
+    for msg in msgs.iter_mut().rev() {
+        if msg.role != "assistant" {
+            continue;
+        }
+        for tc in &mut msg.tool_calls {
+            let id_match = call_id.is_some() && tc.id.as_deref() == call_id;
+            let name_match = call_id.is_none() && tc.name == tool_name && tc.output.is_none();
+            if id_match || name_match {
+                tc.output = Some(formatted);
+                tc.status = if is_err { "error" } else { "ok" }.to_owned();
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn parse_tui_messages(raw: &Value) -> Vec<TuiChatMessage> {
+    let Some(arr) = raw.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        // Unwrap @starness/llm lossless `$starness_llm_msg` envelope
+        if let Some(inner) = obj.get("$starness_llm_msg").and_then(Value::as_object) {
+            let role = inner
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("assistant")
+                .to_ascii_lowercase();
+            let mut text_parts = Vec::new();
+            let mut reasoning_parts = Vec::new();
+            let mut tool_calls = Vec::new();
+            if let Some(content) = inner.get("content") {
+                if let Some(s) = content.as_str() {
+                    if !s.is_empty() {
+                        text_parts.push(s.to_owned());
+                    }
+                } else if let Some(parts) = content.as_array() {
+                    for part in parts {
+                        if let Some(s) = part.as_str() {
+                            text_parts.push(s.to_owned());
+                            continue;
+                        }
+                        let Some(po) = part.as_object() else {
+                            continue;
+                        };
+                        if let Some(t) = po.get("Text").and_then(Value::as_str) {
+                            text_parts.push(t.to_owned());
+                        } else if let Some(r) = po
+                            .get("Thought")
+                            .or_else(|| po.get("Reasoning"))
+                            .or_else(|| po.get("ReasoningContent"))
+                            .and_then(Value::as_str)
+                        {
+                            reasoning_parts.push(r.to_owned());
+                        } else if let Some(tc) = po.get("ToolCall").and_then(Value::as_object) {
+                            tool_calls.push(TuiToolCall {
+                                id: tc
+                                    .get("call_id")
+                                    .or_else(|| tc.get("id"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                name: tc
+                                    .get("fn_name")
+                                    .or_else(|| tc.get("name"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("tool")
+                                    .to_owned(),
+                                status: "ok".to_owned(),
+                                arguments: tc
+                                    .get("fn_arguments")
+                                    .or_else(|| tc.get("arguments"))
+                                    .or_else(|| tc.get("args"))
+                                    .map(format_json_compact),
+                                output: None,
+                            });
+                        }
+                    }
+                }
+            }
+            out.push(TuiChatMessage {
+                role,
+                text: text_parts.join("\n"),
+                reasoning: if reasoning_parts.is_empty() {
+                    None
+                } else {
+                    Some(reasoning_parts.join("\n"))
+                },
+                tool_calls,
+                tool_name: None,
+            });
+            continue;
+        }
+
+        let role = obj
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("assistant")
+            .to_ascii_lowercase();
+
+        if role == "tool"
+            && let Some(results) = obj.get("results").and_then(Value::as_array)
+        {
+            for res in results {
+                let Some(ro) = res.as_object() else {
+                    continue;
+                };
+                let cid = ro.get("call_id").and_then(Value::as_str);
+                let tname = ro
+                    .get("fn_name")
+                    .or_else(|| ro.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                let content = ro.get("content").unwrap_or(&Value::Null);
+                if !attach_tui_tool_result(&mut out, cid, tname, content) {
+                    out.push(TuiChatMessage {
+                        role: "tool".to_owned(),
+                        text: format_json_compact(content),
+                        reasoning: None,
+                        tool_calls: Vec::new(),
+                        tool_name: Some(tname.to_owned()),
+                    });
+                }
+            }
+            continue;
+        }
+
+        if role == "tool" {
+            let cid = obj.get("call_id").and_then(Value::as_str);
+            let tname = obj
+                .get("fn_name")
+                .or_else(|| obj.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            let content = obj
+                .get("content")
+                .or_else(|| obj.get("text"))
+                .unwrap_or(&Value::Null);
+            if !attach_tui_tool_result(&mut out, cid, tname, content) {
+                out.push(TuiChatMessage {
+                    role: "tool".to_owned(),
+                    text: format_json_compact(content),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    tool_name: Some(tname.to_owned()),
+                });
+            }
+            continue;
+        }
+
+        let text = obj
+            .get("text")
+            .or_else(|| obj.get("content"))
+            .map(format_json_compact)
+            .unwrap_or_default();
+        let reasoning = obj
+            .get("reasoning")
+            .or_else(|| obj.get("thought"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut tool_calls = Vec::new();
+        if let Some(raw_tcs) = obj.get("tool_calls").and_then(Value::as_array) {
+            for raw_tc in raw_tcs {
+                let Some(tc) = raw_tc.as_object() else {
+                    continue;
+                };
+                tool_calls.push(TuiToolCall {
+                    id: tc
+                        .get("id")
+                        .or_else(|| tc.get("call_id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    name: tc
+                        .get("name")
+                        .or_else(|| tc.get("fn_name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_owned(),
+                    status: tc
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("ok")
+                        .to_owned(),
+                    arguments: tc
+                        .get("arguments")
+                        .or_else(|| tc.get("args"))
+                        .or_else(|| tc.get("fn_arguments"))
+                        .map(format_json_compact),
+                    output: tc
+                        .get("output")
+                        .or_else(|| tc.get("result"))
+                        .map(format_json_compact),
+                });
+            }
+        }
+        out.push(TuiChatMessage {
+            role,
+            text,
+            reasoning,
+            tool_calls,
+            tool_name: None,
+        });
+    }
+    out
 }
 
 fn set_json_pointer(root: &mut Value, pointer: &str, new_val: Value) {
@@ -3830,7 +5013,7 @@ chart = machine(
     }
 
     #[test]
-    fn ratatui_renders_all_15_showcase_widgets_and_exports_svg_snapshots() {
+    fn ratatui_renders_all_20_showcase_widgets_and_exports_svg_snapshots() {
         let star_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/ui_showcase.star");
         let ui_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -3843,20 +5026,21 @@ chart = machine(
 
         let snap_dir = std::env::var("STARNESS_TUI_SNAPSHOT_DIR").ok();
         let screens = [
-            ("display", "showcase_1_display.svg", "Workspace Crates"),
-            ("inputs", "showcase_2_inputs.svg", "Pre-flight Checks"),
-            ("markdown_review", "showcase_3_markdown.svg", "Release Checklist"),
-            ("diff_review", "showcase_4_diff.svg", "route_event"),
+            ("display", "showcase_1_display.svg", "Workspace Crates", 34),
+            ("inputs", "showcase_2_inputs.svg", "Pre-flight Checks", 34),
+            ("markdown_review", "showcase_3_markdown.svg", "Release Checklist", 34),
+            ("diff_review", "showcase_4_diff.svg", "route_event", 34),
+            ("ai_elements", "showcase_5_ai_elements.svg", "Model Reasoning", 42),
         ];
 
-        for (state_name, filename, expected_text) in screens {
+        for (state_name, filename, expected_text, height) in screens {
             let model = AppModel::new(
                 compiled.ir.clone(),
                 Some(sheet.clone()),
                 vec![state_name.to_owned()],
                 compiled.ir.context.clone(),
             );
-            let backend = TestBackend::new(118, 34);
+            let backend = TestBackend::new(118, height);
             let mut term = Terminal::new(backend).unwrap();
             term.draw(|f| render_app(f, &model)).unwrap();
             let text: String = term
@@ -3876,6 +5060,53 @@ chart = machine(
                 let out_path = std::path::Path::new(dir).join(filename);
                 std::fs::write(out_path, svg).unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn ratatui_prompt_input_types_and_dispatches_without_global_hotkey_conflict() {
+        let star_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/coding_session_llm.star");
+        let ui_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/coding_session_llm.ui.json");
+        let compiled =
+            starness_starlark::compile_starlark_file(&star_path, Some("chart")).unwrap();
+        let sheet =
+            UiViewSheet::from_json_str(&std::fs::read_to_string(&ui_path).unwrap()).unwrap();
+        assert_eq!(sheet.validate_against(&compiled.ir), Ok(()));
+
+        let mut model = AppModel::new(
+            compiled.ir.clone(),
+            Some(sheet),
+            vec!["gather_input".to_owned()],
+            compiled.ir.context.clone(),
+        );
+        // Focus PromptInput widget
+        let prompt_idx = model
+            .widgets
+            .iter()
+            .position(|w| matches!(w, FocusWidget::PromptInput { .. }))
+            .expect("PromptInput widget should exist");
+        model.focused = prompt_idx;
+
+        // Type "quit test" — 'q' and 't' must NOT quit or toggle trace drawer!
+        for ch in "quit test".chars() {
+            let act = model.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+            assert!(matches!(act, AppAction::None));
+        }
+        assert_eq!(model.drawer, DrawerMode::None);
+
+        // Press Enter -> dispatches PROMPT with {"text": "quit test"}
+        let act = model.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match act {
+            AppAction::Dispatch {
+                event_type,
+                payload,
+            } => {
+                assert_eq!(event_type, "PROMPT");
+                assert_eq!(payload["text"], "quit test");
+            }
+            other => panic!("expected PROMPT dispatch, got {other:?}"),
         }
     }
 }
