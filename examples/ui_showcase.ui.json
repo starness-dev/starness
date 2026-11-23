@@ -11,7 +11,7 @@
         },
         "header_card": {
           "type": "Card",
-          "props": { "title": "1 / 4 · Display Widgets" },
+          "props": { "title": "1 / 5 · Display Widgets" },
           "children": ["badge", "kv", "alert_info"]
         },
         "badge": {
@@ -70,7 +70,7 @@
         },
         "title_card": {
           "type": "Card",
-          "props": { "title": "2 / 4 · Input & Action Widgets" },
+          "props": { "title": "2 / 5 · Input & Action Widgets" },
           "children": ["badge"]
         },
         "badge": {
@@ -131,7 +131,7 @@
         "md_rev": {
           "type": "MarkdownReview",
           "props": {
-            "title": "3 / 4 · MarkdownReview",
+            "title": "3 / 5 · MarkdownReview",
             "markdown": { "$state": "/review_md" },
             "agent_notes": { "$state": "/review_notes" },
             "comments_path": "/review_comments",
@@ -158,18 +158,96 @@
         "diff_rev": {
           "type": "DiffReview",
           "props": {
-            "title": "4 / 4 · DiffReview",
+            "title": "4 / 5 · DiffReview",
             "diff": { "$state": "/patch_diff" },
             "comments_path": "/diff_comments",
             "approve_event": "APPROVE",
             "revise_event": "REVISE",
-            "approve_label": "Finish Showcase",
+            "approve_label": "Next: AI Elements →",
             "revise_label": "Request Changes"
           }
         },
         "btn_back": {
           "type": "Button",
           "props": { "label": "← Back", "event": "BACK", "variant": "secondary" }
+        }
+      }
+    },
+    "ai_elements": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["header_card", "convo", "reasoning_card", "tool_card", "term_card", "prompt_bar", "nav_row"]
+        },
+        "header_card": {
+          "type": "Card",
+          "props": { "title": "5 / 5 · AI Workflow Elements" },
+          "children": ["plan_tasks"]
+        },
+        "plan_tasks": {
+          "type": "TaskList",
+          "props": {
+            "title": "Agent Plan",
+            "tasks": { "$state": "/ai_tasks" }
+          }
+        },
+        "convo": {
+          "type": "Conversation",
+          "props": {
+            "title": "Agent Conversation",
+            "messages": { "$state": "/ai_messages" }
+          }
+        },
+        "reasoning_card": {
+          "type": "Reasoning",
+          "props": {
+            "title": "Model Reasoning",
+            "content": { "$state": "/ai_reasoning" },
+            "duration_ms": 1240,
+            "expanded": true
+          }
+        },
+        "tool_card": {
+          "type": "ToolCall",
+          "props": {
+            "name": "bash",
+            "status": "ok",
+            "arguments": { "$state": "/ai_tool_args" },
+            "output": { "$state": "/ai_tool_out" }
+          }
+        },
+        "term_card": {
+          "type": "Terminal",
+          "props": {
+            "command": "cargo test --workspace",
+            "stdout": { "$state": "/ai_cmd_stdout" },
+            "exit_code": 0
+          }
+        },
+        "prompt_bar": {
+          "type": "PromptInput",
+          "props": {
+            "label": "Send Follow-Up Prompt",
+            "placeholder": "Type a message and press Enter…",
+            "submit_event": "PROMPT",
+            "submit_label": "Send",
+            "field_name": "text"
+          }
+        },
+        "nav_row": {
+          "type": "Stack",
+          "props": { "direction": "horizontal", "gap": "sm" },
+          "children": ["btn_back", "btn_finish"]
+        },
+        "btn_back": {
+          "type": "Button",
+          "props": { "label": "← Back", "event": "BACK", "variant": "secondary" }
+        },
+        "btn_finish": {
+          "type": "Button",
+          "props": { "label": "Finish Showcase", "event": "FINISH", "variant": "primary" }
         }
       }
     }

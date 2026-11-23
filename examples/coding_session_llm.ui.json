@@ -1,0 +1,92 @@
+{
+  "machine": "coding_session_llm",
+  "views": {
+    "gather_input": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["header_card", "transcript", "prompt_bar", "actions"]
+        },
+        "header_card": {
+          "type": "Card",
+          "props": { "title": "Coding Agent Harness (@starness/llm + @starness/exec)" },
+          "children": ["meta_kv"]
+        },
+        "meta_kv": {
+          "type": "KeyValue",
+          "props": {
+            "items": {
+              "model": { "$state": "/model" },
+              "turns": { "$state": "/turns" },
+              "tool_runs": { "$state": "/tool_runs" }
+            }
+          }
+        },
+        "transcript": {
+          "type": "Conversation",
+          "props": {
+            "title": "Conversation",
+            "messages": { "$state": "/messages" },
+            "empty_text": "Ask the coding agent to inspect files or run shell commands."
+          }
+        },
+        "prompt_bar": {
+          "type": "PromptInput",
+          "props": {
+            "label": "Message",
+            "placeholder": "Ask the coding agent… (/exit to quit)",
+            "submit_event": "PROMPT",
+            "submit_label": "Send",
+            "field_name": "text"
+          }
+        },
+        "actions": {
+          "type": "Stack",
+          "props": { "direction": "horizontal", "gap": "sm" },
+          "children": ["btn_exit"]
+        },
+        "btn_exit": {
+          "type": "Button",
+          "props": { "label": "Exit Session", "event": "EXIT", "variant": "secondary" }
+        }
+      }
+    },
+    "working": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["status_card", "transcript", "actions"]
+        },
+        "status_card": {
+          "type": "Card",
+          "props": { "title": "Agent Working…" },
+          "children": ["status_badge"]
+        },
+        "status_badge": {
+          "type": "Badge",
+          "props": { "label": "Thinking / executing tools", "variant": "info" }
+        },
+        "transcript": {
+          "type": "Conversation",
+          "props": {
+            "title": "Conversation",
+            "messages": { "$state": "/messages" }
+          }
+        },
+        "actions": {
+          "type": "Stack",
+          "props": { "direction": "horizontal", "gap": "sm" },
+          "children": ["btn_interrupt"]
+        },
+        "btn_interrupt": {
+          "type": "Button",
+          "props": { "label": "Interrupt", "event": "INTERRUPT", "variant": "danger" }
+        }
+      }
+    }
+  }
+}

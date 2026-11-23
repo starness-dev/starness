@@ -22,7 +22,7 @@ load(
     "invoke_llm",
     "llm_model",
     "llm_text",
-    "llm_tool_call",
+    "llm_tool_calls",
     "tool_def",
     "tool_result",
     "user_msg",
@@ -40,7 +40,7 @@ SessionCtx = record(
     llm_endpoint = field(str, ""),
     cwd = field(str, ""),
     messages = field(list[dict], []),
-    pending_call = field(dict | None, None),
+    pending_calls = field(list[dict], []),
     last_reply = field(str, ""),
     turns = field(int, 0),
     tool_runs = field(int, 0),
@@ -61,12 +61,10 @@ def select_model(ctx: SessionCtx) -> LlmModel:
         return llm_model(
             ctx.model,
             endpoint = ctx.llm_endpoint,
-            temperature = 0.2,
         )
     return llm_model(
         ctx.model,
         api_key = secret("OPENAI_API_KEY", optional = True),
-        temperature = 0.2,
     )
 
 def is_exit_prompt(_ctx: SessionCtx, ev: dict) -> bool:
@@ -81,27 +79,30 @@ def append_user_prompt(ctx: SessionCtx, ev: dict) -> SessionCtx:
     return update(
         ctx,
         messages = ctx.messages + [user_msg(txt)],
-        pending_call = None,
+        pending_calls = [],
     )
 
-def record_tool_call(ctx: SessionCtx, ev: dict) -> SessionCtx:
+def record_tool_calls(ctx: SessionCtx, ev: dict) -> SessionCtx:
     return update(
         ctx,
         messages = ctx.messages + [assistant_msg(ev)],
-        pending_call = llm_tool_call(ev),
+        pending_calls = llm_tool_calls(ev),
     )
 
 def record_final_reply(ctx: SessionCtx, ev: dict) -> SessionCtx:
     return update(
         ctx,
         messages = ctx.messages + [assistant_msg(ev)],
-        pending_call = None,
+        pending_calls = [],
         last_reply = llm_text(ev),
         turns = ctx.turns + 1,
     )
 
+def has_more_tool_calls(ctx: SessionCtx, _ev: dict) -> bool:
+    return len(ctx.pending_calls) > 1
+
 def build_bash_spec(ctx: SessionCtx) -> ExecSpec:
-    call = ctx.pending_call
+    call = ctx.pending_calls[0] if len(ctx.pending_calls) > 0 else None
     args = call.get("args", {}) if call != None else {}
     cmd_str = str(args.get("command", "true"))
     return exec_spec(
@@ -112,23 +113,25 @@ def build_bash_spec(ctx: SessionCtx) -> ExecSpec:
     )
 
 def record_bash_output(ctx: SessionCtx, ev: dict) -> SessionCtx:
-    call = ctx.pending_call
+    call = ctx.pending_calls[0] if len(ctx.pending_calls) > 0 else None
+    rest = ctx.pending_calls[1:] if len(ctx.pending_calls) > 1 else []
     out = ev.get("output", {})
     tr = tool_result(call if call != None else "bash", out)
     return update(
         ctx,
         messages = ctx.messages + [tr],
-        pending_call = None,
+        pending_calls = rest,
         tool_runs = ctx.tool_runs + 1,
     )
 
 def record_bash_error(ctx: SessionCtx, ev: dict) -> SessionCtx:
-    call = ctx.pending_call
+    call = ctx.pending_calls[0] if len(ctx.pending_calls) > 0 else None
+    rest = ctx.pending_calls[1:] if len(ctx.pending_calls) > 1 else []
     tr = tool_result(call if call != None else "bash", {"error": str(ev.get("error", "exec_failed"))})
     return update(
         ctx,
         messages = ctx.messages + [tr],
-        pending_call = None,
+        pending_calls = rest,
         tool_runs = ctx.tool_runs + 1,
     )
 
@@ -163,7 +166,7 @@ chart: StateMachine = machine(
                 transition(
                     event = SessionEvent.INTERRUPT,
                     target = S.gather_input,
-                    assign = lambda ctx, _ev: update(ctx, pending_call = None),
+                    assign = lambda ctx, _ev: update(ctx, pending_calls = []),
                 ),
             ],
             states = {
@@ -171,7 +174,7 @@ chart: StateMachine = machine(
                     invoke = invoke_llm(
                         id = "llm_turn",
                         model = select_model,
-                        system = "You are a pragmatic coding assistant. Use the `bash` tool when you need to inspect or run commands in the workspace.",
+                        system = "You are a pragmatic local coding assistant running on the user's machine. Use the provided tools proactively whenever they can help answer the user's request.",
                         system_cache = CachePolicy.ephemeral,
                         messages = lambda ctx: ctx.messages,
                         tools = [
@@ -188,7 +191,7 @@ chart: StateMachine = machine(
                             outcome(
                                 target = S.acting,
                                 guard = lambda _ctx, ev: has_tool_calls(ev),
-                                assign = record_tool_call,
+                                assign = record_tool_calls,
                             ),
                             outcome(
                                 target = S.gather_input,
@@ -205,14 +208,28 @@ chart: StateMachine = machine(
                     invoke = invoke_cmd(
                         id = "run_bash",
                         cmd = build_bash_spec,
-                        on_done = outcome(
-                            target = S.thinking,
-                            assign = record_bash_output,
-                        ),
-                        on_error = outcome(
-                            target = S.thinking,
-                            assign = record_bash_error,
-                        ),
+                        on_done = [
+                            outcome(
+                                target = S.acting,
+                                guard = has_more_tool_calls,
+                                assign = record_bash_output,
+                            ),
+                            outcome(
+                                target = S.thinking,
+                                assign = record_bash_output,
+                            ),
+                        ],
+                        on_error = [
+                            outcome(
+                                target = S.acting,
+                                guard = has_more_tool_calls,
+                                assign = record_bash_error,
+                            ),
+                            outcome(
+                                target = S.thinking,
+                                assign = record_bash_error,
+                            ),
+                        ],
                     ),
                 ),
             },
