@@ -14,9 +14,9 @@ use serde_json::Value;
 use starness_ir::{ActionDef, StateId, StateKind, StateNodeDef, UiViewSheet};
 use starness_runtime::builtins::acp::serve_chart_as_acp_agent;
 use starness_runtime::{
-    HostCallbacks, ServeDefinition, ServeOptions, StarnessActor, StarnessSyncRunner,
-    TraceReceiver, active_states_have_autonomous_work, bind_serve_listener, render_mermaid,
-    serve_charts_http,
+    HostCallbacks, McpServerOptions, ServeDefinition, ServeOptions, StarnessActor,
+    StarnessSyncRunner, TraceReceiver, active_states_have_autonomous_work, bind_serve_listener,
+    render_mermaid, serve_chart_as_mcp_stdio, serve_charts_http,
 };
 use starness_starlark::{
     CompiledChart, chart_dialect, chart_globals, compile_starlark_file, is_builtin_service,
@@ -146,6 +146,20 @@ enum Commands {
         export: String,
     },
 
+    /// Expose a `.star` statechart over `stdio` as a Model Context Protocol (MCP) server.
+    Mcp {
+        /// Path to the `.star` statechart file.
+        file: PathBuf,
+
+        /// Exported variable name holding the `StateMachine` (defaults to `chart`).
+        #[arg(long, default_value = "chart")]
+        export: String,
+
+        /// Spawn a fresh independent statechart instance per tool call when `instance_id` is omitted.
+        #[arg(long)]
+        ephemeral: bool,
+    },
+
     /// Start the Starlark Language Server Protocol (LSP) server over stdio.
     Lsp,
 
@@ -153,6 +167,12 @@ enum Commands {
     Secrets {
         #[command(subcommand)]
         action: SecretsCommand,
+    },
+
+    /// Manage OAuth 2.1 browser logins for remote MCP servers (`starness.mcp.oauth` in OS Keychain).
+    Auth {
+        #[command(subcommand)]
+        action: AuthCommand,
     },
 
     /// Internal stdio <-> localhost TCP bridge for turn-scoped MCP tools.
@@ -177,6 +197,10 @@ enum SecretsCommand {
         #[arg(long, default_value = starness_runtime::builtins::secrets::DEFAULT_KEYCHAIN_SERVICE)]
         service: String,
 
+        /// Optional machine ID scope (`<machine_id>/<name>`); omit for global default.
+        #[arg(long)]
+        machine: Option<String>,
+
         /// Secret value (omit to read from stdin so secrets stay out of shell history).
         #[arg(long)]
         value: Option<String>,
@@ -190,6 +214,10 @@ enum SecretsCommand {
         /// Keychain service namespace (defaults to `starness`).
         #[arg(long, default_value = starness_runtime::builtins::secrets::DEFAULT_KEYCHAIN_SERVICE)]
         service: String,
+
+        /// Optional machine ID scope (`<machine_id>/<name>`).
+        #[arg(long)]
+        machine: Option<String>,
     },
 
     /// Delete a secret from the OS Keychain.
@@ -200,6 +228,51 @@ enum SecretsCommand {
         /// Keychain service namespace (defaults to `starness`).
         #[arg(long, default_value = starness_runtime::builtins::secrets::DEFAULT_KEYCHAIN_SERVICE)]
         service: String,
+
+        /// Optional machine ID scope (`<machine_id>/<name>`).
+        #[arg(long)]
+        machine: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommand {
+    /// Authenticate with a remote MCP server via OAuth 2.1 PKCE browser login.
+    Login {
+        /// Remote MCP server URL (e.g. `https://mcp.linear.app/mcp`).
+        url: String,
+
+        /// Optional machine ID scope (`<machine_id>/<url>`); omit for global default.
+        #[arg(long)]
+        machine: Option<String>,
+
+        /// Optional explicit OAuth scopes (repeatable). Omit to auto-select from server metadata.
+        #[arg(long = "scope")]
+        scopes: Vec<String>,
+
+        /// Print the authorization URL without automatically opening the system browser.
+        #[arg(long)]
+        no_open: bool,
+    },
+
+    /// Remove stored OAuth 2.1 credentials for a remote MCP server from the OS Keychain.
+    Logout {
+        /// Remote MCP server URL.
+        url: String,
+
+        /// Optional machine ID scope (`<machine_id>/<url>`).
+        #[arg(long)]
+        machine: Option<String>,
+    },
+
+    /// Check whether OAuth 2.1 credentials are stored for a remote MCP server.
+    Status {
+        /// Remote MCP server URL.
+        url: String,
+
+        /// Optional machine ID scope (checks `<machine_id>/<url>`, then global fallback).
+        #[arg(long)]
+        machine: Option<String>,
     },
 }
 
@@ -237,22 +310,102 @@ fn main() -> ExitCode {
             db,
         } => run_serve(&paths, &export, &ui, &bind, &db),
         Commands::Acp { file, export } => run_acp_server(&file, &export),
+        Commands::Mcp {
+            file,
+            export,
+            ephemeral,
+        } => run_mcp_server(&file, &export, ephemeral),
         Commands::Lsp => run_lsp(),
         Commands::Secrets { action } => run_secrets(action),
+        Commands::Auth { action } => run_auth(action),
         Commands::McpBridge { addr, token } => run_mcp_bridge(&addr, &token),
+    }
+}
+
+fn run_auth(action: AuthCommand) -> ExitCode {
+    use starness_runtime::{mcp_oauth_login, mcp_oauth_logout, mcp_oauth_status};
+
+    match action {
+        AuthCommand::Login {
+            url,
+            machine,
+            scopes,
+            no_open,
+        } => {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(r) => r,
+                Err(err) => {
+                    eprintln!("ERROR building Tokio runtime: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+            match rt.block_on(mcp_oauth_login(
+                &url,
+                machine.as_deref(),
+                &scopes,
+                no_open,
+            )) {
+                Ok(summary) => {
+                    println!(
+                        "OK logged into `{}` (stored in OS keychain service `{}` account `{}`)",
+                        summary.url, summary.service, summary.account
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("ERROR {err:#}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        AuthCommand::Logout { url, machine } => match mcp_oauth_logout(&url, machine.as_deref()) {
+            Ok(true) => {
+                println!("OK removed OAuth credentials for `{url}`");
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                println!("OK no OAuth credentials found for `{url}`");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("ERROR {err:#}");
+                ExitCode::from(1)
+            }
+        },
+        AuthCommand::Status { url, machine } => match mcp_oauth_status(&url, machine.as_deref()) {
+            Ok(Some(account)) => {
+                println!("OK authenticated for `{url}` (keychain account `{account}`)");
+                ExitCode::SUCCESS
+            }
+            Ok(None) => {
+                eprintln!("MISSING not logged into `{url}` (run `starness auth login {url}`)");
+                ExitCode::from(1)
+            }
+            Err(err) => {
+                eprintln!("ERROR {err:#}");
+                ExitCode::from(1)
+            }
+        },
     }
 }
 
 fn run_secrets(action: SecretsCommand) -> ExitCode {
     use secrecy::{ExposeSecret, SecretString};
-    use starness_runtime::builtins::secrets::{keychain_delete, keychain_exists, keychain_set};
+    use starness_runtime::builtins::secrets::{
+        keychain_delete, keychain_exists, keychain_set, scoped_keychain_account,
+    };
 
     match action {
         SecretsCommand::Set {
             name,
             service,
+            machine,
             value,
         } => {
+            let account = scoped_keychain_account(machine.as_deref(), &name);
             let secret_val: SecretString = match value {
                 Some(v) => SecretString::from(v),
                 None => {
@@ -266,12 +419,12 @@ fn run_secrets(action: SecretsCommand) -> ExitCode {
                 }
             };
             if secret_val.expose_secret().is_empty() {
-                eprintln!("ERROR secret value for `{name}` must not be empty");
+                eprintln!("ERROR secret value for `{account}` must not be empty");
                 return ExitCode::from(1);
             }
-            match keychain_set(&service, &name, &secret_val) {
+            match keychain_set(&service, &account, &secret_val) {
                 Ok(()) => {
-                    println!("OK stored secret `{name}` in OS keychain (service `{service}`)");
+                    println!("OK stored secret `{account}` in OS keychain (service `{service}`)");
                     ExitCode::SUCCESS
                 }
                 Err(err) => {
@@ -280,34 +433,52 @@ fn run_secrets(action: SecretsCommand) -> ExitCode {
                 }
             }
         }
-        SecretsCommand::Check { name, service } => match keychain_exists(&service, &name) {
-            Ok(true) => {
-                println!("OK secret `{name}` is present in OS keychain (service `{service}`)");
-                ExitCode::SUCCESS
+        SecretsCommand::Check {
+            name,
+            service,
+            machine,
+        } => {
+            let account = scoped_keychain_account(machine.as_deref(), &name);
+            match keychain_exists(&service, &account) {
+                Ok(true) => {
+                    println!("OK secret `{account}` is present in OS keychain (service `{service}`)");
+                    ExitCode::SUCCESS
+                }
+                Ok(false) => {
+                    eprintln!(
+                        "MISSING secret `{account}` not found in OS keychain (service `{service}`)"
+                    );
+                    ExitCode::from(1)
+                }
+                Err(err) => {
+                    eprintln!("ERROR {err:#}");
+                    ExitCode::from(1)
+                }
             }
-            Ok(false) => {
-                eprintln!("MISSING secret `{name}` not found in OS keychain (service `{service}`)");
-                ExitCode::from(1)
+        }
+        SecretsCommand::Delete {
+            name,
+            service,
+            machine,
+        } => {
+            let account = scoped_keychain_account(machine.as_deref(), &name);
+            match keychain_delete(&service, &account) {
+                Ok(true) => {
+                    println!("OK deleted secret `{account}` from OS keychain (service `{service}`)");
+                    ExitCode::SUCCESS
+                }
+                Ok(false) => {
+                    println!(
+                        "OK secret `{account}` was already absent in OS keychain (service `{service}`)"
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("ERROR {err:#}");
+                    ExitCode::from(1)
+                }
             }
-            Err(err) => {
-                eprintln!("ERROR {err:#}");
-                ExitCode::from(1)
-            }
-        },
-        SecretsCommand::Delete { name, service } => match keychain_delete(&service, &name) {
-            Ok(true) => {
-                println!("OK deleted secret `{name}` from OS keychain (service `{service}`)");
-                ExitCode::SUCCESS
-            }
-            Ok(false) => {
-                println!("OK secret `{name}` was already absent in OS keychain (service `{service}`)");
-                ExitCode::SUCCESS
-            }
-            Err(err) => {
-                eprintln!("ERROR {err:#}");
-                ExitCode::from(1)
-            }
-        },
+        }
     }
 }
 
@@ -1240,6 +1411,44 @@ fn run_acp_server(file: &Path, export: &str) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("ACP server error: {err:#}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_mcp_server(file: &Path, export: &str, ephemeral: bool) -> ExitCode {
+    let compiled = match compile_starlark_file(file, Some(export)) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("ERROR {}:\n{err}", file.display());
+            return ExitCode::from(1);
+        }
+    };
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("ERROR building Tokio runtime: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let options = McpServerOptions {
+        ephemeral,
+        ..McpServerOptions::default()
+    };
+
+    match rt.block_on(serve_chart_as_mcp_stdio(
+        compiled,
+        HostCallbacks::with_builtins(),
+        options,
+    )) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("MCP server error: {err:#}");
             ExitCode::from(1)
         }
     }

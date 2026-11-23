@@ -1317,19 +1317,44 @@ fn secrets_cli_and_runtime_resolve_env_file_keychain_and_redact_traces_and_error
 
             let (head, body_part) = req.split_once("\r\n\r\n").unwrap_or((&req, ""));
             let first_line = head.lines().next().unwrap_or("");
-            let resp_body = if first_line.contains("/charge") {
-                r#"{"charged":true}"#.to_owned()
+            let req_json: serde_json::Value =
+                serde_json::from_str(body_part).unwrap_or(serde_json::Value::Null);
+            let req_id = req_json.get("id").cloned().unwrap_or(serde_json::json!(1));
+            let (status_line, resp_body) = if first_line.contains("/charge") {
+                ("200 OK", r#"{"charged":true}"#.to_owned())
+            } else if first_line.starts_with("GET ") {
+                ("405 Method Not Allowed", String::new())
+            } else if first_line.starts_with("DELETE ")
+                || body_part.contains(r#""notifications/initialized""#)
+            {
+                ("202 Accepted", String::new())
             } else if body_part.contains(r#""method":"initialize""#) {
-                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":"1.0"}}}"#.to_owned()
-            } else if body_part.contains(r#""notifications/initialized""#) {
-                String::new()
+                (
+                    "200 OK",
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "protocolVersion": "2025-03-26",
+                            "capabilities": {},
+                            "serverInfo": {"name": "mock", "version": "1.0"}
+                        }
+                    })
+                    .to_string(),
+                )
             } else {
-                r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"mcp_ok\":true}"}],"isError":false}}"#.to_owned()
-            };
-            let status_line = if resp_body.is_empty() {
-                "202 Accepted"
-            } else {
-                "200 OK"
+                (
+                    "200 OK",
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "content": [{"type": "text", "text": "{\"mcp_ok\":true}"}],
+                            "isError": false
+                        }
+                    })
+                    .to_string(),
+                )
             };
             let resp = format!(
                 "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
@@ -2738,4 +2763,197 @@ fn bluesky_radar_parallel_http_sampling_query_update_and_digest_curation() {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[test]
+fn starness_mcp_stdio_and_serve_stateless_http_interoperate_with_invoke_mcp() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let tmp = std::env::temp_dir().join(format!(
+        "starness_mcp_e2e_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp).expect("create tmp dir");
+
+    // 1. Worker statechart exposed BOTH via `starness serve` (`/mcp`) AND via `starness mcp --ephemeral`
+    let worker_star = tmp.join("ticket_worker.star");
+    std::fs::write(
+        &worker_star,
+        r#"
+Ctx = record(
+    title = field(str, ""),
+    score = field(int, 0),
+)
+S = state_space("open", "triaged")
+
+chart = machine(
+    id = "ticket_worker",
+    initial = S.open,
+    context = Ctx(),
+    states = {
+        S.open: state(
+            on = [
+                transition(
+                    event = "TRIAGE",
+                    target = S.triaged,
+                    assign = lambda ctx, ev: Ctx(
+                        title = ev["title"],
+                        score = ctx.score + ev["points"],
+                    ),
+                ),
+            ],
+        ),
+        S.triaged: state(
+            on = [
+                transition(
+                    event = "BOOST",
+                    target = S.triaged,
+                    assign = lambda ctx, ev: Ctx(
+                        title = ctx.title,
+                        score = ctx.score + ev["delta"],
+                    ),
+                ),
+            ],
+        ),
+    },
+)
+"#,
+    )
+    .expect("write worker.star");
+
+    // 2. Start `starness serve` on ephemeral port (`127.0.0.1:0`)
+    let mut serve_child = Command::new(bin_path())
+        .args(["serve", worker_star.to_str().unwrap(), "--bind", "127.0.0.1:0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn starness serve");
+
+    let mut serve_stdout = BufReader::new(serve_child.stdout.take().unwrap());
+    let mut banner = String::new();
+    serve_stdout.read_line(&mut banner).expect("read serve banner");
+    let base_url = banner
+        .split("listening on ")
+        .nth(1)
+        .expect("banner should contain listening on URL")
+        .trim()
+        .to_owned();
+
+    // 3. Caller `.star` machine invokes:
+    //    - `starness serve` `/mcp` (stateless 2026-07-28 HTTP MCP, stateful via `instance_id`)
+    //    - `starness serve` `/machines/ticket_worker/mcp` (`BOOST` on the same `instance_id`)
+    //    - `starness mcp <worker.star> --ephemeral` (stdio MCP)
+    let caller_star = tmp.join("caller.star");
+    let bin_lit = serde_json::to_string(bin_path()).unwrap();
+    let worker_lit = serde_json::to_string(worker_star.to_str().unwrap()).unwrap();
+    let root_mcp_lit = serde_json::to_string(&format!("{base_url}/mcp")).unwrap();
+    let machine_mcp_lit =
+        serde_json::to_string(&format!("{base_url}/machines/ticket_worker/mcp")).unwrap();
+
+    std::fs::write(
+        &caller_star,
+        format!(
+            r#"
+load("@starness/mcp", "invoke_mcp", "mcp_http_server", "mcp_stdio_server")
+
+Ctx = record(
+    http_score = field(int, 0),
+    stdio_score = field(int, 0),
+)
+S = state_space("step1_http_triage", "step2_http_boost", "step3_stdio_ephemeral", "done", "failed")
+
+http_root = mcp_http_server(id = "serve_root", url = {root_mcp_lit})
+http_machine = mcp_http_server(id = "serve_machine", url = {machine_mcp_lit})
+stdio_worker = mcp_stdio_server(
+    id = "stdio_worker",
+    command = {bin_lit},
+    args = ["mcp", {worker_lit}, "--ephemeral"],
+)
+
+chart = machine(
+    id = "mcp_caller",
+    initial = S.step1_http_triage,
+    context = Ctx(),
+    states = {{
+        S.step1_http_triage: state(
+            invoke = invoke_mcp(
+                server = http_root,
+                tool = "TRIAGE",
+                arguments = {{"instance_id": "t-42", "title": "Fix race", "points": 10}},
+                on_done = outcome(target = S.step2_http_boost),
+                on_error = outcome(target = S.failed),
+            ),
+        ),
+        S.step2_http_boost: state(
+            invoke = invoke_mcp(
+                server = http_machine,
+                tool = "BOOST",
+                arguments = {{"instance_id": "t-42", "delta": 5}},
+                on_done = outcome(
+                    target = S.step3_stdio_ephemeral,
+                    assign = lambda ctx, ev: Ctx(
+                        http_score = ev["output"]["data"]["context"]["score"],
+                        stdio_score = ctx.stdio_score,
+                    ),
+                ),
+                on_error = outcome(target = S.failed),
+            ),
+        ),
+        S.step3_stdio_ephemeral: state(
+            invoke = invoke_mcp(
+                server = stdio_worker,
+                tool = "TRIAGE",
+                arguments = {{"title": "One-shot", "points": 77}},
+                on_done = outcome(
+                    target = S.done,
+                    assign = lambda ctx, ev: Ctx(
+                        http_score = ctx.http_score,
+                        stdio_score = ev["output"]["data"]["context"]["score"],
+                    ),
+                ),
+                on_error = outcome(target = S.failed),
+            ),
+        ),
+        S.done: final_state(),
+        S.failed: final_state(),
+    }},
+)
+"#
+        ),
+    )
+    .expect("write caller.star");
+
+    let run_out = Command::new(bin_path())
+        .args(["run", caller_star.to_str().unwrap()])
+        .output()
+        .expect("run caller.star");
+
+    let _ = serve_child.kill();
+    let _ = serve_child.wait();
+
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    let stderr = String::from_utf8_lossy(&run_out.stderr);
+    assert!(
+        run_out.status.success(),
+        "caller.star failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("done"),
+        "expected caller to reach `done`, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"http_score\": 15") || stdout.contains("\"http_score\":15"),
+        "expected stateful HTTP MCP score 10 + 5 = 15 in:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"stdio_score\": 77") || stdout.contains("\"stdio_score\":77"),
+        "expected ephemeral stdio MCP score = 77 in:\n{stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }
