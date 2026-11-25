@@ -47,11 +47,10 @@ Never use a heavyweight autonomous agent for work that belongs to a lighter, fas
 > Read [`references/modules.md`](references/modules.md) for when, why, and how to use each `@starness/*` module with full idioms and signatures.
 
 ### Step 3: Write Typed, Immutable Starlark
-Structure every `.star` file in this clean order:
+Structure every `.star` file so the statechart is immediately readable near the top:
 1. `load("@starness/...", ...)` imports (and shared local modules via `load("types.star", ...)`).
 2. Typed data declarations: `enum(...)` for events/categories, `record(...)` for context and structured LLM/tool schemas, and `state_space(...)` for all `StateId`s.
-3. Pure helper functions: guards (`(ctx, ev) -> bool`), reducers (`(ctx, ev) -> Ctx` using `update(ctx, ...)`), and dynamic input builders (`(ctx) -> ...`).
-4. `chart: StateMachine = machine(id = ..., initial = ..., context = Ctx(), states = { ... })`.
+3. For workflows with many helpers, put `def build_machine() -> StateMachine: return machine(...)` right here so readers see the full statechart first, followed by pure helper `def`s (guards, reducers, input builders), ending with `chart: StateMachine = build_machine()`. (For short workflows with no helpers, assign `chart: StateMachine = machine(...)` directly.)
 
 ```python
 load("@starness/llm", "invoke_llm", "llm_structured")
