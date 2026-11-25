@@ -797,7 +797,10 @@ load(
     "CachePolicy",
     "ToolChoice",
     "assistant_msg",
+    "LlmAttachment",
+    "LlmMessage",
     "attachment",
+    "attachments_from",
     "has_tool_calls",
     "invoke_llm",
     "llm_model",
@@ -814,14 +817,15 @@ load(
 BashArgs = record(command = str)
 
 Ctx = record(
-    messages = field(list[dict], []),
+    messages = field(list[LlmMessage], []),
     pending_call = field(dict | None, None),
     reply = field(str, ""),
 )
 
 _sys = system_msg("Be concise.", cache = CachePolicy.ephemeral)
-_img = attachment(base64 = "AAAA", mime = "image/png", name = "screen.png")
-_u = user_msg("Inspect this", attachments = [_img], cache = "5m")
+_img: LlmAttachment = attachment(base64 = "AAAA", mime = "image/png", name = "screen.png")
+_from_files: list[LlmAttachment] = attachments_from([{"path": "/tmp/a.png", "mime": "image/png", "name": "a.png"}, _img])
+_u = user_msg("Inspect this", attachments = _from_files, cache = "5m")
 _a = assistant_msg("Sure")
 _tr = tool_result({"id": "call_1", "name": "bash"}, {"stdout": "ok"}, cache = CachePolicy.memory)
 _batch = tool_results_msg([_tr], cache = "1h")

@@ -847,6 +847,26 @@ LlmModel = record(
     reasoning_effort = field(str | None, None),
 )
 
+LlmAttachment = record(
+    path = field(str | None, None),
+    base64 = field(str | None, None),
+    url = field(str | None, None),
+    mime = field(str | None, None),
+    name = field(str | None, None),
+)
+
+LlmMessage = record(
+    role = field(str, "assistant"),
+    text = field(str, ""),
+    attachments = field(list[LlmAttachment], []),
+    call_id = field(str | None, None),
+    fn_name = field(str | None, None),
+    content = field(typing.Any, None),
+    results = field(list | None, None),
+    cache = field(str | None, None),
+    raw = field(dict | None, None),
+)
+
 def _normalize_cache(cache: CachePolicy | str | None) -> str | None:
     if cache == None:
         return None
@@ -900,7 +920,7 @@ def attachment(
     url: str | None = None,
     mime: str | None = None,
     name: str | None = None,
-) -> dict:
+) -> LlmAttachment:
     sources = (1 if path != None else 0) + (1 if base64 != None else 0) + (1 if url != None else 0)
     if sources != 1:
         fail("attachment requires exactly one of `path`, `base64`, or `url`")
@@ -916,73 +936,101 @@ def attachment(
             fail("attachment `url` must not be empty")
         if mime == None or mime == "":
             fail("attachment with `url` requires `mime` (e.g. `image/png`)")
-    return {
-        "path": path,
-        "base64": base64,
-        "url": url,
-        "mime": mime,
-        "name": name,
-    }
+    return LlmAttachment(
+        path = path,
+        base64 = base64,
+        url = url,
+        mime = mime,
+        name = name,
+    )
+
+def attachments_from(items: list) -> list[LlmAttachment]:
+    out: list[LlmAttachment] = []
+    for item in items:
+        if type(item) == "record":
+            out.append(item)
+        elif type(item) == "dict":
+            path = item.get("path")
+            b64 = item.get("base64")
+            url = item.get("url")
+            mime = item.get("mime")
+            name = item.get("name")
+            mime_str = str(mime) if mime != None and str(mime) != "" else None
+            name_str = str(name) if name != None and str(name) != "" else None
+            if path != None and str(path) != "":
+                out.append(attachment(path = str(path), mime = mime_str, name = name_str))
+            elif b64 != None and str(b64) != "":
+                out.append(attachment(base64 = str(b64), mime = mime_str, name = name_str))
+            elif url != None and str(url) != "":
+                out.append(attachment(url = str(url), mime = mime_str, name = name_str))
+    return out
 
 def system_msg(
     text: str,
     *,
     cache: CachePolicy | str | None = None,
-) -> dict:
+) -> LlmMessage:
     if text == "":
         fail("system_msg `text` must not be empty")
-    return {
-        "role": "system",
-        "text": text,
-        "cache": _normalize_cache(cache),
-    }
+    return LlmMessage(
+        role = "system",
+        text = text,
+        cache = _normalize_cache(cache),
+    )
 
 def user_msg(
     text: str = "",
     *,
-    attachments: list = [],
+    attachments: list[LlmAttachment] = [],
     cache: CachePolicy | str | None = None,
-) -> dict:
+) -> LlmMessage:
     if text == "" and len(attachments) == 0:
         fail("user_msg requires non-empty `text` or at least one `attachment(...)`")
-    return {
-        "role": "user",
-        "text": text,
-        "attachments": attachments,
-        "cache": _normalize_cache(cache),
-    }
+    return LlmMessage(
+        role = "user",
+        text = text,
+        attachments = attachments,
+        cache = _normalize_cache(cache),
+    )
 
 def assistant_msg(
     event_or_text,
     *,
     cache: CachePolicy | str | None = None,
-) -> dict:
+) -> LlmMessage:
     cache_str = _normalize_cache(cache)
     if type(event_or_text) == "string":
-        return {
-            "role": "assistant",
-            "text": event_or_text,
-            "cache": cache_str,
-        }
+        return LlmMessage(
+            role = "assistant",
+            text = event_or_text,
+            cache = cache_str,
+        )
     if type(event_or_text) == "dict":
         out = event_or_text.get("output") if "output" in event_or_text else event_or_text
         if type(out) == "dict":
             if "$starness_llm_msg" in out:
-                msg = dict(out)
-                if cache_str != None:
-                    msg["cache"] = cache_str
-                return msg
+                raw_inner = out["$starness_llm_msg"]
+                return LlmMessage(
+                    role = "assistant",
+                    text = str(out.get("text", "")),
+                    cache = cache_str if cache_str != None else out.get("cache"),
+                    raw = raw_inner if type(raw_inner) == "dict" else None,
+                )
             if "message" in out and type(out["message"]) == "dict":
-                msg = dict(out["message"])
-                if cache_str != None:
-                    msg["cache"] = cache_str
-                return msg
+                inner_msg = out["message"]
+                raw_inner = inner_msg.get("$starness_llm_msg")
+                return LlmMessage(
+                    role = "assistant",
+                    text = str(out.get("text", "")),
+                    cache = cache_str if cache_str != None else inner_msg.get("cache"),
+                    raw = raw_inner if type(raw_inner) == "dict" else None,
+                )
             if "text" in out:
-                return {
-                    "role": "assistant",
-                    "text": str(out["text"]),
-                    "cache": cache_str,
-                }
+                return LlmMessage(
+                    role = "assistant",
+                    text = str(out["text"]),
+                    cache = cache_str,
+                )
     fail("assistant_msg expects a string or an @starness/llm `on_done` event dict")
 
 ToolCall = record(
@@ -997,7 +1045,7 @@ def tool_result(
     *,
     fn_name: str | None = None,
     cache: CachePolicy | str | None = None,
-) -> dict:
+) -> LlmMessage:
     call_id = ""
     resolved_fn = fn_name
     if type(call_or_id) == "record":
@@ -1014,29 +1062,31 @@ def tool_result(
         call_id = str(call_or_id) if call_or_id != None else ""
     if call_id == "":
         fail("tool_result requires a non-empty tool call `id` or tool-call dict")
-    return {
-        "role": "tool",
-        "call_id": call_id,
-        "fn_name": resolved_fn,
-        "content": content,
-        "cache": _normalize_cache(cache),
-    }
+    return LlmMessage(
+        role = "tool",
+        call_id = call_id,
+        fn_name = resolved_fn,
+        content = content,
+        cache = _normalize_cache(cache),
+    )
 
 def tool_results_msg(
-    results: list,
+    results: list[LlmMessage],
     *,
     cache: CachePolicy | str | None = None,
-) -> dict:
+) -> LlmMessage:
     if len(results) == 0:
         fail("tool_results_msg requires at least one tool_result(...)")
     for item in results:
-        if type(item) != "dict" or item.get("role") != "tool" or not item.get("call_id"):
+        is_valid_rec = type(item) == "record" and item.role == "tool" and bool(item.call_id)
+        is_valid_dict = type(item) == "dict" and item.get("role") == "tool" and bool(item.get("call_id"))
+        if not is_valid_rec and not is_valid_dict:
             fail("tool_results_msg items must be created with tool_result(...)")
-    return {
-        "role": "tool",
-        "results": results,
-        "cache": _normalize_cache(cache),
-    }
+    return LlmMessage(
+        role = "tool",
+        results = results,
+        cache = _normalize_cache(cache),
+    )
 
 def tool_def(
     name: str,

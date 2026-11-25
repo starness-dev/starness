@@ -555,8 +555,13 @@ fn parse_chat_message(raw: &Value) -> anyhow::Result<ChatMessage> {
 
     let cache_opt = parse_optional_cache(obj.get("cache"))?;
 
-    // Lossless round-tripped `genai::chat::ChatMessage` produced by `assistant_msg(ev)`.
-    if let Some(native_val) = obj.get(LLM_MSG_ENVELOPE_KEY) {
+    // Lossless round-tripped `genai::chat::ChatMessage` produced by `assistant_msg(ev)`
+    // (either legacy `$starness_llm_msg` dict envelope or typed `LlmMessage.raw`).
+    if let Some(native_val) = obj
+        .get(LLM_MSG_ENVELOPE_KEY)
+        .or_else(|| obj.get("raw"))
+        .filter(|v| v.is_object())
+    {
         let mut msg: ChatMessage = serde_json::from_value(native_val.clone())
             .context("failed deserializing round-tripped `$starness_llm_msg`")?;
         if let Some(cache) = cache_opt {
