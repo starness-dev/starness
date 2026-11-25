@@ -32,14 +32,15 @@ load(
 load("@starness/exec", "exec_result", "exec_spec")
 load(
     "@starness/llm",
+    "LlmMessage",
     "LlmModel",
     "ToolCall",
     "ToolChoice",
     "assistant_msg",
+    "attachments_from",
     "has_tool_calls",
     "invoke_llm",
     "llm_model",
-    "llm_text",
     "llm_tool_calls",
     "tool_def",
     "tool_result",
@@ -69,16 +70,14 @@ McpHarnessCtx = record(
     mcp_name = field(str, "linear"),
     mcp_url = field(str, "https://mcp.linear.app/mcp"),
     cwd = field(str, ""),
-    messages = field(list[dict], []),
+    messages = field(list[LlmMessage], []),
     pending_calls = field(list[ToolCall], []),
     approval_rows = field(list[list[str]], []),
     last_decision = field(str, ""),
     last_decision_prob = field(float, 0.0),
-    last_reply = field(str, ""),
-    turns = field(int, 0),
     tool_runs = field(int, 0),
     tool_errors = field(int, 0),
-    reason = field(str, ""),
+    error = field(str, ""),
 )
 
 S = state_space(
@@ -107,37 +106,38 @@ def truncate_text(raw: str, limit: int) -> str:
     omitted = len(raw) - limit
     return raw[:half] + "\n... [truncated " + str(omitted) + " chars] ...\n" + raw[len(raw) - half:]
 
-def prompt_text(ev: dict) -> str:
-    return str(ev.get("text", ev.get("message", ""))).strip()
-
-def is_exit_prompt(ctx: McpHarnessCtx, ev: dict) -> bool:
-    return prompt_text(ev).lower() in ["/exit", "/quit", "exit", "quit"]
+def is_exit_prompt(_ctx: McpHarnessCtx, ev: dict) -> bool:
+    return str(ev.get("text", "")).strip().lower() == "/exit"
 
 def has_prompt(ctx: McpHarnessCtx, ev: dict) -> bool:
-    txt = prompt_text(ev)
-    return txt != "" and not is_exit_prompt(ctx, ev)
+    txt = str(ev.get("text", "")).strip()
+    return (txt != "" or len(ev.get("files", [])) > 0) and not is_exit_prompt(ctx, ev)
 
 def select_model(ctx: McpHarnessCtx) -> LlmModel:
-    if ctx.llm_endpoint != "":
-        return llm_model(ctx.model, endpoint = ctx.llm_endpoint)
-    return llm_model(ctx.model, api_key = secret("OPENAI_API_KEY", optional = True))
+    return llm_model(
+        ctx.model,
+        api_key = secret("OPENAI_API_KEY", optional = True),
+        endpoint = ctx.llm_endpoint if ctx.llm_endpoint != "" else None,
+    )
 
 def select_decision_provider(ctx: McpHarnessCtx) -> DecisionProvider:
-    if ctx.decision_endpoint != "":
-        return openai_decision(
-            model = ctx.decision_model,
-            endpoint = ctx.decision_endpoint,
-            api_key = secret("OPENAI_API_KEY", optional = True),
-        )
-    return openai_decision(model = ctx.decision_model)
+    return openai_decision(
+        model = ctx.decision_model,
+        endpoint = ctx.decision_endpoint if ctx.decision_endpoint != "" else None,
+        api_key = secret("OPENAI_API_KEY", optional = True),
+    )
 
 def append_user_prompt(ctx: McpHarnessCtx, ev: dict) -> McpHarnessCtx:
     return update(
         ctx,
-        messages = ctx.messages + [user_msg(prompt_text(ev))],
+        messages = ctx.messages + [
+            user_msg(
+                str(ev.get("text", "")).strip(),
+                attachments = attachments_from(ev.get("files", [])),
+            ),
+        ],
         pending_calls = [],
         approval_rows = [],
-        turns = ctx.turns + 1,
     )
 
 def queue_tool_calls(ctx: McpHarnessCtx, ev: dict) -> McpHarnessCtx:
@@ -146,7 +146,6 @@ def queue_tool_calls(ctx: McpHarnessCtx, ev: dict) -> McpHarnessCtx:
         messages = ctx.messages + [assistant_msg(ev)],
         pending_calls = llm_tool_calls(ev),
         approval_rows = [],
-        last_reply = llm_text(ev),
     )
 
 def record_final_reply(ctx: McpHarnessCtx, ev: dict) -> McpHarnessCtx:
@@ -155,7 +154,6 @@ def record_final_reply(ctx: McpHarnessCtx, ev: dict) -> McpHarnessCtx:
         messages = ctx.messages + [assistant_msg(ev)],
         pending_calls = [],
         approval_rows = [],
-        last_reply = llm_text(ev),
     )
 
 def describe_call(call: ToolCall) -> str:
@@ -353,23 +351,19 @@ def record_batch_results(ctx: McpHarnessCtx, ev: dict) -> McpHarnessCtx:
         tool_errors = ctx.tool_errors + errs,
     )
 
-def record_interrupt(ctx: McpHarnessCtx, ev: dict) -> McpHarnessCtx:
+def record_interrupt(ctx: McpHarnessCtx, _ev: dict) -> McpHarnessCtx:
     return update(
         ctx,
         pending_calls = [],
         approval_rows = [],
-        reason = str(ev.get("reason", "interrupted by user")),
     )
 
-def record_exit(ctx: McpHarnessCtx, ev: dict) -> McpHarnessCtx:
-    return update(ctx, reason = str(ev.get("reason", "user_exit")))
-
 def record_error(ctx: McpHarnessCtx, ev: dict) -> McpHarnessCtx:
-    return update(ctx, reason = str(ev.get("error", ev)))
+    return update(ctx, error = str(ev.get("error", "Coding MCP harness error")))
 
 chart: StateMachine = machine(
     id = "coding_harness_mcp",
-    description = "03: Coding harness connected to a remote MCP server (OAuth 2.1 / Streamable HTTP)",
+    description = "Coding harness connected to a remote MCP server (OAuth 2.1 / Streamable HTTP)",
     initial = S.gather_input,
     context = McpHarnessCtx(),
     states = {
@@ -379,7 +373,6 @@ chart: StateMachine = machine(
                     event = HarnessEvent.PROMPT,
                     guard = is_exit_prompt,
                     target = S.done,
-                    assign = record_exit,
                 ),
                 transition(
                     event = HarnessEvent.PROMPT,
@@ -390,7 +383,6 @@ chart: StateMachine = machine(
                 transition(
                     event = HarnessEvent.EXIT,
                     target = S.done,
-                    assign = record_exit,
                 ),
             ],
         ),
@@ -405,7 +397,6 @@ chart: StateMachine = machine(
                 transition(
                     event = HarnessEvent.EXIT,
                     target = S.done,
-                    assign = record_exit,
                 ),
             ],
             states = {

@@ -57,7 +57,7 @@ ReviewCtx = record(
     diff = field(str, ""),
     reviewer_approved = field(bool, False),
     reviewer_summary = field(str, ""),
-    findings = field(list[dict], []),
+    findings = field(list[Finding], []),
     finding_rows = field(list[list[str]], []),
     human_feedback = field(str, ""),
     status_label = field(str, "Awaiting Task"),
@@ -89,11 +89,11 @@ reviewer = claude_agent(
 
 # --- Helpers ---
 
-def has_task_text(ctx: ReviewCtx, ev: dict) -> bool:
-    return str(ev.get("text", ev.get("task", ""))).strip() != ""
+def has_task_text(_ctx: ReviewCtx, ev: dict) -> bool:
+    return str(ev.get("text", "")).strip() != ""
 
 def record_task(ctx: ReviewCtx, ev: dict) -> ReviewCtx:
-    text = str(ev.get("text", ev.get("task", ""))).strip()
+    text = str(ev.get("text", "")).strip()
     return update(
         ctx,
         task = text,
@@ -147,21 +147,11 @@ def review_needs_revision(ctx: ReviewCtx, ev: dict) -> bool:
     verdict = artifact(ev, "submit_verdict", ReviewVerdict)
     return (not verdict.approved) and ctx.attempt < ctx.max_attempts
 
-def findings_to_rows(items: list) -> list[list[str]]:
+def findings_to_rows(items: list[Finding]) -> list[list[str]]:
     rows = []
     for f in items:
         rows.append([str(f.severity), str(f.file), str(f.message)])
     return rows
-
-def findings_to_dicts(items: list) -> list[dict]:
-    out = []
-    for f in items:
-        out.append({
-            "severity": str(f.severity),
-            "file": str(f.file),
-            "message": str(f.message),
-        })
-    return out
 
 def record_review_and_retry(ctx: ReviewCtx, ev: dict) -> ReviewCtx:
     verdict = artifact(ev, "submit_verdict", ReviewVerdict)
@@ -172,7 +162,7 @@ def record_review_and_retry(ctx: ReviewCtx, ev: dict) -> ReviewCtx:
         attempt = next_attempt,
         reviewer_approved = verdict.approved,
         reviewer_summary = verdict.summary,
-        findings = findings_to_dicts(items),
+        findings = items,
         finding_rows = findings_to_rows(items),
         status_label = "Revising after peer review (attempt " + str(next_attempt) + ")",
     )
@@ -185,13 +175,13 @@ def record_review_for_human(ctx: ReviewCtx, ev: dict) -> ReviewCtx:
         ctx,
         reviewer_approved = verdict.approved,
         reviewer_summary = verdict.summary,
-        findings = findings_to_dicts(items),
+        findings = items,
         finding_rows = findings_to_rows(items),
         status_label = label,
     )
 
 def record_human_feedback(ctx: ReviewCtx, ev: dict) -> ReviewCtx:
-    comment = str(ev.get("comment", ev.get("feedback", ev.get("text", "")))).strip()
+    comment = str(ev.get("comment", "")).strip()
     next_attempt = ctx.attempt + 1
     return update(
         ctx,
@@ -209,7 +199,7 @@ def record_error(ctx: ReviewCtx, ev: dict) -> ReviewCtx:
 
 chart: StateMachine = machine(
     id = "coding_review_acp",
-    description = "04: Multi-harness coding and peer review over @starness/acp with DiffReview sign-off",
+    description = "Multi-harness coding and peer review over @starness/acp with DiffReview sign-off",
     initial = S.gather_task,
     context = ReviewCtx(),
     states = {

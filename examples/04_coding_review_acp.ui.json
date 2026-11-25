@@ -100,6 +100,24 @@
           "props": { "label": "Abort", "event": "ABORT", "variant": "danger" }
         }
       }
+    },
+    "failed": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["error_alert"]
+        },
+        "error_alert": {
+          "type": "Alert",
+          "props": {
+            "variant": "danger",
+            "title": "Coding Review Pipeline Failed",
+            "message": { "$state": "/error" }
+          }
+        }
+      }
     }
   }
 }

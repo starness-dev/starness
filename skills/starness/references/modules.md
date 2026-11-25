@@ -75,19 +75,26 @@ invoke_llm(
 )
 ```
 
-**Pattern B — Multi-turn tool loop (lossless round-tripping):**
+**Pattern B — Multi-turn tool loop (typed `LlmMessage` + lossless round-tripping + attachments):**
 ```python
 load(
     "@starness/llm",
-    "CachePolicy", "ToolChoice", "assistant_msg", "attachment",
-    "has_tool_calls", "invoke_llm", "llm_text", "llm_tool_call", "llm_tool_calls",
-    "system_msg", "tool_def", "tool_result", "tool_results_msg", "user_msg",
+    "CachePolicy", "LlmAttachment", "LlmMessage", "ToolCall", "ToolChoice",
+    "assistant_msg", "attachment", "attachments_from", "has_tool_calls",
+    "invoke_llm", "llm_tool_call", "llm_tool_calls", "system_msg",
+    "tool_def", "tool_result", "tool_results_msg", "user_msg",
 )
 
 BashArgs = record(command = str)
+ChatCtx = record(
+    messages = field(list[LlmMessage], []),
+    pending_call = field(ToolCall | None, None),
+    error = field(str, ""),
+)
 
-# 1. Append user message (with optional image/PDF attachments):
-#    ctx.messages + [user_msg("Inspect screenshot", attachments = [attachment(path = "ui.png")])]
+# 1. Append user message (with optional file attachments from PromptInput `allow_attachments: true`):
+#    ctx.messages + [user_msg(str(ev.get("text", "")).strip(), attachments = attachments_from(ev.get("files", [])))]
+#    Or construct directly: attachment(path = "ui.png") -> LlmAttachment
 # 2. Invoke LLM with tools + system prompt caching:
 invoke_llm(
     model = "gpt-6-luna",
@@ -108,13 +115,16 @@ invoke_llm(
         ),
         outcome(
             target = S.gather_input,
-            assign = lambda ctx, ev: update(ctx, messages = ctx.messages + [assistant_msg(ev)], last_reply = llm_text(ev)),
+            assign = lambda ctx, ev: update(ctx, messages = ctx.messages + [assistant_msg(ev)]),
         ),
     ],
-    on_error = S.failed,
+    on_error = outcome(
+        target = S.failed,
+        assign = lambda ctx, ev: update(ctx, error = str(ev.get("error", "LLM request failed"))),
+    ),
 )
 # 3. After executing the tool in S.acting, append `tool_result(ctx.pending_call, ev["output"])`
-#    (passing the call dict preserves BOTH `call_id` and `fn_name` for OpenAI, Anthropic, and Gemini).
+#    (passing the ToolCall preserves BOTH `call_id` and `fn_name` for OpenAI, Anthropic, and Gemini).
 #    For parallel tool calls, batch them with `tool_results_msg([tool_result(c, out), ...])`.
 ```
 

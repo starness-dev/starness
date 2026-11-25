@@ -12,10 +12,11 @@
 
 load(
     "@starness/llm",
+    "LlmMessage",
     "assistant_msg",
+    "attachments_from",
     "invoke_llm",
     "llm_model",
-    "llm_text",
     "user_msg",
 )
 load("@starness/secrets", "secret")
@@ -24,20 +25,17 @@ ChatEvent = enum("PROMPT", "INTERRUPT")
 
 ChatCtx = record(
     model = field(str, "gpt-6-luna"),
-    messages = field(list[dict], []),
-    last_reply = field(str, ""),
+    messages = field(list[LlmMessage], []),
+    error = field(str, ""),
 )
 
 S = state_space("gather_input", "thinking", "done", "failed")
 
 SYSTEM_PROMPT = "You are a concise, helpful assistant."
 
-def prompt_text(ev: dict) -> str:
-    return str(ev.get("text", ev.get("message", ""))).strip()
-
 chart: StateMachine = machine(
     id = "chat_harness",
-    description = "01: Minimal multi-turn AI chat harness powered by @starness/llm",
+    description = "Minimal multi-turn AI chat harness powered by @starness/llm",
     initial = S.gather_input,
     context = ChatCtx(),
     states = {
@@ -45,16 +43,21 @@ chart: StateMachine = machine(
             on = [
                 transition(
                     event = ChatEvent.PROMPT,
-                    guard = lambda _ctx, ev: prompt_text(ev).lower() == "/exit",
+                    guard = lambda _ctx, ev: str(ev.get("text", "")).strip().lower() == "/exit",
                     target = S.done,
                 ),
                 transition(
                     event = ChatEvent.PROMPT,
-                    guard = lambda _ctx, ev: prompt_text(ev) != "",
+                    guard = lambda _ctx, ev: str(ev.get("text", "")).strip() != "" or len(ev.get("files", [])) > 0,
                     target = S.thinking,
                     assign = lambda ctx, ev: update(
                         ctx,
-                        messages = ctx.messages + [user_msg(prompt_text(ev))],
+                        messages = ctx.messages + [
+                            user_msg(
+                                str(ev.get("text", "")).strip(),
+                                attachments = attachments_from(ev.get("files", [])),
+                            ),
+                        ],
                     ),
                 ),
             ],
@@ -80,10 +83,15 @@ chart: StateMachine = machine(
                     assign = lambda ctx, ev: update(
                         ctx,
                         messages = ctx.messages + [assistant_msg(ev)],
-                        last_reply = llm_text(ev),
                     ),
                 ),
-                on_error = outcome(target = S.failed),
+                on_error = outcome(
+                    target = S.failed,
+                    assign = lambda ctx, ev: update(
+                        ctx,
+                        error = str(ev.get("error", "LLM request failed")),
+                    ),
+                ),
             ),
         ),
         S.done: final_state(),

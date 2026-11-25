@@ -13,17 +13,17 @@ Use `starness run` for one-shot automation, CI jobs, or local interactive sessio
 starness run workflow.star --context '{"repo":"floodfx/starness"}' --trace -
 
 # Interactive / human-in-the-loop workflow (events sent line-by-line on stdin)
-starness run examples/coding_session_llm.star --events-stdin --trace session.jsonl
+starness run examples/02_coding_harness.star --events-stdin --trace session.jsonl
 
 # Validate a statechart and its optional external UI view-sheet
-starness check examples/plan_review.star --ui examples/plan_review.ui.json
+starness check examples/01_chat_harness.star --ui examples/01_chat_harness.ui.json
 
-# Interactive terminal TUI (renders --ui view-sheet or falls back to an allowed_events picker)
-starness run -i examples/plan_review.star --ui examples/plan_review.ui.json
-starness run -i examples/plan_review.star
+# Interactive terminal TUI (renders --ui view-sheet with drag-and-drop paste & shortcuts, or falls back to an allowed_events picker)
+starness run -i examples/01_chat_harness.star --ui examples/01_chat_harness.ui.json
+starness run -i examples/01_chat_harness.star
 
 # Multi-machine HTTP + SSE daemon + embedded Web Studio (/ui)
-starness serve examples/plan_review.star --ui examples/plan_review.ui.json --bind 127.0.0.1:8080
+starness serve examples/01_chat_harness.star --ui examples/01_chat_harness.ui.json --bind 127.0.0.1:8080
 ```
 
 **Stdin event formats (`--events-stdin`):**
@@ -92,8 +92,9 @@ curl -s -X DELETE "http://127.0.0.1:8080/machines/coding_session_llm/instances/$
 - `GET /machines` / `GET /machines/:machine` / `GET /machines/:machine/diagram`.
 - `POST /machines/:machine/instances` / `GET /machines/:machine/instances` (`?status=active|waiting|completed|failed|cancelled`).
 - `GET /machines/:machine/instances/:id` — Returns `InstanceSnapshot` enriched with active `ui` spec and `allowed_events`.
-- `DELETE /machines/:machine/instances/:id` (`?purge=true`).
+- `DELETE /machines/:machine/instances/:id` (`?purge=true` also removes uploaded temp files).
 - `POST /machines/:machine/instances/:id/events` / `POST /machines/:machine/instances/:id/cancel`.
+- `POST /machines/:machine/instances/:id/files` — Upload a file attachment (`X-Filename`, raw bytes up to 16 MiB); returns `{path, name, mime, size}` for passing in event payloads (e.g. `PromptInput` with `allow_attachments: true`).
 - `GET /machines/:machine/instances/:id/trace` (SSE or `?format=jsonl`).
 
 ---
@@ -108,7 +109,7 @@ curl -s -X DELETE "http://127.0.0.1:8080/machines/coding_session_llm/instances/$
   ```
 - **Expose any `.star` workflow as an ACP v1 Agent** (for Zed, Neovim, JetBrains, or parent workflows):
   ```bash
-  starness acp examples/multi_agent_acp.star
+  starness acp examples/04_coding_review_acp.star
   ```
 - **Starness Editor LSP** (live static typechecking & autocomplete for the Starness DSL and `@starness/*` modules):
   ```bash

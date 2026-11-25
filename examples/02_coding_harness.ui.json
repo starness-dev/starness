@@ -19,7 +19,6 @@
           "props": {
             "items": {
               "model": { "$state": "/model" },
-              "turns": { "$state": "/turns" },
               "tool_runs": { "$state": "/tool_runs" },
               "last_decision": { "$state": "/last_decision" }
             }
@@ -37,10 +36,11 @@
           "type": "PromptInput",
           "props": {
             "label": "Message",
-            "placeholder": "Ask the coding harness… (/exit to quit)",
+            "placeholder": "Ask the coding harness or drag a file… (/exit to quit)",
             "submit_event": "PROMPT",
             "submit_label": "Send",
-            "field_name": "text"
+            "field_name": "text",
+            "allow_attachments": true
           }
         },
         "actions": {
@@ -100,7 +100,7 @@
         },
         "btn_interrupt": {
           "type": "Button",
-          "props": { "label": "Interrupt", "event": "INTERRUPT", "variant": "secondary" }
+          "props": { "label": "Interrupt", "event": "INTERRUPT", "variant": "secondary", "shortcut": "Esc" }
         }
       }
     },
@@ -135,7 +135,32 @@
         },
         "btn_interrupt": {
           "type": "Button",
-          "props": { "label": "Interrupt", "event": "INTERRUPT", "variant": "danger" }
+          "props": { "label": "Interrupt", "event": "INTERRUPT", "variant": "danger", "shortcut": "Esc" }
+        }
+      }
+    },
+    "failed": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["error_alert", "transcript"]
+        },
+        "error_alert": {
+          "type": "Alert",
+          "props": {
+            "variant": "danger",
+            "title": "Coding Harness Failed",
+            "message": { "$state": "/error" }
+          }
+        },
+        "transcript": {
+          "type": "Conversation",
+          "props": {
+            "title": "Conversation",
+            "messages": { "$state": "/messages" }
+          }
         }
       }
     }

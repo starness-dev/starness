@@ -21,6 +21,7 @@ load("@starness/exec", "exec_spec")
 load(
     "@starness/llm",
     "CachePolicy",
+    "LlmMessage",
     "LlmModel",
     "ToolCall",
     "ToolChoice",
@@ -46,7 +47,7 @@ SessionCtx = record(
     model = field(str, "gpt-6-luna"),
     llm_endpoint = field(str, ""),
     cwd = field(str, ""),
-    messages = field(list[dict], []),
+    messages = field(list[LlmMessage], []),
     safe_calls = field(list[ToolCall], []),
     risky_calls = field(list[ToolCall], []),
     approval_rows = field(list[list[str]], []),
@@ -235,7 +236,7 @@ def truncate_stream(text: str, limit: int = MAX_TOOL_STREAM_CHARS) -> str:
     omitted = n - head - tail
     return text[:head] + "\n... [truncated " + str(omitted) + " chars; refine command or pipe through head/tail] ...\n" + text[n - tail:]
 
-def format_batch_tool_results(calls: list[ToolCall], ev: dict) -> (list[dict], int, int):
+def format_batch_tool_results(calls: list[ToolCall], ev: dict) -> (list[LlmMessage], int, int):
     out = ev.get("output", {})
     results = out.get("results", []) if type(out) == "dict" else []
     by_id = {}

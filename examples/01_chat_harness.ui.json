@@ -34,10 +34,11 @@
           "type": "PromptInput",
           "props": {
             "label": "Message",
-            "placeholder": "Ask anything… (/exit to quit)",
+            "placeholder": "Ask anything or drag a file… (/exit to quit)",
             "submit_event": "PROMPT",
             "submit_label": "Send",
-            "field_name": "text"
+            "field_name": "text",
+            "allow_attachments": true
           }
         }
       }
@@ -74,6 +75,31 @@
         "btn_interrupt": {
           "type": "Button",
           "props": { "label": "Interrupt", "event": "INTERRUPT", "variant": "danger", "shortcut": "Esc" }
+        }
+      }
+    },
+    "failed": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["error_alert", "transcript"]
+        },
+        "error_alert": {
+          "type": "Alert",
+          "props": {
+            "variant": "danger",
+            "title": "LLM Request Failed",
+            "message": { "$state": "/error" }
+          }
+        },
+        "transcript": {
+          "type": "Conversation",
+          "props": {
+            "title": "Conversation",
+            "messages": { "$state": "/messages" }
+          }
         }
       }
     }
