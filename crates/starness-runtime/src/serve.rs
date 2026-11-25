@@ -10,6 +10,7 @@
 //! - `GET /machines/:machine/instances` — list instances (`?status=active|waiting|completed|cancelled|failed`)
 //! - `GET /machines/:machine/instances/:id` — inspect an instance snapshot
 //! - `POST /machines/:machine/instances/:id/events` (and `/events/:event`) — route an event to an instance
+//! - `POST /machines/:machine/instances/:id/files` — upload a file attachment for an instance (`X-Filename`, raw bytes)
 //! - `POST /machines/:machine/instances/:id/cancel` — cancel a running/waiting instance
 //! - `DELETE /machines/:machine/instances/:id` — cancel instance (or delete from SQLite with `?purge=true`)
 //! - `GET /machines/:machine/instances/:id/trace` — per-instance SSE (`text/event-stream`) or JSONL (`?format=jsonl`)
@@ -739,7 +740,7 @@ async fn handle_http_connection(
     }
 
     if method == "OPTIONS" {
-        let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Last-Event-ID, Mcp-Session-Id, Mcp-Protocol-Version, Mcp-Method, Mcp-Name\r\nAccess-Control-Expose-Headers: Mcp-Session-Id, Mcp-Protocol-Version\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Last-Event-ID, X-Filename, Mcp-Session-Id, Mcp-Protocol-Version, Mcp-Method, Mcp-Name\r\nAccess-Control-Expose-Headers: Mcp-Session-Id, Mcp-Protocol-Version\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         write_half.write_all(resp.as_bytes()).await?;
         write_half.flush().await?;
         return Ok(());
@@ -1161,6 +1162,74 @@ async fn handle_http_connection(
                 .await?;
         }
 
+        // POST /machines/:machine/instances/:id/files — upload an attachment to temp storage
+        ("POST", ["machines", machine_id, "instances", instance_id, "files"]) => {
+            if !state.machines.contains_key(*machine_id) {
+                return write_not_found(
+                    &mut write_half,
+                    format!("machine `{machine_id}` is not registered"),
+                )
+                .await;
+            }
+            let exists = state.get_live(machine_id, instance_id).is_some()
+                || state
+                    .store
+                    .get_instance(machine_id, instance_id)?
+                    .is_some();
+            if !exists {
+                return write_not_found(
+                    &mut write_half,
+                    format!("instance `{instance_id}` not found for machine `{machine_id}`"),
+                )
+                .await;
+            }
+            if body_bytes.is_empty() {
+                return write_json_response(
+                    &mut write_half,
+                    "400 Bad Request",
+                    &json!({ "error": "uploaded file body is empty" }),
+                )
+                .await;
+            }
+
+            let raw_name = raw_headers
+                .iter()
+                .rev()
+                .find(|(k, _)| k == "x-filename")
+                .map(|(_, v)| percent_decode(v))
+                .unwrap_or_else(|| "upload.bin".to_owned());
+            let safe_name = sanitize_upload_filename(&raw_name);
+            let raw_ct = raw_headers
+                .iter()
+                .rev()
+                .find(|(k, _)| k == "content-type")
+                .map(|(_, v)| v.split(';').next().unwrap_or("").trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty() && v != "application/octet-stream");
+            let mime = raw_ct.unwrap_or_else(|| infer_mime_from_filename(&safe_name).to_owned());
+
+            let dir = instance_upload_dir(instance_id);
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .with_context(|| format!("failed to create upload dir {}", dir.display()))?;
+            let seq = UPLOAD_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let file_path = dir.join(format!("{seq}-{safe_name}"));
+            tokio::fs::write(&file_path, &body_bytes)
+                .await
+                .with_context(|| format!("failed to write uploaded file {}", file_path.display()))?;
+
+            write_json_response(
+                &mut write_half,
+                "201 Created",
+                &json!({
+                    "path": file_path.to_string_lossy(),
+                    "name": safe_name,
+                    "mime": mime,
+                    "size": body_bytes.len(),
+                }),
+            )
+            .await?;
+        }
+
         // DELETE /machines/:machine/instances/:id (or POST .../cancel)
         ("DELETE", ["machines", machine_id, "instances", instance_id])
         | ("POST", ["machines", machine_id, "instances", instance_id, "cancel"]) => {
@@ -1194,6 +1263,7 @@ async fn handle_http_connection(
 
                 if purge {
                     state.store.delete_instance(machine_id, instance_id)?;
+                    let _ = tokio::fs::remove_dir_all(instance_upload_dir(instance_id)).await;
                     return write_json_response(
                         &mut write_half,
                         "200 OK",
@@ -1223,6 +1293,7 @@ async fn handle_http_connection(
 
             if purge {
                 state.store.delete_instance(machine_id, instance_id)?;
+                let _ = tokio::fs::remove_dir_all(instance_upload_dir(instance_id)).await;
                 return write_json_response(
                     &mut write_half,
                     "200 OK",
@@ -2078,4 +2149,68 @@ async fn handle_mcp_http_request(
     }
 
     Ok(())
+}
+
+static UPLOAD_FILE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn instance_upload_dir(instance_id: &str) -> std::path::PathBuf {
+    let safe_id: String = instance_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let dir_name = if safe_id.is_empty() {
+        "instance".to_owned()
+    } else {
+        safe_id
+    };
+    std::env::temp_dir()
+        .join("starness-uploads")
+        .join(dir_name)
+}
+
+fn sanitize_upload_filename(raw: &str) -> String {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw).trim();
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\' && *c != '\0')
+        .collect();
+    let trimmed = cleaned.trim_matches('.');
+    if trimmed.is_empty() {
+        "upload.bin".to_owned()
+    } else {
+        trimmed.chars().take(180).collect()
+    }
+}
+
+fn infer_mime_from_filename(name: &str) -> &'static str {
+    let ext = name
+        .rsplit('.')
+        .next()
+        .filter(|_| name.contains('.'))
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        Some("txt" | "log") => "text/plain",
+        Some("md" | "markdown") => "text/markdown",
+        Some("json") => "application/json",
+        Some("csv") => "text/csv",
+        Some("html" | "htm") => "text/html",
+        Some("xml") => "application/xml",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("mp4") => "video/mp4",
+        Some("zip") => "application/zip",
+        _ => "application/octet-stream",
+    }
 }

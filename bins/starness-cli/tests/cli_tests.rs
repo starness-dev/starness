@@ -3311,3 +3311,112 @@ fn coding_harness_02_decide_gate_allows_safe_bash_and_returns_stdout() {
         "expected tool_runs == 1 in context:\n{stdout}"
     );
 }
+
+#[test]
+fn serve_instance_file_upload_sanitizes_name_infers_mime_and_cleans_up_on_purge() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::process::Stdio;
+
+    let probe = TcpListener::bind("127.0.0.1:0").expect("probe port");
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let db_path = std::env::temp_dir().join(format!(
+        "starness_upload_e2e_{}_{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+
+    let mut child = Command::new(bin_path())
+        .arg("serve")
+        .arg(workspace_file("examples/01_chat_harness.star"))
+        .arg("--ui")
+        .arg(workspace_file("examples/01_chat_harness.ui.json"))
+        .arg("--bind")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--db")
+        .arg(&db_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn starness serve");
+
+    let raw_http = |req_bytes: &[u8]| -> (u16, String) {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect serve");
+        stream.write_all(req_bytes).unwrap();
+        stream.flush().unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).unwrap();
+        let resp_str = String::from_utf8_lossy(&resp).into_owned();
+        let status: u16 = resp_str
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let body = resp_str
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_owned())
+            .unwrap_or_default();
+        (status, body)
+    };
+
+    // Wait for server health
+    let mut ready = false;
+    for _ in 0..40 {
+        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(ready, "starness serve did not bind on port {port}");
+
+    // 1. Create an instance
+    let create_req = format!(
+        "POST /machines/chat_harness/instances HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+    );
+    let (create_status, create_body) = raw_http(create_req.as_bytes());
+    assert_eq!(create_status, 201, "create failed: {create_body}");
+    let created: serde_json::Value = serde_json::from_str(&create_body).unwrap();
+    let inst_id = created["id"].as_str().expect("instance id").to_owned();
+
+    // 2. Upload binary PNG with path-traversal X-Filename and generic Content-Type
+    let png_bytes: &[u8] = b"\x89PNG\r\n\x1a\nfake-png-payload";
+    let upload_head = format!(
+        "POST /machines/chat_harness/instances/{inst_id}/files HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Filename: ../../evil/my%20photo.png\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        png_bytes.len()
+    );
+    let mut upload_req = upload_head.into_bytes();
+    upload_req.extend_from_slice(png_bytes);
+    let (up_status, up_body) = raw_http(&upload_req);
+    assert_eq!(up_status, 201, "upload failed: {up_body}");
+    let up_json: serde_json::Value = serde_json::from_str(&up_body).unwrap();
+    assert_eq!(up_json["name"], "my photo.png");
+    assert_eq!(up_json["mime"], "image/png");
+    assert_eq!(up_json["size"], png_bytes.len() as u64);
+
+    let saved_path = std::path::PathBuf::from(up_json["path"].as_str().expect("saved path"));
+    assert!(saved_path.is_file(), "uploaded file missing at {}", saved_path.display());
+    assert_eq!(std::fs::read(&saved_path).unwrap(), png_bytes);
+
+    // 3. Purge instance and verify uploaded temp directory is cleaned up
+    let del_req = format!(
+        "DELETE /machines/chat_harness/instances/{inst_id}?purge=true HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    );
+    let (del_status, del_body) = raw_http(del_req.as_bytes());
+    assert_eq!(del_status, 200, "purge failed: {del_body}");
+    assert!(
+        !saved_path.exists(),
+        "expected uploaded file {} to be removed on purge",
+        saved_path.display()
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&db_path);
+}
