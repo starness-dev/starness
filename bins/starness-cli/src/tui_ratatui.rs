@@ -107,6 +107,7 @@ struct ActionBarItem {
     payload: Map<String, Value>,
     comments_path: Option<String>,
     show_comment_count: bool,
+    shortcut: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -347,6 +348,7 @@ impl AppModel {
     ) {
         let ctx_fingerprint = serde_json::to_string(&context).unwrap_or_default();
         let next_key = format!("{}|{}|{status:?}", active_states.join(","), ctx_fingerprint);
+        let states_changed = self.last_state_key.is_empty() || self.active_states != active_states;
         self.active_states = active_states;
         self.context = context;
         self.status = status;
@@ -360,11 +362,11 @@ impl AppModel {
             } else {
                 json!({})
             };
-            self.rebuild_widgets();
+            self.rebuild_widgets(states_changed);
         }
     }
 
-    fn rebuild_widgets(&mut self) {
+    fn rebuild_widgets(&mut self, states_changed: bool) {
         if !self.widgets.is_empty() {
             self.saved_focused = self.focused;
             for w in &self.widgets {
@@ -417,7 +419,17 @@ impl AppModel {
         }
 
         if !self.widgets.is_empty() {
-            self.focused = self.saved_focused.min(self.widgets.len() - 1);
+            if states_changed
+                && let Some(prompt_idx) = self
+                    .widgets
+                    .iter()
+                    .position(|w| matches!(w, FocusWidget::PromptInput { .. }))
+            {
+                self.focused = prompt_idx;
+                self.saved_focused = prompt_idx;
+            } else {
+                self.focused = self.saved_focused.min(self.widgets.len() - 1);
+            }
             for w in &mut self.widgets {
                 if let FocusWidget::Table {
                     rows, selected_row, ..
@@ -443,12 +455,13 @@ impl AppModel {
                 to.join(",")
             ),
             TraceEvent::ServiceStarted { invoke_id, src, .. } => {
+                self.live_progress.clear();
                 format!("#{} invoke start {invoke_id} ({src})", rec.seq)
             }
             TraceEvent::ServiceProgress { stream, chunk, .. } => {
                 let s = format!("[{stream:?}] {chunk}");
                 self.live_progress.push((*stream, chunk.clone()));
-                if self.live_progress.len() > 200 {
+                if self.live_progress.len() > 2000 {
                     self.live_progress.remove(0);
                 }
                 format!("#{} {s}", rec.seq)
@@ -551,11 +564,48 @@ impl AppModel {
             _ => {}
         }
 
+        if !typing_prompt
+            && let Some((ev, payload)) = self.match_button_shortcut(key)
+        {
+            return AppAction::Dispatch {
+                event_type: ev,
+                payload,
+            };
+        }
+
         if self.widgets.is_empty() {
             return AppAction::None;
         }
 
         self.handle_focused_widget_key(key)
+    }
+
+    fn match_button_shortcut(&self, key: KeyEvent) -> Option<(String, Value)> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT)
+        {
+            return None;
+        }
+        for w in &self.widgets {
+            if let FocusWidget::ActionBar { buttons, .. } = w {
+                for btn in buttons {
+                    let Some(sc) = &btn.shortcut else {
+                        continue;
+                    };
+                    let matched = match sc.to_ascii_lowercase().as_str() {
+                        "esc" | "escape" => key.code == KeyCode::Esc,
+                        s if s.chars().count() == 1 => {
+                            let ch = s.chars().next().unwrap();
+                            matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&ch))
+                        }
+                        _ => false,
+                    };
+                    if matched {
+                        return Some((btn.event.clone(), Value::Object(btn.payload.clone())));
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn toggle_drawer(&mut self, mode: DrawerMode) {
@@ -2077,6 +2127,11 @@ fn render_interactive_widgets(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
                     empty_text,
                     *scroll,
                     border_style,
+                    if model.has_active_invoke() {
+                        &model.live_progress
+                    } else {
+                        &[]
+                    },
                 );
             }
             FocusWidget::PromptInput {
@@ -2552,13 +2607,15 @@ fn render_conversation_widget(
     empty_text: &str,
     scroll: usize,
     border_style: Style,
+    live_progress: &[(ProgressKind, String)],
 ) {
     let header = match title {
         Some(t) => format!(" {t} ({}) ", messages.len()),
         None => format!(" Conversation ({}) ", messages.len()),
     };
     let mut lines: Vec<Line<'static>> = Vec::new();
-    if messages.is_empty() {
+    let has_live = !live_progress.is_empty();
+    if messages.is_empty() && !has_live {
         lines.push(Line::styled(
             format!(" {empty_text}"),
             Style::default().fg(TEXT_MUTED),
@@ -2618,16 +2675,24 @@ fn render_conversation_widget(
                 ]));
             }
             if !msg.text.trim().is_empty() {
-                let text_color = if msg.role == "tool" {
-                    CODE_FG
+                if msg.role == "assistant" {
+                    for ml in parse_md_lines(&msg.text) {
+                        let mut spans = vec![Span::raw("   ")];
+                        spans.extend(render_md_line_spans(&ml.raw, ml.in_code_fence));
+                        lines.push(Line::from(spans));
+                    }
                 } else {
-                    TEXT_PRIMARY
-                };
-                for l in msg.text.lines().take(12) {
-                    lines.push(Line::styled(
-                        format!("   {l}"),
-                        Style::default().fg(text_color),
-                    ));
+                    let text_color = if msg.role == "tool" {
+                        CODE_FG
+                    } else {
+                        TEXT_PRIMARY
+                    };
+                    for l in msg.text.lines() {
+                        lines.push(Line::styled(
+                            format!("   {l}"),
+                            Style::default().fg(text_color),
+                        ));
+                    }
                 }
             }
             for tc in &msg.tool_calls {
@@ -2667,6 +2732,50 @@ fn render_conversation_widget(
                         format!("     ↳ {compact_out}"),
                         Style::default().fg(CODE_FG),
                     ));
+                }
+            }
+        }
+
+        if has_live {
+            let mut live_thought = String::new();
+            let mut live_text = String::new();
+            let mut live_tools: Vec<String> = Vec::new();
+            for (kind, chunk) in live_progress {
+                match kind {
+                    ProgressKind::AgentThought => live_thought.push_str(chunk),
+                    ProgressKind::AgentText => live_text.push_str(chunk),
+                    ProgressKind::ToolCall => live_tools.push(chunk.clone()),
+                    _ => {}
+                }
+            }
+            if !live_thought.is_empty() || !live_text.is_empty() || !live_tools.is_empty() {
+                if !lines.is_empty() {
+                    lines.push(Line::from(""));
+                }
+                lines.push(Line::styled(
+                    " Assistant (streaming…)",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ));
+                if !live_thought.trim().is_empty() {
+                    for l in live_thought.lines().rev().take(4).collect::<Vec<_>>().into_iter().rev() {
+                        lines.push(Line::from(vec![
+                            Span::styled("   ◆ ", Style::default().fg(NOTE_ACCENT)),
+                            Span::styled(l.to_owned(), Style::default().fg(TEXT_MUTED)),
+                        ]));
+                    }
+                }
+                if !live_text.is_empty() {
+                    for ml in parse_md_lines(&live_text) {
+                        let mut spans = vec![Span::raw("   ")];
+                        spans.extend(render_md_line_spans(&ml.raw, ml.in_code_fence));
+                        lines.push(Line::from(spans));
+                    }
+                }
+                for tc in live_tools.iter().rev().take(4).rev() {
+                    lines.push(Line::from(vec![
+                        Span::styled("   ⚙ ", Style::default().fg(WARNING)),
+                        Span::styled(tc.clone(), Style::default().fg(WARNING)),
+                    ]));
                 }
             }
         }
@@ -3764,12 +3873,22 @@ fn collect_spec_nodes(
         }
         "Button" => {
             if let Some(ev) = props.get("event").and_then(Value::as_str) {
+                let shortcut = props
+                    .get("shortcut")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let base_label = props
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or(ev);
+                let label = match &shortcut {
+                    Some(sc) => format!("{base_label} ({sc})"),
+                    None => base_label.to_owned(),
+                };
                 action_buttons.push(ActionBarItem {
-                    label: props
-                        .get("label")
-                        .and_then(Value::as_str)
-                        .unwrap_or(ev)
-                        .to_owned(),
+                    label,
                     event: ev.to_owned(),
                     variant: props
                         .get("variant")
@@ -3783,6 +3902,7 @@ fn collect_spec_nodes(
                         .unwrap_or_default(),
                     comments_path: None,
                     show_comment_count: false,
+                    shortcut,
                 });
             }
         }
@@ -3809,6 +3929,7 @@ fn collect_spec_nodes(
                 payload: Map::new(),
                 comments_path: Some(comments_path.clone()),
                 show_comment_count: false,
+                shortcut: None,
             });
             action_buttons.push(ActionBarItem {
                 label: "↻ Request Changes".to_owned(),
@@ -3817,6 +3938,7 @@ fn collect_spec_nodes(
                 payload: Map::new(),
                 comments_path: Some(comments_path),
                 show_comment_count: true,
+                shortcut: None,
             });
             widgets.push(FocusWidget::MarkdownReview {
                 props,
@@ -3846,6 +3968,7 @@ fn collect_spec_nodes(
                 payload: Map::new(),
                 comments_path: Some(comments_path.clone()),
                 show_comment_count: false,
+                shortcut: None,
             });
             action_buttons.push(ActionBarItem {
                 label: "↻ Request Changes".to_owned(),
@@ -3854,6 +3977,7 @@ fn collect_spec_nodes(
                 payload: Map::new(),
                 comments_path: Some(comments_path),
                 show_comment_count: true,
+                shortcut: None,
             });
             widgets.push(FocusWidget::DiffReview {
                 props,
@@ -4736,9 +4860,9 @@ chart = machine(
     #[test]
     fn ratatui_renders_bluesky_radar_with_after_timer_and_clean_table_links() {
         let star_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/bluesky_radar.star");
+            .join("tests/fixtures/bluesky_radar.star");
         let ui_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/bluesky_radar.ui.json");
+            .join("tests/fixtures/bluesky_radar.ui.json");
         let compiled =
             starness_starlark::compile_starlark_file(&star_path, Some("chart")).unwrap();
         let sheet =
@@ -4840,7 +4964,7 @@ chart = machine(
     #[test]
     fn ratatui_after_timer_state_without_ui_shows_fallback_picker() {
         let star_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/bluesky_radar.star");
+            .join("tests/fixtures/bluesky_radar.star");
         let compiled =
             starness_starlark::compile_starlark_file(&star_path, Some("chart")).unwrap();
 
@@ -5066,9 +5190,9 @@ chart = machine(
     #[test]
     fn ratatui_prompt_input_types_and_dispatches_without_global_hotkey_conflict() {
         let star_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/coding_session_llm.star");
+            .join("tests/fixtures/coding_session_llm.star");
         let ui_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/coding_session_llm.ui.json");
+            .join("tests/fixtures/coding_session_llm.ui.json");
         let compiled =
             starness_starlark::compile_starlark_file(&star_path, Some("chart")).unwrap();
         let sheet =
@@ -5081,13 +5205,15 @@ chart = machine(
             vec!["gather_input".to_owned()],
             compiled.ir.context.clone(),
         );
-        // Focus PromptInput widget
-        let prompt_idx = model
-            .widgets
-            .iter()
-            .position(|w| matches!(w, FocusWidget::PromptInput { .. }))
-            .expect("PromptInput widget should exist");
-        model.focused = prompt_idx;
+        // PromptInput should be auto-focused on startup so the user can type immediately.
+        assert!(
+            matches!(
+                model.widgets.get(model.focused),
+                Some(FocusWidget::PromptInput { .. })
+            ),
+            "PromptInput should be auto-focused on startup (focused={})",
+            model.focused
+        );
 
         // Type "quit test" — 'q' and 't' must NOT quit or toggle trace drawer!
         for ch in "quit test".chars() {
@@ -5108,5 +5234,258 @@ chart = machine(
             }
             other => panic!("expected PROMPT dispatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn all_example_ui_sheets_validate_catalog_types_and_render_in_desktop_and_narrow_tui() {
+        const VALID_WIDGETS: &[&str] = &[
+            "Stack",
+            "Card",
+            "Markdown",
+            "KeyValue",
+            "Table",
+            "Badge",
+            "Alert",
+            "TextInput",
+            "Textarea",
+            "Select",
+            "MultiSelect",
+            "Button",
+            "MarkdownReview",
+            "DiffReview",
+            "Conversation",
+            "PromptInput",
+            "ToolCall",
+            "Reasoning",
+            "TaskList",
+            "Terminal",
+        ];
+
+        let examples_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let mut checked_count = 0usize;
+
+        for entry in std::fs::read_dir(&examples_dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if !name.ends_with(".ui.json") {
+                continue;
+            }
+            let stem = name.strip_suffix(".ui.json").unwrap();
+            let star_path = examples_dir.join(format!("{stem}.star"));
+            assert!(
+                star_path.is_file(),
+                "UI view-sheet `{name}` missing matching `{stem}.star`"
+            );
+
+            let compiled = starness_starlark::compile_starlark_file(&star_path, Some("chart"))
+                .unwrap_or_else(|e| panic!("failed compiling `{}`: {e}", star_path.display()));
+            let raw_ui = std::fs::read_to_string(&path).unwrap();
+            let sheet = UiViewSheet::from_json_str(&raw_ui)
+                .unwrap_or_else(|e| panic!("failed parsing `{name}`: {e}"));
+            assert_eq!(
+                sheet.validate_against(&compiled.ir),
+                Ok(()),
+                "view-sheet `{name}` failed static validation"
+            );
+
+            // Verify every declared element `type` is in the 20-widget catalog.
+            for (view_state, spec) in sheet.views.iter() {
+                if let Some(elements) = spec.get("elements").and_then(Value::as_object) {
+                    for (elem_id, elem) in elements {
+                        let ty = elem
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<missing>");
+                        assert!(
+                            VALID_WIDGETS.contains(&ty),
+                            "`{name}` view `{view_state}` element `{elem_id}` uses unknown widget type `{ty}`"
+                        );
+                    }
+                }
+
+                // Render every declared view at desktop (118x36) and narrow (80x24) sizes.
+                let model = AppModel::new(
+                    compiled.ir.clone(),
+                    Some(sheet.clone()),
+                    vec![view_state.as_str().to_owned()],
+                    compiled.ir.context.clone(),
+                );
+                for (w, h) in [(118, 36), (80, 24)] {
+                    let backend = TestBackend::new(w, h);
+                    let mut term = Terminal::new(backend).unwrap();
+                    term.draw(|f| render_app(f, &model))
+                        .unwrap_or_else(|e| panic!("render failed for `{name}` `{view_state}` at {w}x{h}: {e}"));
+                }
+            }
+            checked_count += 1;
+        }
+
+        assert!(
+            checked_count >= 4,
+            "expected at least 4 examples/*.ui.json files, found {checked_count}"
+        );
+    }
+
+    #[test]
+    fn ratatui_conversation_streams_live_markdown_and_clears_on_next_invoke() {
+        let star_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/01_chat_harness.star");
+        let ui_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/01_chat_harness.ui.json");
+        let compiled =
+            starness_starlark::compile_starlark_file(&star_path, Some("chart")).unwrap();
+        let sheet =
+            UiViewSheet::from_json_str(&std::fs::read_to_string(&ui_path).unwrap()).unwrap();
+
+        let mut model = AppModel::new(
+            compiled.ir.clone(),
+            Some(sheet),
+            vec!["thinking".to_owned()],
+            compiled.ir.context.clone(),
+        );
+
+        let mk_rec = |seq: u64, event: TraceEvent| TraceRecord {
+            seq,
+            t_ms: seq * 10,
+            machine: "chat_harness".to_owned(),
+            instance_id: None,
+            event,
+        };
+        model.push_trace_record(&mk_rec(
+            1,
+            TraceEvent::ServiceStarted {
+                invoke_id: "chat_turn".to_owned(),
+                state: "thinking".to_owned(),
+                src: "__starness_builtin_llm__".to_owned(),
+                input: json!({}),
+            },
+        ));
+        model.push_trace_record(&mk_rec(
+            2,
+            TraceEvent::ServiceProgress {
+                invoke_id: "chat_turn".to_owned(),
+                state: "thinking".to_owned(),
+                src: "__starness_builtin_llm__".to_owned(),
+                stream: ProgressKind::AgentThought,
+                chunk: "Checking answer".to_owned(),
+            },
+        ));
+        model.push_trace_record(&mk_rec(
+            3,
+            TraceEvent::ServiceProgress {
+                invoke_id: "chat_turn".to_owned(),
+                state: "thinking".to_owned(),
+                src: "__starness_builtin_llm__".to_owned(),
+                stream: ProgressKind::AgentText,
+                chunk: "Hello **world** via `starness`".to_owned(),
+            },
+        ));
+
+        let backend = TestBackend::new(100, 28);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_app(f, &model)).unwrap();
+        let rendered: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("Assistant (streaming…)") && rendered.contains("Checking answer"));
+        // Markdown rendering strips raw `**` markers while preserving the text
+        assert!(rendered.contains("Hello world via") && rendered.contains("starness"));
+        assert!(!rendered.contains("**world**"));
+
+        // Next ServiceStarted clears previous live_progress
+        model.push_trace_record(&mk_rec(
+            4,
+            TraceEvent::ServiceStarted {
+                invoke_id: "chat_turn".to_owned(),
+                state: "thinking".to_owned(),
+                src: "__starness_builtin_llm__".to_owned(),
+                input: json!({}),
+            },
+        ));
+        assert!(model.live_progress.is_empty());
+
+        // Pressing Esc while in `thinking` (where INTERRUPT is allowed) dispatches INTERRUPT
+        let act = model.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            matches!(act, AppAction::Dispatch { ref event_type, .. } if event_type == "INTERRUPT"),
+            "expected Esc to dispatch INTERRUPT, got {act:?}"
+        );
+    }
+
+    #[test]
+    fn ratatui_ai_widgets_handle_expand_collapse_scroll_and_interrupt() {
+        let star_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/ui_showcase.star");
+        let ui_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/ui_showcase.ui.json");
+        let compiled =
+            starness_starlark::compile_starlark_file(&star_path, Some("chart")).unwrap();
+        let sheet =
+            UiViewSheet::from_json_str(&std::fs::read_to_string(&ui_path).unwrap()).unwrap();
+
+        let mut model = AppModel::new(
+            compiled.ir.clone(),
+            Some(sheet),
+            vec!["ai_elements".to_owned()],
+            compiled.ir.context.clone(),
+        );
+
+        // Toggle ToolCall expand/collapse with Enter
+        let tc_idx = model
+            .widgets
+            .iter()
+            .position(|w| matches!(w, FocusWidget::ToolCall { .. }))
+            .expect("ToolCall widget");
+        model.focused = tc_idx;
+        let was_expanded = matches!(
+            model.widgets[tc_idx],
+            FocusWidget::ToolCall { expanded: true, .. }
+        );
+        model.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let is_expanded = matches!(
+            model.widgets[tc_idx],
+            FocusWidget::ToolCall { expanded: true, .. }
+        );
+        assert_ne!(was_expanded, is_expanded);
+
+        // Toggle Reasoning expand/collapse with Enter
+        let r_idx = model
+            .widgets
+            .iter()
+            .position(|w| matches!(w, FocusWidget::Reasoning { .. }))
+            .expect("Reasoning widget");
+        model.focused = r_idx;
+        let r_before = matches!(
+            model.widgets[r_idx],
+            FocusWidget::Reasoning { expanded: true, .. }
+        );
+        model.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let r_after = matches!(
+            model.widgets[r_idx],
+            FocusWidget::Reasoning { expanded: true, .. }
+        );
+        assert_ne!(r_before, r_after);
+
+        // Scroll Terminal with Down / Up
+        let term_idx = model
+            .widgets
+            .iter()
+            .position(|w| matches!(w, FocusWidget::Terminal { .. }))
+            .expect("Terminal widget");
+        model.focused = term_idx;
+        model.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(
+            model.widgets[term_idx],
+            FocusWidget::Terminal { scroll: 1, .. }
+        ));
+        model.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(matches!(
+            model.widgets[term_idx],
+            FocusWidget::Terminal { scroll: 0, .. }
+        ));
     }
 }
