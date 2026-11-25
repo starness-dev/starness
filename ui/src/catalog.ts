@@ -159,9 +159,11 @@ export const starnessCatalog = defineCatalog(schema, {
         field_name: z.string().optional(),
         interrupt_event: z.string().optional(),
         interrupt_label: z.string().optional(),
+        allow_attachments: z.boolean().optional(),
+        accept: z.string().optional(),
       }),
       description:
-        "AI prompt input bar dispatching a statechart event with the entered text and optional interrupt button.",
+        "AI prompt input bar dispatching a statechart event with the entered text, optional file attachments, and optional interrupt button.",
     },
     ToolCall: {
       props: z.object({

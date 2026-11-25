@@ -37,6 +37,13 @@ export interface TraceRecord {
   [key: string]: unknown;
 }
 
+export interface UploadedFile {
+  path: string;
+  name: string;
+  mime: string;
+  size: number;
+}
+
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
   const text = await res.text();
@@ -111,6 +118,30 @@ export async function cancelInstance(
   await fetchJson(
     `/machines/${encodeURIComponent(machineId)}/instances/${encodeURIComponent(instanceId)}`,
     { method: "DELETE" },
+  );
+}
+
+export async function uploadInstanceFile(
+  machineId: string,
+  instanceId: string,
+  file: Blob,
+  filename: string,
+  mime?: string,
+): Promise<UploadedFile> {
+  const headers: Record<string, string> = {
+    "x-filename": encodeURIComponent(filename || "upload.bin"),
+  };
+  const ct = mime || file.type;
+  if (ct) {
+    headers["content-type"] = ct;
+  }
+  return fetchJson<UploadedFile>(
+    `/machines/${encodeURIComponent(machineId)}/instances/${encodeURIComponent(instanceId)}/files`,
+    {
+      method: "POST",
+      headers,
+      body: file,
+    },
   );
 }
 

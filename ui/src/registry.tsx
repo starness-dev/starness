@@ -336,6 +336,8 @@ export const { registry: starnessRegistry } = defineRegistry(starnessCatalog, {
           fieldName={props.field_name ?? "text"}
           interruptEvent={props.interrupt_event}
           interruptLabel={props.interrupt_label}
+          allowAttachments={props.allow_attachments}
+          accept={props.accept}
           onDispatch={async (event, payload) => {
             await execute({
               action: "send_event",

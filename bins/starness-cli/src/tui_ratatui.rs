@@ -11,8 +11,9 @@ use std::io;
 use std::time::Duration;
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream, KeyCode, KeyEvent,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -119,12 +120,21 @@ struct TuiToolCall {
     output: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TuiAttachment {
+    path: String,
+    name: String,
+    mime: String,
+    size: u64,
+}
+
 #[derive(Debug, Clone)]
 struct TuiChatMessage {
     role: String,
     text: String,
     reasoning: Option<String>,
     tool_calls: Vec<TuiToolCall>,
+    attachments: Vec<String>,
     tool_name: Option<String>,
 }
 
@@ -165,6 +175,8 @@ enum FocusWidget {
         field_name: String,
         interrupt_event: Option<String>,
         interrupt_label: String,
+        allow_attachments: bool,
+        attachments: Vec<TuiAttachment>,
         buffer: String,
     },
     ToolCall {
@@ -285,6 +297,7 @@ struct AppModel {
     focused: usize,
     saved_focused: usize,
     saved_table_row: usize,
+    saved_conversation_scroll: usize,
     scroll_offset: u16,
     modal: Option<InputModal>,
     modal_focus: ModalFocus,
@@ -318,6 +331,7 @@ impl AppModel {
             focused: 0,
             saved_focused: 0,
             saved_table_row: 0,
+            saved_conversation_scroll: 0,
             scroll_offset: 0,
             modal: None,
             modal_focus: ModalFocus::Input,
@@ -372,6 +386,8 @@ impl AppModel {
             for w in &self.widgets {
                 if let FocusWidget::Table { selected_row, .. } = w {
                     self.saved_table_row = *selected_row;
+                } else if let FocusWidget::Conversation { scroll, .. } = w {
+                    self.saved_conversation_scroll = *scroll;
                 }
             }
         }
@@ -437,6 +453,8 @@ impl AppModel {
                     && !rows.is_empty()
                 {
                     *selected_row = self.saved_table_row.min(rows.len() - 1);
+                } else if let FocusWidget::Conversation { scroll, .. } = w {
+                    *scroll = self.saved_conversation_scroll;
                 }
             }
         }
@@ -1076,23 +1094,57 @@ impl AppModel {
                 KeyCode::Up | KeyCode::Char('k') => {
                     *scroll = scroll.saturating_sub(1);
                 }
+                KeyCode::PageDown => {
+                    *scroll = scroll.saturating_add(10);
+                }
+                KeyCode::PageUp => {
+                    *scroll = scroll.saturating_sub(10);
+                }
+                KeyCode::Home => {
+                    *scroll = 0;
+                }
+                KeyCode::End => {
+                    *scroll = usize::MAX;
+                }
                 _ => {}
             },
             FocusWidget::PromptInput {
                 submit_event,
                 field_name,
                 interrupt_event,
+                allow_attachments,
+                attachments,
                 buffer,
                 ..
             } => match key.code {
                 KeyCode::Enter => {
                     let trimmed = buffer.trim().to_owned();
-                    if !trimmed.is_empty() {
+                    if !trimmed.is_empty() || !attachments.is_empty() {
                         let ev = submit_event.clone();
                         let field = field_name.clone();
+                        let mut final_attachments = std::mem::take(attachments);
+                        let final_text = if *allow_attachments {
+                            extract_inline_at_attachments(&trimmed, &mut final_attachments)
+                        } else {
+                            trimmed
+                        };
                         buffer.clear();
                         let mut map = Map::new();
-                        map.insert(field, Value::String(trimmed));
+                        map.insert(field, Value::String(final_text));
+                        if !final_attachments.is_empty() {
+                            let files_val: Vec<Value> = final_attachments
+                                .into_iter()
+                                .map(|a| {
+                                    json!({
+                                        "path": a.path,
+                                        "name": a.name,
+                                        "mime": a.mime,
+                                        "size": a.size,
+                                    })
+                                })
+                                .collect();
+                            map.insert("files".to_owned(), Value::Array(files_val));
+                        }
                         return AppAction::Dispatch {
                             event_type: ev,
                             payload: Value::Object(map),
@@ -1109,7 +1161,13 @@ impl AppModel {
                     buffer.clear();
                 }
                 KeyCode::Backspace => {
-                    buffer.pop();
+                    if buffer.is_empty() {
+                        if let Some(removed) = attachments.pop() {
+                            self.status_flash = Some(format!("Removed {}", removed.name));
+                        }
+                    } else {
+                        buffer.pop();
+                    }
                 }
                 KeyCode::Char(c)
                     if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1431,6 +1489,71 @@ impl AppModel {
             }
         }
     }
+
+    fn handle_paste(&mut self, pasted: &str) {
+        if let Some(modal) = &mut self.modal {
+            match modal {
+                InputModal::MarkdownComment { buffer, .. }
+                | InputModal::DiffComment { buffer, .. }
+                | InputModal::TextField { buffer, .. }
+                | InputModal::FallbackPayload { buffer, .. } => {
+                    buffer.push_str(pasted);
+                }
+            }
+            return;
+        }
+
+        // Route paste to the focused PromptInput, or auto-focus the first PromptInput so
+        // dragging a file anywhere onto the terminal window attaches it immediately.
+        let target_idx = if matches!(
+            self.widgets.get(self.focused),
+            Some(FocusWidget::PromptInput { .. })
+        ) {
+            Some(self.focused)
+        } else {
+            self.widgets
+                .iter()
+                .position(|w| matches!(w, FocusWidget::PromptInput { .. }))
+        };
+
+        let Some(idx) = target_idx else {
+            return;
+        };
+        self.focused = idx;
+
+        if let Some(FocusWidget::PromptInput {
+            allow_attachments,
+            attachments,
+            buffer,
+            ..
+        }) = self.widgets.get_mut(idx)
+        {
+            if *allow_attachments {
+                let paths = parse_pasted_file_paths(pasted);
+                if !paths.is_empty() {
+                    let mut added = 0usize;
+                    for p in paths {
+                        if let Some(att) = tui_attachment_from_path(&p)
+                            && !attachments.iter().any(|existing| existing.path == att.path)
+                        {
+                            attachments.push(att);
+                            added += 1;
+                        }
+                    }
+                    if added > 0 {
+                        self.status_flash = Some(format!(
+                            "Attached {} file{}",
+                            added,
+                            if added == 1 { "" } else { "s" }
+                        ));
+                    }
+                    return;
+                }
+            }
+            let cleaned = pasted.replace("\r\n", " ").replace(['\r', '\n'], " ");
+            buffer.push_str(&cleaned);
+        }
+    }
 }
 
 /// Runs the fullscreen Ratatui TUI bound to a live [`StarnessActor`].
@@ -1441,7 +1564,12 @@ pub async fn run_ratatui_app(
 ) -> anyhow::Result<std::process::ExitCode> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1450,6 +1578,7 @@ pub async fn run_ratatui_app(
     let _ = disable_raw_mode();
     let _ = execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
     );
@@ -1516,6 +1645,10 @@ where
                 match maybe_ev {
                     Some(Ok(TermEvent::Mouse(mouse))) => {
                         model.handle_mouse(mouse);
+                    }
+                    Some(Ok(TermEvent::Paste(text))) => {
+                        model.status_flash = None;
+                        model.handle_paste(&text);
                     }
                     Some(Ok(TermEvent::Key(key))) => {
                         model.status_flash = None;
@@ -2036,7 +2169,9 @@ fn render_interactive_widgets(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
                     Constraint::Length(3)
                 }
             }
-            FocusWidget::PromptInput { .. } => Constraint::Length(3),
+            FocusWidget::PromptInput { attachments, .. } => {
+                Constraint::Length(if attachments.is_empty() { 3 } else { 4 })
+            }
             FocusWidget::FallbackPicker { events, .. } => {
                 Constraint::Min((events.len() as u16).saturating_add(3))
             }
@@ -2140,6 +2275,7 @@ fn render_interactive_widgets(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
                 submit_label,
                 interrupt_event,
                 interrupt_label,
+                attachments,
                 buffer,
                 ..
             } => {
@@ -2151,6 +2287,7 @@ fn render_interactive_widgets(f: &mut Frame<'_>, area: Rect, model: &AppModel) {
                     submit_label,
                     interrupt_event.is_some(),
                     interrupt_label,
+                    attachments,
                     buffer,
                     is_focused,
                     border_style,
@@ -2674,6 +2811,19 @@ fn render_conversation_widget(
                     Span::styled(preview, Style::default().fg(TEXT_MUTED)),
                 ]));
             }
+            if !msg.attachments.is_empty() {
+                let mut att_spans = vec![Span::raw("   ")];
+                for (ai, name) in msg.attachments.iter().enumerate() {
+                    if ai > 0 {
+                        att_spans.push(Span::raw("  "));
+                    }
+                    att_spans.push(Span::styled(
+                        format!("📎 {name}"),
+                        Style::default().fg(NOTE_ACCENT),
+                    ));
+                }
+                lines.push(Line::from(att_spans));
+            }
             if !msg.text.trim().is_empty() {
                 if msg.role == "assistant" {
                     for ml in parse_md_lines(&msg.text) {
@@ -2783,11 +2933,7 @@ fn render_conversation_widget(
 
     let inner_h = area.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(inner_h);
-    let effective_scroll = if scroll == 0 {
-        max_scroll
-    } else {
-        scroll.min(max_scroll)
-    };
+    let effective_scroll = scroll.min(max_scroll);
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -2811,6 +2957,7 @@ fn render_prompt_input_widget(
     submit_label: &str,
     has_interrupt: bool,
     interrupt_label: &str,
+    attachments: &[TuiAttachment],
     buffer: &str,
     is_focused: bool,
     border_style: Style,
@@ -2819,7 +2966,30 @@ fn render_prompt_input_widget(
         Some(l) if !l.is_empty() => format!(" {l} "),
         _ => " Prompt ".to_owned(),
     };
-    let mut spans = vec![Span::styled(" › ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))];
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if !attachments.is_empty() {
+        let mut att_spans = vec![Span::raw(" ")];
+        for (i, att) in attachments.iter().enumerate() {
+            if i > 0 {
+                att_spans.push(Span::raw("  "));
+            }
+            att_spans.push(Span::styled(
+                format!("📎 {}", att.name),
+                Style::default()
+                    .fg(NOTE_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        att_spans.push(Span::styled(
+            "  (Backspace on empty to remove)",
+            Style::default().fg(TEXT_MUTED),
+        ));
+        lines.push(Line::from(att_spans));
+    }
+    let mut spans = vec![Span::styled(
+        " › ",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )];
     if buffer.is_empty() {
         spans.push(Span::styled(
             placeholder.to_owned(),
@@ -2844,12 +3014,13 @@ fn render_prompt_input_widget(
             Style::default().fg(DANGER),
         ));
     }
+    lines.push(Line::from(spans));
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .title(title)
         .border_style(border_style);
-    f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3694,6 +3865,11 @@ fn collect_spec_nodes(
                         .and_then(Value::as_str)
                         .unwrap_or("Stop")
                         .to_owned(),
+                    allow_attachments: props
+                        .get("allow_attachments")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    attachments: Vec::new(),
                     buffer: String::new(),
                 });
             }
@@ -4385,8 +4561,12 @@ fn parse_tui_messages(raw: &Value) -> Vec<TuiChatMessage> {
         let Some(obj) = item.as_object() else {
             continue;
         };
-        // Unwrap @starness/llm lossless `$starness_llm_msg` envelope
-        if let Some(inner) = obj.get("$starness_llm_msg").and_then(Value::as_object) {
+        // Unwrap @starness/llm lossless `$starness_llm_msg` envelope or typed `LlmMessage.raw`
+        if let Some(inner) = obj
+            .get("$starness_llm_msg")
+            .or_else(|| obj.get("raw"))
+            .and_then(Value::as_object)
+        {
             let role = inner
                 .get("role")
                 .and_then(Value::as_str)
@@ -4395,6 +4575,7 @@ fn parse_tui_messages(raw: &Value) -> Vec<TuiChatMessage> {
             let mut text_parts = Vec::new();
             let mut reasoning_parts = Vec::new();
             let mut tool_calls = Vec::new();
+            let mut attachments = Vec::new();
             if let Some(content) = inner.get("content") {
                 if let Some(s) = content.as_str() {
                     if !s.is_empty() {
@@ -4439,6 +4620,13 @@ fn parse_tui_messages(raw: &Value) -> Vec<TuiChatMessage> {
                                     .map(format_json_compact),
                                 output: None,
                             });
+                        } else if let Some(bin) = po.get("Binary").and_then(Value::as_object) {
+                            let name = bin
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .or_else(|| bin.get("content_type").and_then(Value::as_str))
+                                .unwrap_or("attachment");
+                            attachments.push(name.to_owned());
                         }
                     }
                 }
@@ -4452,6 +4640,7 @@ fn parse_tui_messages(raw: &Value) -> Vec<TuiChatMessage> {
                     Some(reasoning_parts.join("\n"))
                 },
                 tool_calls,
+                attachments,
                 tool_name: None,
             });
             continue;
@@ -4483,6 +4672,7 @@ fn parse_tui_messages(raw: &Value) -> Vec<TuiChatMessage> {
                         text: format_json_compact(content),
                         reasoning: None,
                         tool_calls: Vec::new(),
+                        attachments: Vec::new(),
                         tool_name: Some(tname.to_owned()),
                     });
                 }
@@ -4507,6 +4697,7 @@ fn parse_tui_messages(raw: &Value) -> Vec<TuiChatMessage> {
                     text: format_json_compact(content),
                     reasoning: None,
                     tool_calls: Vec::new(),
+                    attachments: Vec::new(),
                     tool_name: Some(tname.to_owned()),
                 });
             }
@@ -4558,15 +4749,229 @@ fn parse_tui_messages(raw: &Value) -> Vec<TuiChatMessage> {
                 });
             }
         }
+        let mut attachments = Vec::new();
+        if let Some(raw_atts) = obj.get("attachments").and_then(Value::as_array) {
+            for att in raw_atts {
+                let Some(ao) = att.as_object() else {
+                    continue;
+                };
+                let label = ao
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        ao.get("path")
+                            .and_then(Value::as_str)
+                            .and_then(|p| p.rsplit(['/', '\\']).next())
+                            .map(str::to_owned)
+                    })
+                    .or_else(|| ao.get("url").and_then(Value::as_str).map(str::to_owned))
+                    .unwrap_or_else(|| "attachment".to_owned());
+                attachments.push(label);
+            }
+        }
         out.push(TuiChatMessage {
             role,
             text,
             reasoning,
             tool_calls,
+            attachments,
             tool_name: None,
         });
     }
     out
+}
+
+fn split_shell_paste_tokens(raw: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut chars = raw.chars().peekable();
+    let mut quote: Option<char> = None;
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                } else {
+                    cur.push(ch);
+                }
+            }
+            Some('"') => {
+                if ch == '"' {
+                    quote = None;
+                } else if ch == '\\' {
+                    if let Some(&next) = chars.peek() {
+                        if matches!(next, '"' | '\\' | '$' | '`') {
+                            cur.push(chars.next().unwrap());
+                        } else {
+                            cur.push(ch);
+                        }
+                    } else {
+                        cur.push(ch);
+                    }
+                } else {
+                    cur.push(ch);
+                }
+            }
+            None => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '\\' => {
+                    if let Some(escaped) = chars.next() {
+                        cur.push(escaped);
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if !cur.is_empty() {
+                        tokens.push(std::mem::take(&mut cur));
+                    }
+                }
+                other => cur.push(other),
+            },
+            Some(_) => {}
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+fn decode_file_uri(token: &str) -> String {
+    let Some(rest) = token.strip_prefix("file://") else {
+        return token.to_owned();
+    };
+    let path_part = rest.strip_prefix("localhost").unwrap_or(rest);
+    let mut out = Vec::with_capacity(path_part.len());
+    let bytes = path_part.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn resolve_candidate_file_path(token: &str) -> Option<std::path::PathBuf> {
+    let decoded = decode_file_uri(token.trim());
+    if decoded.is_empty() {
+        return None;
+    }
+    let expanded = if let Some(rest) = decoded.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(rest))
+            .unwrap_or_else(|| std::path::PathBuf::from(&decoded))
+    } else {
+        std::path::PathBuf::from(&decoded)
+    };
+    if expanded.is_file() {
+        Some(expanded)
+    } else {
+        None
+    }
+}
+
+/// Parses a bracketed-paste string (as sent by macOS Terminal.app, iTerm2, Ghostty, WezTerm when
+/// dragging files from Finder) into resolved file paths. Returns empty if any token is not an
+/// existing regular file, so normal text pastes are never misclassified as file drops.
+fn parse_pasted_file_paths(raw: &str) -> Vec<std::path::PathBuf> {
+    let tokens = split_shell_paste_tokens(raw);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let mut paths = Vec::with_capacity(tokens.len());
+    for tok in &tokens {
+        match resolve_candidate_file_path(tok) {
+            Some(p) => paths.push(p),
+            None => return Vec::new(),
+        }
+    }
+    paths
+}
+
+fn extract_inline_at_attachments(text: &str, attachments: &mut Vec<TuiAttachment>) -> String {
+    if !text.contains('@') {
+        return text.to_owned();
+    }
+    let mut kept = Vec::new();
+    let mut found_any = false;
+    for tok in split_shell_paste_tokens(text) {
+        if let Some(raw_path) = tok.strip_prefix('@')
+            && !raw_path.is_empty()
+            && let Some(path) = resolve_candidate_file_path(raw_path)
+            && let Some(att) = tui_attachment_from_path(&path)
+        {
+            found_any = true;
+            if !attachments.iter().any(|existing| existing.path == att.path) {
+                attachments.push(att);
+            }
+            continue;
+        }
+        kept.push(tok);
+    }
+    if found_any {
+        kept.join(" ")
+    } else {
+        text.to_owned()
+    }
+}
+
+fn tui_attachment_from_path(path: &std::path::Path) -> Option<TuiAttachment> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let name = abs
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("attachment")
+        .to_owned();
+    let mime = infer_tui_mime(&name).to_owned();
+    Some(TuiAttachment {
+        path: abs.to_string_lossy().into_owned(),
+        name,
+        mime,
+        size: meta.len(),
+    })
+}
+
+fn infer_tui_mime(name: &str) -> &'static str {
+    let ext = name
+        .rsplit('.')
+        .next()
+        .filter(|_| name.contains('.'))
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        Some("txt" | "log") => "text/plain",
+        Some("md" | "markdown") => "text/markdown",
+        Some("json") => "application/json",
+        Some("csv") => "text/csv",
+        Some("html" | "htm") => "text/html",
+        Some("xml") => "application/xml",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("mp4") => "video/mp4",
+        Some("zip") => "application/zip",
+        _ => "application/octet-stream",
+    }
 }
 
 fn set_json_pointer(root: &mut Value, pointer: &str, new_val: Value) {
@@ -5487,5 +5892,104 @@ chart = machine(
             model.widgets[term_idx],
             FocusWidget::Terminal { scroll: 0, .. }
         ));
+    }
+
+    #[test]
+    fn ratatui_prompt_input_handles_drag_and_drop_bracketed_paste_files() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "starness_tui_drop_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let img_path = tmp_dir.join("my screenshot.png");
+        let md_path = tmp_dir.join("notes.md");
+        std::fs::write(&img_path, b"\x89PNG\r\n\x1a\n1234").unwrap();
+        std::fs::write(&md_path, b"# Notes\nhello").unwrap();
+
+        let star_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/01_chat_harness.star");
+        let ui_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/01_chat_harness.ui.json");
+        let compiled =
+            starness_starlark::compile_starlark_file(&star_path, Some("chart")).unwrap();
+        let sheet =
+            UiViewSheet::from_json_str(&std::fs::read_to_string(&ui_path).unwrap()).unwrap();
+
+        let mut model = AppModel::new(
+            compiled.ir.clone(),
+            Some(sheet),
+            vec!["gather_input".to_owned()],
+            compiled.ir.context.clone(),
+        );
+
+        // Start focused on Conversation (index 0); pasting a dragged file auto-focuses PromptInput!
+        model.focused = 0;
+        let escaped_img = img_path.to_string_lossy().replace(' ', "\\ ");
+        model.handle_paste(&format!("{escaped_img} "));
+
+        let backend = TestBackend::new(100, 28);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_app(f, &model)).unwrap();
+        let rendered: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            rendered.contains("📎")
+                && rendered.contains("my screenshot.png")
+                && rendered.contains("Backspace on empty to remove"),
+            "expected attachment chip in rendered TUI:\n{rendered}"
+        );
+
+        // Backspace on empty prompt removes the attachment chip
+        model.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        let prompt_idx = model
+            .widgets
+            .iter()
+            .position(|w| matches!(w, FocusWidget::PromptInput { .. }))
+            .expect("PromptInput");
+        assert!(matches!(
+            &model.widgets[prompt_idx],
+            FocusWidget::PromptInput { attachments, .. } if attachments.is_empty()
+        ));
+
+        // Multi-file paste: single-quoted path with spaces + file:// URI
+        let multi_paste = format!(
+            "'{}' file://{}",
+            img_path.to_string_lossy(),
+            md_path.to_string_lossy()
+        );
+        model.handle_paste(&multi_paste);
+
+        // Normal non-file text paste appends to buffer instead of failing
+        model.handle_paste("Compare these two files");
+
+        let act = model.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match act {
+            AppAction::Dispatch {
+                event_type,
+                payload,
+            } => {
+                assert_eq!(event_type, "PROMPT");
+                assert_eq!(payload["text"], "Compare these two files");
+                let files = payload["files"].as_array().expect("files array");
+                assert_eq!(files.len(), 2);
+                assert_eq!(files[0]["name"], "my screenshot.png");
+                assert_eq!(files[0]["mime"], "image/png");
+                assert_eq!(files[0]["size"], 12);
+                assert_eq!(files[1]["name"], "notes.md");
+                assert_eq!(files[1]["mime"], "text/markdown");
+            }
+            other => panic!("expected Dispatch PROMPT with files, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

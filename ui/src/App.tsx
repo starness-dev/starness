@@ -22,11 +22,16 @@ import {
   listMachines,
   sendEvent,
   subscribeInstanceTrace,
+  uploadInstanceFile,
 } from "./api";
 import { starnessRegistry } from "./registry";
 import { MermaidDiagram } from "./components/MermaidDiagram";
 import { FallbackEventForm } from "./components/FallbackEventForm";
-import { LiveServiceStream, LiveTracesContext } from "./components/AiElements";
+import {
+  LiveServiceStream,
+  LiveTracesContext,
+  UploadFileContext,
+} from "./components/AiElements";
 
 const STATUS_BADGE: Record<string, string> = {
   active: "bg-sky-500/15 text-sky-300 border-sky-500/40",
@@ -412,39 +417,45 @@ export function App() {
                   )}
 
                   {snapshot.ui ? (
-                    <LiveTracesContext.Provider
-                      value={{ traces, isActive: snapshot.status === "active" }}
+                    <UploadFileContext.Provider
+                      value={async (file, filename, mime) =>
+                        uploadInstanceFile(selectedMachine, snapshot.id, file, filename, mime)
+                      }
                     >
-                      <JSONUIProvider
-                        key={snapshot.id}
-                        registry={starnessRegistry}
-                        store={stateStoreRef.current}
-                        handlers={{
-                          send_event: async (params: Record<string, unknown>) => {
-                            const evName = String(params.event ?? "");
-                            const explicitPayload =
-                              params.payload && typeof params.payload === "object"
-                                ? (params.payload as Record<string, unknown>)
-                                : {};
-                            const liveState = stateStoreRef.current.getSnapshot();
-                            const mergedPayload: Record<string, unknown> = {
-                              ...explicitPayload,
-                            };
-                            for (const [k, v] of Object.entries(liveState)) {
-                              if (
-                                !(k in mergedPayload) &&
-                                JSON.stringify(snapshot.context?.[k]) !== JSON.stringify(v)
-                              ) {
-                                mergedPayload[k] = v;
-                              }
-                            }
-                            await handleDispatchEvent(evName, mergedPayload);
-                          },
-                        }}
+                      <LiveTracesContext.Provider
+                        value={{ traces, isActive: snapshot.status === "active" }}
                       >
-                        <Renderer spec={snapshot.ui} registry={starnessRegistry} />
-                      </JSONUIProvider>
-                    </LiveTracesContext.Provider>
+                        <JSONUIProvider
+                          key={snapshot.id}
+                          registry={starnessRegistry}
+                          store={stateStoreRef.current}
+                          handlers={{
+                            send_event: async (params: Record<string, unknown>) => {
+                              const evName = String(params.event ?? "");
+                              const explicitPayload =
+                                params.payload && typeof params.payload === "object"
+                                  ? (params.payload as Record<string, unknown>)
+                                  : {};
+                              const liveState = stateStoreRef.current.getSnapshot();
+                              const mergedPayload: Record<string, unknown> = {
+                                ...explicitPayload,
+                              };
+                              for (const [k, v] of Object.entries(liveState)) {
+                                if (
+                                  !(k in mergedPayload) &&
+                                  JSON.stringify(snapshot.context?.[k]) !== JSON.stringify(v)
+                                ) {
+                                  mergedPayload[k] = v;
+                                }
+                              }
+                              await handleDispatchEvent(evName, mergedPayload);
+                            },
+                          }}
+                        >
+                          <Renderer spec={snapshot.ui} registry={starnessRegistry} />
+                        </JSONUIProvider>
+                      </LiveTracesContext.Provider>
+                    </UploadFileContext.Provider>
                   ) : snapshot.status === "waiting" ? (
                     <FallbackEventForm
                       allowedEvents={snapshot.allowed_events ?? []}

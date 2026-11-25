@@ -217,6 +217,105 @@ describe("PromptInputView", () => {
     fireEvent.click(screen.getByRole("button", { name: /Stop/i }));
     expect(onDispatch).toHaveBeenCalledWith("INTERRUPT", {});
   });
+
+  it("accepts drag-and-drop file attachments, uploads them on submit, and supports removal", async () => {
+    const uploaded = {
+      path: "/tmp/starness-uploads/inst-1/1-screenshot.png",
+      name: "screenshot.png",
+      mime: "image/png",
+      size: 9,
+    };
+    const onUploadFile = vi.fn().mockResolvedValue(uploaded);
+    const onDispatch = vi.fn().mockResolvedValue(undefined);
+
+    // jsdom does not implement fetch("blob:..."); provide a tiny data URL shim for createObjectURL
+    const origCreateObjectURL = URL.createObjectURL;
+    const origRevokeObjectURL = URL.revokeObjectURL;
+    URL.createObjectURL = vi.fn(() => "data:image/png;base64,aGVsbG8gcG5n");
+    URL.revokeObjectURL = vi.fn();
+
+    try {
+      render(
+        <TooltipProvider>
+          <PromptInputView
+            label="Prompt"
+            placeholder="Drop files here"
+            submitEvent="PROMPT"
+            fieldName="text"
+            allowAttachments
+            onUploadFile={onUploadFile}
+            onDispatch={onDispatch}
+          />
+        </TooltipProvider>,
+      );
+
+      const textarea = screen.getByPlaceholderText("Drop files here");
+      const form = textarea.closest("form")!;
+
+      const file = new File(["hello png"], "screenshot.png", { type: "image/png" });
+      const dropEv = new Event("drop", { bubbles: true, cancelable: true });
+      Object.defineProperty(dropEv, "dataTransfer", {
+        value: { types: ["Files"], files: [file] },
+      });
+      act(() => {
+        form.dispatchEvent(dropEv);
+      });
+
+      expect(screen.getByTestId("prompt-attachment-chip")).toHaveTextContent("screenshot.png");
+
+      // Test removal button works
+      fireEvent.click(screen.getByRole("button", { name: "Remove screenshot.png" }));
+      expect(screen.queryByTestId("prompt-attachment-chip")).not.toBeInTheDocument();
+
+      // Re-drop and submit without text (attachment-only prompt)
+      const dropEv2 = new Event("drop", { bubbles: true, cancelable: true });
+      Object.defineProperty(dropEv2, "dataTransfer", {
+        value: { types: ["Files"], files: [file] },
+      });
+      act(() => {
+        form.dispatchEvent(dropEv2);
+      });
+      expect(screen.getByTestId("prompt-attachment-chip")).toHaveTextContent("screenshot.png");
+
+      fireEvent.submit(form);
+
+      await waitFor(() => {
+        expect(onUploadFile).toHaveBeenCalledTimes(1);
+        expect(onDispatch).toHaveBeenCalledWith("PROMPT", {
+          text: "",
+          files: [uploaded],
+        });
+      });
+      const [blobArg, nameArg, mimeArg] = onUploadFile.mock.calls[0];
+      expect(blobArg).toBeInstanceOf(Blob);
+      expect(nameArg).toBe("screenshot.png");
+      expect(mimeArg).toBe("image/png");
+    } finally {
+      URL.createObjectURL = origCreateObjectURL;
+      URL.revokeObjectURL = origRevokeObjectURL;
+    }
+  });
+});
+
+describe("ConversationView attachments", () => {
+  it("renders attachment badges on user messages", () => {
+    render(
+      <TooltipProvider>
+        <ConversationView
+          title="Chat"
+          messages={[
+            {
+              role: "user",
+              text: "Check this screenshot",
+              attachments: [{ path: "/tmp/shot.png", name: "shot.png", mime: "image/png" }],
+            },
+          ]}
+        />
+      </TooltipProvider>,
+    );
+    expect(screen.getByText("shot.png")).toBeInTheDocument();
+    expect(screen.getByText("Check this screenshot")).toBeInTheDocument();
+  });
 });
 
 describe("JSONUIProvider state-transition stability", () => {
@@ -289,5 +388,42 @@ describe("JSONUIProvider state-transition stability", () => {
     const logElAfter = screen.getByRole("log");
     expect(logElAfter).toBe(logElBefore);
     expect(screen.getByText("World")).toBeInTheDocument();
+  });
+
+  it("stays at current scrollTop when new messages arrive instead of yanking to bottom", () => {
+    const { rerender } = render(
+      <TooltipProvider>
+        <ConversationView
+          title="Chat"
+          messages={[
+            { role: "user", text: "First" },
+            { role: "assistant", text: "Reply 1" },
+          ]}
+        />
+      </TooltipProvider>,
+    );
+
+    const logEl = screen.getByRole("log");
+    const scroller = logEl.firstElementChild as HTMLElement;
+    Object.defineProperty(scroller, "scrollHeight", { value: 1200, configurable: true });
+    Object.defineProperty(scroller, "clientHeight", { value: 400, configurable: true });
+    scroller.scrollTop = 120;
+    fireEvent.scroll(scroller);
+
+    // Rerender with an additional message — scrollTop must remain at 120
+    rerender(
+      <TooltipProvider>
+        <ConversationView
+          title="Chat"
+          messages={[
+            { role: "user", text: "First" },
+            { role: "assistant", text: "Reply 1" },
+            { role: "assistant", text: "Reply 2 (longer)" },
+          ]}
+        />
+      </TooltipProvider>,
+    );
+
+    expect(scroller.scrollTop).toBe(120);
   });
 });

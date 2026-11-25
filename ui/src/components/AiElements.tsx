@@ -4,7 +4,9 @@ import {
   Circle,
   Loader2,
   MessageSquare,
+  Paperclip,
   Square,
+  X,
   XCircle,
 } from "lucide-react";
 import type { DynamicToolUIPart } from "ai";
@@ -28,6 +30,7 @@ import {
   PromptInputSubmit,
   PromptInputTextarea,
   PromptInputTools,
+  usePromptInputAttachments,
 } from "@/components/ai-elements/prompt-input";
 import {
   Reasoning,
@@ -55,7 +58,7 @@ import {
   ToolInput,
   ToolOutput,
 } from "@/components/ai-elements/tool";
-import type { TraceRecord } from "../api";
+import type { TraceRecord, UploadedFile } from "../api";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -107,6 +110,7 @@ export interface NormalizedMessage {
   text: string;
   reasoning?: string;
   toolCalls: NormalizedToolCall[];
+  attachments?: string[];
   toolName?: string;
   callId?: string;
 }
@@ -115,14 +119,16 @@ function extractGenaiParts(content: unknown): {
   text: string[];
   reasoning: string[];
   toolCalls: NormalizedToolCall[];
+  attachments: string[];
 } {
   const text: string[] = [];
   const reasoning: string[] = [];
   const toolCalls: NormalizedToolCall[] = [];
+  const attachments: string[] = [];
 
   if (typeof content === "string") {
     if (content) text.push(content);
-    return { text, reasoning, toolCalls };
+    return { text, reasoning, toolCalls, attachments };
   }
 
   const parts = Array.isArray(content) ? content : [];
@@ -149,11 +155,18 @@ function extractGenaiParts(content: unknown): {
         status: "ok",
         arguments: tc.fn_arguments ?? tc.arguments ?? tc.args,
       });
+    } else if (obj.Binary && typeof obj.Binary === "object") {
+      const bin = obj.Binary as Record<string, unknown>;
+      const label =
+        (typeof bin.name === "string" && bin.name) ||
+        (typeof bin.content_type === "string" && bin.content_type) ||
+        "attachment";
+      attachments.push(label);
     } else if (typeof obj.text === "string") {
       text.push(obj.text);
     }
   }
-  return { text, reasoning, toolCalls };
+  return { text, reasoning, toolCalls, attachments };
 }
 
 /**
@@ -200,9 +213,14 @@ export function normalizeMessages(raw: unknown): NormalizedMessage[] {
     if (!item || typeof item !== "object") continue;
     const obj = item as Record<string, unknown>;
 
-    // Unwrap @starness/llm lossless `$starness_llm_msg` envelope
-    if (obj.$starness_llm_msg && typeof obj.$starness_llm_msg === "object") {
-      const inner = obj.$starness_llm_msg as Record<string, unknown>;
+    // Unwrap @starness/llm lossless `$starness_llm_msg` envelope or typed `LlmMessage.raw`
+    const lossless =
+      (obj.$starness_llm_msg && typeof obj.$starness_llm_msg === "object"
+        ? (obj.$starness_llm_msg as Record<string, unknown>)
+        : null) ??
+      (obj.raw && typeof obj.raw === "object" ? (obj.raw as Record<string, unknown>) : null);
+    if (lossless) {
+      const inner = lossless;
       const roleRaw = String(inner.role ?? "assistant").toLowerCase();
       const role =
         roleRaw === "user"
@@ -218,6 +236,7 @@ export function normalizeMessages(raw: unknown): NormalizedMessage[] {
         text: extracted.text.join("\n"),
         reasoning: extracted.reasoning.length > 0 ? extracted.reasoning.join("\n") : undefined,
         toolCalls: extracted.toolCalls,
+        attachments: extracted.attachments.length > 0 ? extracted.attachments : undefined,
       });
       continue;
     }
@@ -300,11 +319,26 @@ export function normalizeMessages(raw: unknown): NormalizedMessage[] {
       });
     }
 
+    const attachments: string[] = [];
+    if (Array.isArray(obj.attachments)) {
+      for (const att of obj.attachments) {
+        if (!att || typeof att !== "object") continue;
+        const a = att as Record<string, unknown>;
+        const label =
+          (typeof a.name === "string" && a.name) ||
+          (typeof a.path === "string" && a.path.split(/[\\/]/).pop()) ||
+          (typeof a.url === "string" && a.url) ||
+          "attachment";
+        attachments.push(label);
+      }
+    }
+
     out.push({
       role,
       text,
       reasoning,
       toolCalls,
+      attachments: attachments.length > 0 ? attachments : undefined,
     });
   }
 
@@ -657,6 +691,19 @@ export function ConversationView({
                       {msg.reasoning && (
                         <ReasoningView title="Thinking" content={msg.reasoning} />
                       )}
+                      {msg.attachments && msg.attachments.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5 mb-1">
+                          {msg.attachments.map((att, aIdx) => (
+                            <span
+                              key={aIdx}
+                              className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/60 px-2 py-0.5 text-[11px] font-mono text-muted-foreground"
+                            >
+                              <Paperclip className="size-3 shrink-0" />
+                              <span className="truncate max-w-[200px]">{att}</span>
+                            </span>
+                          ))}
+                        </div>
+                      )}
                       {msg.text && <MessageResponse>{msg.text}</MessageResponse>}
                       {msg.toolCalls.length > 0 && (
                         <div className="flex flex-col gap-2 w-full">
@@ -718,6 +765,79 @@ export function ConversationView({
 
 // ── 6. PromptInput (shadcn AI Elements <PromptInput>) ────────────────────────
 
+export type UploadFileFn = (
+  file: Blob,
+  filename: string,
+  mime?: string,
+) => Promise<UploadedFile>;
+
+export const UploadFileContext = createContext<UploadFileFn | null>(null);
+
+async function filePartToBlob(url: string, mediaType?: string): Promise<Blob> {
+  if (url.startsWith("data:")) {
+    const commaIdx = url.indexOf(",");
+    if (commaIdx !== -1) {
+      const header = url.slice(5, commaIdx);
+      const data = url.slice(commaIdx + 1);
+      const mime = mediaType || header.split(";")[0] || "application/octet-stream";
+      if (header.includes(";base64")) {
+        const binary = atob(data);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        return new Blob([bytes], { type: mime });
+      }
+      return new Blob([decodeURIComponent(data)], { type: mime });
+    }
+  }
+  const res = await fetch(url);
+  return res.blob();
+}
+
+function PromptAttachmentsBar() {
+  const { files, remove } = usePromptInputAttachments();
+  if (files.length === 0) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 w-full px-3 pt-2.5">
+      {files.map((file) => (
+        <span
+          key={file.id}
+          data-testid="prompt-attachment-chip"
+          className="inline-flex items-center gap-1.5 rounded-md border border-border bg-muted/70 px-2 py-1 text-xs text-foreground"
+        >
+          <Paperclip className="size-3 text-muted-foreground shrink-0" />
+          <span className="truncate max-w-[180px] font-mono text-[11px]">
+            {file.filename || "attachment"}
+          </span>
+          <button
+            type="button"
+            aria-label={`Remove ${file.filename || "attachment"}`}
+            onClick={() => remove(file.id)}
+            className="rounded p-0.5 text-muted-foreground hover:text-foreground hover:bg-muted cursor-pointer"
+          >
+            <X className="size-3" />
+          </button>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function PromptAttachButton() {
+  const { openFileDialog } = usePromptInputAttachments();
+  return (
+    <PromptInputButton
+      variant="ghost"
+      aria-label="Attach files"
+      title="Attach files (or drag & drop)"
+      onClick={() => openFileDialog()}
+    >
+      <Paperclip className="size-3.5" />
+    </PromptInputButton>
+  );
+}
+
 export function PromptInputView({
   label,
   placeholder,
@@ -725,6 +845,9 @@ export function PromptInputView({
   fieldName = "text",
   interruptEvent,
   interruptLabel,
+  allowAttachments = false,
+  accept,
+  onUploadFile,
   onDispatch,
 }: {
   label?: string;
@@ -734,45 +857,123 @@ export function PromptInputView({
   fieldName?: string;
   interruptEvent?: string;
   interruptLabel?: string;
+  allowAttachments?: boolean;
+  accept?: string;
+  onUploadFile?: UploadFileFn;
   onDispatch: (event: string, payload: Record<string, unknown>) => Promise<void> | void;
 }) {
+  const ctxUploadFile = useContext(UploadFileContext);
+  const uploadFile = onUploadFile ?? ctxUploadFile;
   const [status, setStatus] = useState<"ready" | "submitted">("ready");
+  const [isDragging, setIsDragging] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
 
   return (
-    <div className="space-y-1.5">
+    <div
+      className="space-y-1.5"
+      onDragEnter={(e) => {
+        if (!allowAttachments) return;
+        if (e.dataTransfer?.types?.includes("Files")) {
+          setIsDragging(true);
+        }
+      }}
+      onDragOver={(e) => {
+        if (!allowAttachments) return;
+        if (e.dataTransfer?.types?.includes("Files")) {
+          e.preventDefault();
+          setIsDragging(true);
+        }
+      }}
+      onDragLeave={(e) => {
+        if (!allowAttachments) return;
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+          setIsDragging(false);
+        }
+      }}
+      onDrop={() => {
+        setIsDragging(false);
+      }}
+    >
       {label && <div className="text-xs font-medium text-muted-foreground">{label}</div>}
-      <PromptInput
-        onSubmit={async (msg) => {
-          const trimmed = msg.text.trim();
-          if (!trimmed) return;
-          setStatus("submitted");
-          try {
-            await onDispatch(submitEvent, { [fieldName]: trimmed });
-          } finally {
-            setStatus("ready");
-          }
-        }}
+      <div
+        className={
+          isDragging
+            ? "rounded-xl ring-2 ring-sky-400/80 ring-offset-2 ring-offset-background transition"
+            : "transition"
+        }
       >
-        <PromptInputBody>
-          <PromptInputTextarea
-            placeholder={placeholder || "What would you like to do?"}
-          />
-        </PromptInputBody>
-        <PromptInputFooter>
-          <PromptInputTools>
-            {interruptEvent && (
-              <PromptInputButton
-                variant="ghost"
-                onClick={() => void onDispatch(interruptEvent, {})}
-              >
-                <Square className="size-3.5 text-destructive" />
-                <span>{interruptLabel || "Stop"}</span>
-              </PromptInputButton>
-            )}
-          </PromptInputTools>
-          <PromptInputSubmit status={status} />
-        </PromptInputFooter>
-      </PromptInput>
+        <PromptInput
+          accept={accept}
+          multiple={allowAttachments}
+          onSubmit={async (msg) => {
+            const trimmed = msg.text.trim();
+            const rawFiles = allowAttachments ? msg.files : [];
+            if (!trimmed && rawFiles.length === 0) return;
+
+            setUploadError(null);
+            setStatus("submitted");
+            try {
+              const uploaded: UploadedFile[] = [];
+              if (rawFiles.length > 0) {
+                if (!uploadFile) {
+                  throw new Error("File upload handler is not configured");
+                }
+                for (const part of rawFiles) {
+                  const blob = await filePartToBlob(part.url, part.mediaType);
+                  const saved = await uploadFile(
+                    blob,
+                    part.filename || "upload.bin",
+                    part.mediaType,
+                  );
+                  uploaded.push(saved);
+                }
+              }
+              const payload: Record<string, unknown> = { [fieldName]: trimmed };
+              if (uploaded.length > 0) {
+                payload.files = uploaded;
+              }
+              await onDispatch(submitEvent, payload);
+            } catch (err) {
+              setUploadError(err instanceof Error ? err.message : String(err));
+              throw err;
+            } finally {
+              setStatus("ready");
+            }
+          }}
+        >
+          {allowAttachments && <PromptAttachmentsBar />}
+          <PromptInputBody>
+            <PromptInputTextarea
+              placeholder={
+                isDragging
+                  ? "Drop files to attach…"
+                  : placeholder ||
+                    (allowAttachments
+                      ? "Message… (drag & drop files or click paperclip)"
+                      : "What would you like to do?")
+              }
+            />
+          </PromptInputBody>
+          <PromptInputFooter>
+            <PromptInputTools>
+              {allowAttachments && <PromptAttachButton />}
+              {interruptEvent && (
+                <PromptInputButton
+                  variant="ghost"
+                  onClick={() => void onDispatch(interruptEvent, {})}
+                >
+                  <Square className="size-3.5 text-destructive" />
+                  <span>{interruptLabel || "Stop"}</span>
+                </PromptInputButton>
+              )}
+            </PromptInputTools>
+            <PromptInputSubmit status={status} />
+          </PromptInputFooter>
+        </PromptInput>
+      </div>
+      {uploadError && (
+        <div className="text-xs text-rose-400">Upload failed: {uploadError}</div>
+      )}
     </div>
   );
 }
