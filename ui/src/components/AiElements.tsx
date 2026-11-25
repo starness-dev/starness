@@ -551,18 +551,17 @@ export const LiveTracesContext = createContext<LiveTracesContextValue>({
 });
 
 function extractActiveStream(traces: TraceRecord[]) {
-  let startIdx = -1;
+  let startIdx = 0;
   for (let i = traces.length - 1; i >= 0; i--) {
     if (traces[i].kind === "service_finished") {
       // Latest invocation already finished; no in-flight stream
       return null;
     }
-    if (traces[i].kind === "service_started") {
+    if (traces[i].kind === "service_started" || traces[i].kind === "transition") {
       startIdx = i;
       break;
     }
   }
-  if (startIdx < 0) return null;
 
   const recent = traces.slice(startIdx).filter((r) => r.kind === "service_progress");
   if (recent.length === 0) return null;

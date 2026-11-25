@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { defineRegistry, useActions, useStateStore } from "@json-render/react";
 import { starnessCatalog } from "./catalog";
 import { MarkdownReviewView, renderInlineMarkdown } from "./components/MarkdownReview";
@@ -271,6 +272,27 @@ export const { registry: starnessRegistry } = defineRegistry(starnessCatalog, {
     Button: ({ props }) => {
       const { execute } = useActions();
       const style = BUTTON_VARIANTS[props.variant ?? "primary"] ?? BUTTON_VARIANTS.primary;
+      const shortcut = props.shortcut?.trim();
+
+      useEffect(() => {
+        if (!shortcut) return;
+        const targetKey = shortcut.toLowerCase() === "esc" ? "escape" : shortcut.toLowerCase();
+        const onKeyDown = (e: KeyboardEvent) => {
+          if (e.key.toLowerCase() !== targetKey) return;
+          const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase();
+          if (targetKey !== "escape" && (tag === "input" || tag === "textarea" || tag === "select")) {
+            return;
+          }
+          e.preventDefault();
+          void execute({
+            action: "send_event",
+            params: { event: props.event, payload: props.payload ?? {} },
+          });
+        };
+        window.addEventListener("keydown", onKeyDown);
+        return () => window.removeEventListener("keydown", onKeyDown);
+      }, [shortcut, execute, props.event, props.payload]);
+
       return (
         <button
           type="button"
@@ -280,9 +302,14 @@ export const { registry: starnessRegistry } = defineRegistry(starnessCatalog, {
               params: { event: props.event, payload: props.payload ?? {} },
             })
           }
-          className={`self-start inline-flex items-center justify-center rounded-lg border px-3.5 py-1.5 text-xs font-medium transition cursor-pointer ${style}`}
+          className={`self-start inline-flex items-center justify-center gap-1.5 rounded-lg border px-3.5 py-1.5 text-xs font-medium transition cursor-pointer ${style}`}
         >
-          {props.label}
+          <span>{props.label}</span>
+          {shortcut && (
+            <kbd className="rounded bg-black/25 px-1.5 py-0.5 font-mono text-[10px] opacity-80">
+              {shortcut}
+            </kbd>
+          )}
         </button>
       );
     },

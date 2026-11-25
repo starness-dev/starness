@@ -128,7 +128,7 @@ export function App() {
     const unsub = subscribeInstanceTrace(selectedMachine, selectedInstanceId, (rec) => {
       setTraces((prev) => {
         if (prev.some((p) => p.seq === rec.seq)) return prev;
-        return [...prev.slice(-400), rec];
+        return [...prev.slice(-2000), rec];
       });
       if (rec.kind === "transition" || rec.kind === "started" || rec.kind === "stopped" || rec.kind === "error") {
         void refreshSnapshot(selectedMachine, selectedInstanceId);
@@ -174,7 +174,11 @@ export function App() {
       try {
         const updated = await sendEvent(selectedMachine, selectedInstanceId, eventType, payload);
         setSnapshot(updated);
-        stateStoreRef.current = createStateStore({ ...(updated.context ?? {}) });
+        const updates: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(updated.context ?? {})) {
+          updates[`/${k}`] = v;
+        }
+        stateStoreRef.current.update(updates);
         await refreshInstances(selectedMachine);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));

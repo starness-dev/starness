@@ -109,8 +109,9 @@ export const starnessCatalog = defineCatalog(schema, {
         event: z.string(),
         payload: z.record(z.string(), z.unknown()).optional(),
         variant: z.enum(["primary", "secondary", "danger", "ghost"]).optional(),
+        shortcut: z.string().optional(),
       }),
-      description: "Interactive button dispatching a Starness statechart event.",
+      description: "Interactive button dispatching a Starness statechart event, with optional keyboard shortcut (e.g. 'Esc').",
     },
     MarkdownReview: {
       props: z.object({
