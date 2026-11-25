@@ -66,7 +66,7 @@ def http_request(
 
 def invoke_http(
     *,
-    request: HttpRequest | typing.Callable,
+    request: HttpRequest | typing.Callable[[typing.Any], HttpRequest],
     id: str | None = None,
     on_done = None,
     on_error = None,
@@ -114,9 +114,28 @@ def exec_spec(
         check = check,
     )
 
+ExecResult = record(
+    code = int,
+    stdout = str,
+    stderr = str,
+    ok = bool,
+)
+
+def exec_result(event: dict) -> ExecResult:
+    out = event.get("output") if "output" in event else event
+    if type(out) != "dict":
+        fail("exec_result: event missing `output` dict")
+    code = int(out.get("code", 0))
+    return ExecResult(
+        code = code,
+        stdout = str(out.get("stdout", "")),
+        stderr = str(out.get("stderr", "")),
+        ok = bool(out.get("ok", code == 0)),
+    )
+
 def invoke_cmd(
     *,
-    cmd: list[str] | ExecSpec | typing.Callable,
+    cmd: list[str] | ExecSpec | typing.Callable[[typing.Any], list[str] | ExecSpec],
     id: str | None = None,
     cwd: str | None = None,
     env: dict[str, str | Secret] = {},
@@ -307,8 +326,8 @@ def codex_agent(
 def invoke_agent(
     *,
     agent: AcpAgent,
-    prompt: str | typing.Callable,
-    context = None,
+    prompt: str | typing.Callable[[typing.Any], str],
+    context: dict | typing.Callable[[typing.Any], dict] | None = None,
     tools: list[AgentTool] = [],
     id: str | None = None,
     on_done = None,
@@ -422,11 +441,29 @@ def mcp_server(
         )
     fail("mcp_server requires either `command` (stdio) or `url` (http)")
 
+McpResult = record(
+    tool = str,
+    is_error = bool,
+    text = str,
+    data = typing.Any,
+)
+
+def mcp_result(event: dict) -> McpResult:
+    out = event.get("output") if "output" in event else event
+    if type(out) != "dict":
+        fail("mcp_result: event missing `output` dict")
+    return McpResult(
+        tool = str(out.get("tool", "")),
+        is_error = bool(out.get("is_error", False)),
+        text = str(out.get("text", "")),
+        data = out.get("data", None),
+    )
+
 def invoke_mcp(
     *,
-    server: McpServer | typing.Callable,
-    tool: str | typing.Callable,
-    arguments = {},
+    server: McpServer | typing.Callable[[typing.Any], McpServer],
+    tool: str | typing.Callable[[typing.Any], str],
+    arguments: dict | typing.Callable[[typing.Any], dict] = {},
     check_tool_error: bool = True,
     id: str | None = None,
     on_done = None,
@@ -700,8 +737,8 @@ def cloudflare_decision(
 
 def invoke_decision(
     *,
-    provider: DecisionProvider | typing.Callable,
-    evidence,
+    provider: DecisionProvider | typing.Callable[[typing.Any], DecisionProvider],
+    evidence: dict | str | typing.Callable[[typing.Any], typing.Any],
     questions: dict[str, DecisionQuestion],
     images = None,
     timeout_ms: int = 15000,
@@ -948,6 +985,12 @@ def assistant_msg(
                 }
     fail("assistant_msg expects a string or an @starness/llm `on_done` event dict")
 
+ToolCall = record(
+    id = str,
+    name = str,
+    args = dict,
+)
+
 def tool_result(
     call_or_id,
     content,
@@ -957,7 +1000,11 @@ def tool_result(
 ) -> dict:
     call_id = ""
     resolved_fn = fn_name
-    if type(call_or_id) == "dict":
+    if type(call_or_id) == "record":
+        call_id = str(call_or_id.id)
+        if resolved_fn == None:
+            resolved_fn = str(call_or_id.name)
+    elif type(call_or_id) == "dict":
         raw_id = call_or_id.get("id")
         call_id = str(raw_id) if raw_id != None else ""
         if resolved_fn == None:
@@ -1012,10 +1059,10 @@ def tool_def(
 
 def invoke_llm(
     *,
-    model: LlmModel | str | typing.Callable,
-    prompt: str | typing.Callable | None = None,
-    messages: list | typing.Callable | None = None,
-    system: str | typing.Callable | None = None,
+    model: LlmModel | str | typing.Callable[[typing.Any], LlmModel | str],
+    prompt: str | typing.Callable[[typing.Any], str] | None = None,
+    messages: list | typing.Callable[[typing.Any], list] | None = None,
+    system: str | typing.Callable[[typing.Any], str] | None = None,
     system_cache: CachePolicy | str | None = None,
     context = None,
     tools: list = [],
@@ -1067,17 +1114,30 @@ def llm_text(event: dict) -> str:
     txt = out.get("text")
     return str(txt) if txt != None else ""
 
-def llm_tool_calls(event: dict) -> list[dict]:
+def llm_tool_calls(event: dict) -> list[ToolCall]:
     out = event.get("output") if "output" in event else event
     if type(out) != "dict":
         fail("llm_tool_calls: event missing `output` dict")
-    calls = out.get("tool_calls")
-    return calls if calls != None else []
+    raw_calls = out.get("tool_calls")
+    if raw_calls == None:
+        return []
+    typed = []
+    for c in raw_calls:
+        if type(c) == "record":
+            typed.append(c)
+        elif type(c) == "dict":
+            raw_args = c.get("args", {})
+            typed.append(ToolCall(
+                id = str(c.get("id", "")),
+                name = str(c.get("name", "")),
+                args = raw_args if type(raw_args) == "dict" else {},
+            ))
+    return typed
 
 def has_tool_calls(event: dict) -> bool:
     return len(llm_tool_calls(event)) > 0
 
-def llm_tool_call(event: dict) -> dict | None:
+def llm_tool_call(event: dict) -> ToolCall | None:
     calls = llm_tool_calls(event)
     return calls[0] if len(calls) > 0 else None
 "#;

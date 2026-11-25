@@ -91,6 +91,34 @@ pub type GuardCallable<'v> = StarlarkCallable<'v, (FrozenValue, FrozenValue), bo
 /// Statically typed `(ctx, event) -> dict | record` Starlark assign reducer callable.
 pub type AssignCallable<'v> = StarlarkCallable<'v, (FrozenValue, FrozenValue), DictOrRecord>;
 
+/// Statically typed `(ctx) -> list` callable for `invoke_all(items = ...)`.
+pub type BatchItemsCallable<'v> = StarlarkCallable<'v, (FrozenValue,), Vec<FrozenValue>>;
+
+/// Polymorphic `items` input accepted by `invoke_all(items = ...)`: either a static list of
+/// `batch_item(...)` dicts or a 1-arg `(ctx) -> list` callable.
+pub struct BatchItemsInput<'v>(pub Value<'v>);
+
+impl<'v> StarlarkTypeRepr for BatchItemsInput<'v> {
+    type Canonical = Self;
+
+    fn starlark_type_repr() -> Ty {
+        Ty::union2(Ty::list(Ty::any()), BatchItemsCallable::starlark_type_repr())
+    }
+}
+
+impl<'v> UnpackValue<'v> for BatchItemsInput<'v> {
+    type Error = starlark::Error;
+
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        if starlark::values::list::ListRef::from_value(value).is_some()
+            || matches!(BatchItemsCallable::unpack_value_impl(value), Ok(Some(_)))
+        {
+            return Ok(Some(Self(value)));
+        }
+        Ok(None)
+    }
+}
+
 /// Type marker representing `int | float` for dynamic delay callables `(ctx, event) -> ms`.
 pub struct IntOrFloat;
 

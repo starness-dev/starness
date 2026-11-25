@@ -894,4 +894,77 @@ chart = machine(
             "string"
         );
     }
+
+    #[test]
+    fn static_typechecker_rejects_wrong_arity_on_invoke_callbacks_and_misspelled_tool_call_fields() {
+        // 1. `invoke_all(items = ...)` must reject a 2-arg `(ctx, ev)` callback statically
+        let bad_batch_arity = r#"
+S = state_space("acting", "done")
+def bad_items(ctx, ev) -> list[dict]:
+    return []
+chart: StateMachine = machine(
+    id = "bad_batch",
+    initial = S.acting,
+    context = {},
+    states = {
+        S.acting: state(
+            invoke = invoke_all(items = bad_items, on_done = S.done),
+        ),
+        S.done: final_state(),
+    },
+)
+"#;
+        let err = compile_starlark_str("bad_batch.star", bad_batch_arity, None)
+            .expect_err("2-arg invoke_all items callback must fail static typecheck");
+        assert!(
+            matches!(err, ChartCompileError::Typecheck(_)),
+            "expected Typecheck error, got {err:?}"
+        );
+
+        // 2. `invoke_llm(messages = ...)` must reject a 2-arg `(ctx, ev)` callback statically
+        let bad_llm_arity = r#"
+load("@starness/llm", "invoke_llm", "llm_model")
+S = state_space("thinking", "done")
+def bad_msgs(ctx, ev) -> list:
+    return []
+chart: StateMachine = machine(
+    id = "bad_llm",
+    initial = S.thinking,
+    context = {},
+    states = {
+        S.thinking: state(
+            invoke = invoke_llm(model = llm_model("gpt-6-luna"), messages = bad_msgs, on_done = S.done),
+        ),
+        S.done: final_state(),
+    },
+)
+"#;
+        let err2 = compile_starlark_str("bad_llm.star", bad_llm_arity, None)
+            .expect_err("2-arg invoke_llm messages callback must fail static typecheck");
+        assert!(
+            matches!(err2, ChartCompileError::Typecheck(_)),
+            "expected Typecheck error, got {err2:?}"
+        );
+
+        // 3. `llm_tool_calls(ev)` returns typed `list[ToolCall]` — accessing `.arguments` must fail statically
+        let bad_tool_call_field = r#"
+load("@starness/llm", "llm_tool_calls")
+S = state_space("done")
+def inspect(ev: dict) -> dict:
+    calls = llm_tool_calls(ev)
+    return calls[0].arguments
+chart: StateMachine = machine(
+    id = "bad_field",
+    initial = S.done,
+    context = {},
+    states = { S.done: final_state() },
+)
+"#;
+        let err3 = compile_starlark_str("bad_field.star", bad_tool_call_field, None)
+            .expect_err("misspelled `.arguments` on ToolCall must fail static typecheck");
+        assert!(
+            matches!(err3, ChartCompileError::Typecheck(_)),
+            "expected Typecheck error, got {err3:?}"
+        );
+    }
 }

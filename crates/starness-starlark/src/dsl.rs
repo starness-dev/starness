@@ -21,7 +21,8 @@ use crate::schema::{
 };
 use crate::types::{
     ActionDataGen, ActionInput, AfterDataGen, AgentToolDataGen, ArtifactMode, AssignCallable,
-    DelayInput, GuardExprGen, GuardInput, InvokeDataGen, InvokeInputGen, InvokeOutcomesInput,
+    BatchItemsInput, DelayInput, GuardExprGen, GuardInput, InvokeDataGen, InvokeInputGen,
+    InvokeOutcomesInput,
     JsonHolder, NodeKindDataGen, OneOrManyAfter, OneOrManyInvoke, OutcomeDataGen, StarlarkAction,
     StarlarkAfter, StarlarkAgentTool, StarlarkGuard, StarlarkInvoke, StarlarkMachine,
     StarlarkOutcome, StarlarkSecret, StarlarkStateId, StarlarkStateNode, StarlarkStateSpace,
@@ -512,7 +513,7 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
 
     /// Declares a bounded-concurrency fan-out/fan-in invocation over `exec`, `http`, or `mcp` items.
     fn invoke_all<'v>(
-        #[starlark(require = named)] items: Value<'v>,
+        #[starlark(require = named)] items: BatchItemsInput<'v>,
         #[starlark(require = named, default = NoneOr::None)] id: NoneOr<&str>,
         #[starlark(require = named, default = 4)] max_concurrency: i32,
         #[starlark(require = named, default = NoneOr::None)] on_done: NoneOr<
@@ -531,7 +532,7 @@ pub fn register_dsl(builder: &mut GlobalsBuilder) {
         {
             bail!("invoke_all `id` must not be empty");
         }
-        let items_input = unpack_invoke_input_value(items)?;
+        let items_input = unpack_invoke_input_value(items.0)?;
         let input_data = InvokeInputGen::Object(vec![
             ("items".to_owned(), items_input),
             (
