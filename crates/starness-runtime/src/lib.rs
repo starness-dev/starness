@@ -2731,7 +2731,7 @@ chart = machine(
         });
 
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/checkout_http.star");
+            .join("../../bins/starness-cli/tests/fixtures/checkout_http.star");
         let mut chart = compile_starlark_file(path, None).expect("checkout_http.star must compile");
         chart.ir.context["api_base"] = json!(format!("http://127.0.0.1:{port}"));
 

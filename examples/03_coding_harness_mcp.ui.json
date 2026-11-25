@@ -1,0 +1,144 @@
+{
+  "machine": "coding_harness_mcp",
+  "views": {
+    "gather_input": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["header_card", "transcript", "prompt_bar", "actions"]
+        },
+        "header_card": {
+          "type": "Card",
+          "props": { "title": "03 — Coding Harness + Remote MCP (@starness/mcp + @starness/decide)" },
+          "children": ["meta_kv"]
+        },
+        "meta_kv": {
+          "type": "KeyValue",
+          "props": {
+            "items": {
+              "model": { "$state": "/model" },
+              "mcp_server": { "$state": "/mcp_name" },
+              "mcp_url": { "$state": "/mcp_url" },
+              "tool_runs": { "$state": "/tool_runs" },
+              "last_decision": { "$state": "/last_decision" }
+            }
+          }
+        },
+        "transcript": {
+          "type": "Conversation",
+          "props": {
+            "title": "Conversation",
+            "messages": { "$state": "/messages" },
+            "empty_text": "Ask the harness to check Linear issues via MCP or inspect the repo with bash."
+          }
+        },
+        "prompt_bar": {
+          "type": "PromptInput",
+          "props": {
+            "label": "Message",
+            "placeholder": "e.g. List our Linear teams and check git status… (/exit to quit)",
+            "submit_event": "PROMPT",
+            "submit_label": "Send",
+            "field_name": "text"
+          }
+        },
+        "actions": {
+          "type": "Stack",
+          "props": { "direction": "horizontal", "gap": "sm" },
+          "children": ["btn_exit"]
+        },
+        "btn_exit": {
+          "type": "Button",
+          "props": { "label": "Exit Session", "event": "EXIT", "variant": "secondary" }
+        }
+      }
+    },
+    "awaiting_approval": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["warn_alert", "transcript", "pending_table", "actions"]
+        },
+        "warn_alert": {
+          "type": "Alert",
+          "props": {
+            "title": "Tool / MCP Permission Required",
+            "message": "@starness/decide routed these local/MCP tool calls for human approval.",
+            "variant": "warning"
+          }
+        },
+        "transcript": {
+          "type": "Conversation",
+          "props": {
+            "title": "Conversation",
+            "messages": { "$state": "/messages" }
+          }
+        },
+        "pending_table": {
+          "type": "Table",
+          "props": {
+            "title": "Actions Awaiting Approval",
+            "columns": ["Tool", "Action", "Decision"],
+            "rows": { "$state": "/approval_rows" }
+          }
+        },
+        "actions": {
+          "type": "Stack",
+          "props": { "direction": "horizontal", "gap": "sm" },
+          "children": ["btn_approve", "btn_deny", "btn_interrupt"]
+        },
+        "btn_approve": {
+          "type": "Button",
+          "props": { "label": "Approve & Run", "event": "APPROVE", "variant": "primary" }
+        },
+        "btn_deny": {
+          "type": "Button",
+          "props": { "label": "Deny", "event": "DENY", "variant": "danger" }
+        },
+        "btn_interrupt": {
+          "type": "Button",
+          "props": { "label": "Interrupt", "event": "INTERRUPT", "variant": "secondary" }
+        }
+      }
+    },
+    "working": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["status_card", "transcript", "actions"]
+        },
+        "status_card": {
+          "type": "Card",
+          "props": { "title": "Coding + MCP Harness Working…" },
+          "children": ["status_badge"]
+        },
+        "status_badge": {
+          "type": "Badge",
+          "props": { "label": "Thinking / gating / running bash & MCP calls", "variant": "info" }
+        },
+        "transcript": {
+          "type": "Conversation",
+          "props": {
+            "title": "Conversation",
+            "messages": { "$state": "/messages" }
+          }
+        },
+        "actions": {
+          "type": "Stack",
+          "props": { "direction": "horizontal", "gap": "sm" },
+          "children": ["btn_interrupt"]
+        },
+        "btn_interrupt": {
+          "type": "Button",
+          "props": { "label": "Interrupt", "event": "INTERRUPT", "variant": "danger" }
+        }
+      }
+    }
+  }
+}

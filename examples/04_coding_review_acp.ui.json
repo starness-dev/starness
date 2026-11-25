@@ -1,0 +1,105 @@
+{
+  "machine": "coding_review_acp",
+  "views": {
+    "gather_task": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["header_card", "task_input", "actions"]
+        },
+        "header_card": {
+          "type": "Card",
+          "props": { "title": "04 — Multi-Harness Coding + Peer Review (@starness/acp)" },
+          "children": ["intro_alert"]
+        },
+        "intro_alert": {
+          "type": "Alert",
+          "props": {
+            "title": "Two-Harness ACP Pipeline",
+            "message": "Harness #1 implements the task; Harness #2 reviews the git diff over ACP; you sign off in DiffReview.",
+            "variant": "info"
+          }
+        },
+        "task_input": {
+          "type": "PromptInput",
+          "props": {
+            "label": "Coding Task",
+            "placeholder": "Describe the change to implement and review…",
+            "submit_event": "SUBMIT_TASK",
+            "submit_label": "Start Implementation",
+            "field_name": "text"
+          }
+        },
+        "actions": {
+          "type": "Stack",
+          "props": { "direction": "horizontal", "gap": "sm" },
+          "children": ["btn_abort"]
+        },
+        "btn_abort": {
+          "type": "Button",
+          "props": { "label": "Abort", "event": "ABORT", "variant": "secondary" }
+        }
+      }
+    },
+    "human_review": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["summary_card", "findings_table", "diff_view", "actions"]
+        },
+        "summary_card": {
+          "type": "Card",
+          "props": { "title": "Human Sign-Off — Peer Review Complete" },
+          "children": ["meta_kv"]
+        },
+        "meta_kv": {
+          "type": "KeyValue",
+          "props": {
+            "items": {
+              "status": { "$state": "/status_label" },
+              "attempt": { "$state": "/attempt" },
+              "implementation": { "$state": "/impl_summary" },
+              "reviewer_verdict": { "$state": "/reviewer_summary" }
+            }
+          }
+        },
+        "findings_table": {
+          "type": "Table",
+          "props": {
+            "title": "Reviewer Findings",
+            "columns": ["Severity", "File", "Message"],
+            "rows": { "$state": "/finding_rows" }
+          }
+        },
+        "diff_view": {
+          "type": "DiffReview",
+          "props": {
+            "title": "Workspace Git Diff",
+            "diff": { "$state": "/diff" },
+            "approve_event": "APPROVE",
+            "revise_event": "REQUEST_CHANGES",
+            "approve_label": "Approve Changes",
+            "revise_label": "Request Changes"
+          }
+        },
+        "actions": {
+          "type": "Stack",
+          "props": { "direction": "horizontal", "gap": "sm" },
+          "children": ["btn_approve", "btn_abort"]
+        },
+        "btn_approve": {
+          "type": "Button",
+          "props": { "label": "Approve Changes", "event": "APPROVE", "variant": "primary" }
+        },
+        "btn_abort": {
+          "type": "Button",
+          "props": { "label": "Abort", "event": "ABORT", "variant": "danger" }
+        }
+      }
+    }
+  }
+}

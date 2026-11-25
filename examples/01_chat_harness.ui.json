@@ -1,0 +1,81 @@
+{
+  "machine": "chat_harness",
+  "views": {
+    "gather_input": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["header_card", "transcript", "prompt_bar"]
+        },
+        "header_card": {
+          "type": "Card",
+          "props": { "title": "01 — AI Chat Harness (@starness/llm)" },
+          "children": ["meta_kv"]
+        },
+        "meta_kv": {
+          "type": "KeyValue",
+          "props": {
+            "items": {
+              "model": { "$state": "/model" }
+            }
+          }
+        },
+        "transcript": {
+          "type": "Conversation",
+          "props": {
+            "title": "Conversation",
+            "messages": { "$state": "/messages" },
+            "empty_text": "Send a message to start chatting."
+          }
+        },
+        "prompt_bar": {
+          "type": "PromptInput",
+          "props": {
+            "label": "Message",
+            "placeholder": "Ask anything… (/exit to quit)",
+            "submit_event": "PROMPT",
+            "submit_label": "Send",
+            "field_name": "text"
+          }
+        }
+      }
+    },
+    "thinking": {
+      "root": "root",
+      "elements": {
+        "root": {
+          "type": "Stack",
+          "props": { "direction": "vertical", "gap": "md" },
+          "children": ["status_card", "transcript", "actions"]
+        },
+        "status_card": {
+          "type": "Card",
+          "props": { "title": "Assistant Thinking…" },
+          "children": ["status_badge"]
+        },
+        "status_badge": {
+          "type": "Badge",
+          "props": { "label": "Streaming response", "variant": "info" }
+        },
+        "transcript": {
+          "type": "Conversation",
+          "props": {
+            "title": "Conversation",
+            "messages": { "$state": "/messages" }
+          }
+        },
+        "actions": {
+          "type": "Stack",
+          "props": { "direction": "horizontal", "gap": "sm" },
+          "children": ["btn_interrupt"]
+        },
+        "btn_interrupt": {
+          "type": "Button",
+          "props": { "label": "Interrupt", "event": "INTERRUPT", "variant": "danger", "shortcut": "Esc" }
+        }
+      }
+    }
+  }
+}

@@ -22,6 +22,7 @@ load(
     "@starness/llm",
     "CachePolicy",
     "LlmModel",
+    "ToolCall",
     "ToolChoice",
     "assistant_msg",
     "has_tool_calls",
@@ -46,8 +47,8 @@ SessionCtx = record(
     llm_endpoint = field(str, ""),
     cwd = field(str, ""),
     messages = field(list[dict], []),
-    safe_calls = field(list[dict], []),
-    risky_calls = field(list[dict], []),
+    safe_calls = field(list[ToolCall], []),
+    risky_calls = field(list[ToolCall], []),
     approval_rows = field(list[list[str]], []),
     last_reply = field(str, ""),
     turns = field(int, 0),
@@ -124,19 +125,18 @@ def classify_bash_command(cmd: str) -> (bool, str):
                 return (False, "mutating or non-allowlisted command")
     return (True, "read-only command")
 
-def partition_calls(calls: list[dict]) -> (list[dict], list[dict], list[list[str]]):
+def partition_calls(calls: list[ToolCall]) -> (list[ToolCall], list[ToolCall], list[list[str]]):
     safe = []
     risky = []
     rows = []
     for call in calls:
-        args = call.get("args", {})
-        cmd = str(args.get("command", ""))
+        cmd = str(call.args.get("command", ""))
         ok, why = classify_bash_command(cmd)
         if ok:
             safe.append(call)
         else:
             risky.append(call)
-            rows.append([str(call.get("name", "bash")), cmd, why])
+            rows.append([call.name, cmd, why])
     return (safe, risky, rows)
 
 def select_model(ctx: SessionCtx) -> LlmModel:
@@ -200,14 +200,13 @@ def record_final_reply(ctx: SessionCtx, ev: dict) -> SessionCtx:
         turns = ctx.turns + 1,
     )
 
-def build_batch_for_calls(calls: list[dict], cwd: str) -> list[dict]:
+def build_batch_for_calls(calls: list[ToolCall], cwd: str) -> list[dict]:
     items = []
     for call in calls:
-        args = call.get("args", {})
-        cmd_str = str(args.get("command", "true"))
+        cmd_str = str(call.args.get("command", "true"))
         items.append(
             batch_item(
-                id = str(call.get("id", "bash")),
+                id = call.id,
                 kind = "exec",
                 spec = exec_spec(
                     cmd = ["sh", "-c", cmd_str],
@@ -236,7 +235,7 @@ def truncate_stream(text: str, limit: int = MAX_TOOL_STREAM_CHARS) -> str:
     omitted = n - head - tail
     return text[:head] + "\n... [truncated " + str(omitted) + " chars; refine command or pipe through head/tail] ...\n" + text[n - tail:]
 
-def format_batch_tool_results(calls: list[dict], ev: dict) -> (list[dict], int, int):
+def format_batch_tool_results(calls: list[ToolCall], ev: dict) -> (list[dict], int, int):
     out = ev.get("output", {})
     results = out.get("results", []) if type(out) == "dict" else []
     by_id = {}
@@ -247,8 +246,7 @@ def format_batch_tool_results(calls: list[dict], ev: dict) -> (list[dict], int, 
     new_msgs = []
     err_count = 0
     for call in calls:
-        cid = str(call.get("id", "bash"))
-        res = by_id.get(cid)
+        res = by_id.get(call.id)
         if res == None:
             err_count += 1
             new_msgs.append(tool_result(call, {"error": "missing batch result"}))

@@ -114,10 +114,10 @@ fn run_executes_order_workflow_events_end_to_end() {
 fn check_builtin_http_and_acp_examples_exits_zero() {
     let output = Command::new(bin_path())
         .arg("check")
-        .arg(workspace_file("examples/checkout_http.star"))
-        .arg(workspace_file("examples/ci_autofix_acp.star"))
-        .arg(workspace_file("examples/deployment_pipeline.star"))
-        .arg(workspace_file("examples/multi_agent_acp.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/checkout_http.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/ci_autofix_acp.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/deployment_pipeline.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/multi_agent_acp.star"))
         .output()
         .expect("run starness check on zero-compile examples");
 
@@ -541,7 +541,7 @@ fn run_events_stdin_drives_deployment_pipeline_standalone_without_control_api() 
 
     let mut child = Command::new(bin_path())
         .arg("run")
-        .arg(workspace_file("examples/deployment_pipeline.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/deployment_pipeline.star"))
         .arg("--events-stdin")
         .arg("--trace")
         .arg("-")
@@ -593,7 +593,7 @@ fn run_events_stdin_drives_deployment_pipeline_with_pause_resume_to_live() {
 
     let mut child = Command::new(bin_path())
         .arg("run")
-        .arg(workspace_file("examples/deployment_pipeline.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/deployment_pipeline.star"))
         .arg("--events-stdin")
         .arg("--trace")
         .arg("-")
@@ -650,7 +650,7 @@ fn run_events_stdin_handles_live_rollback_signal_and_pages_oncall() {
 
     let mut child = Command::new(bin_path())
         .arg("run")
-        .arg(workspace_file("examples/deployment_pipeline.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/deployment_pipeline.star"))
         .arg("--events-stdin")
         .arg("--trace")
         .arg("-")
@@ -790,7 +790,7 @@ chart: StateMachine = machine(
     // Default `--db` is `:memory:`. Pass both `examples/` directory and `feature_flag.star`!
     let mut child = Command::new(bin_path())
         .arg("serve")
-        .arg(workspace_file("examples"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures"))
         .arg(&flag_star)
         .arg("--bind")
         .arg("127.0.0.1:0")
@@ -1034,7 +1034,7 @@ fn serve_rehydrates_in_flight_instances_from_sqlite_db_file_across_restart() {
     // --- Process 1: start server with `--db <path>/starness.db` ---
     let mut server1 = Command::new(bin_path())
         .arg("serve")
-        .arg(workspace_file("examples/deployment_pipeline.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/deployment_pipeline.star"))
         .arg("--bind")
         .arg("127.0.0.1:0")
         .arg("--db")
@@ -1156,7 +1156,7 @@ fn serve_rehydrates_in_flight_instances_from_sqlite_db_file_across_restart() {
     // --- Process 2: restart against the same `--db` SQLite file ---
     let mut server2 = Command::new(bin_path())
         .arg("serve")
-        .arg(workspace_file("examples/deployment_pipeline.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/deployment_pipeline.star"))
         .arg("--bind")
         .arg("127.0.0.1:0")
         .arg("--db")
@@ -1652,7 +1652,7 @@ fn decide_support_triage_example_auto_refund_and_refusal_escalation() {
     // Case 1: High-confidence billing refund -> auto-remediates via `issuing_refund` -> `resolved`!
     let out1 = Command::new(bin_path())
         .arg("run")
-        .arg(workspace_file("examples/support_triage_decide.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/support_triage_decide.star"))
         .arg("--context")
         .arg(&ctx_patch)
         .arg("--trace")
@@ -1681,7 +1681,7 @@ fn decide_support_triage_example_auto_refund_and_refusal_escalation() {
     refuse_team.store(true, Ordering::SeqCst);
     let mut child2 = Command::new(bin_path())
         .arg("run")
-        .arg(workspace_file("examples/support_triage_decide.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/support_triage_decide.star"))
         .arg("--context")
         .arg(&ctx_patch)
         .arg("--events-stdin")
@@ -1979,7 +1979,7 @@ fn release_notes_llm_example_streams_structured_record_and_gates_breaking_change
     // Case 1: Routine non-breaking release -> streams chunks, rehydrates Record, auto-publishes!
     let out1 = Command::new(bin_path())
         .arg("run")
-        .arg(workspace_file("examples/release_notes_llm.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/release_notes_llm.star"))
         .arg("--context")
         .arg(&ctx_patch)
         .arg("--trace")
@@ -2014,7 +2014,7 @@ fn release_notes_llm_example_streams_structured_record_and_gates_breaking_change
     breaking_mode.store(true, Ordering::SeqCst);
     let mut child2 = Command::new(bin_path())
         .arg("run")
-        .arg(workspace_file("examples/release_notes_llm.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/release_notes_llm.star"))
         .arg("--context")
         .arg(&ctx_patch)
         .arg("--events-stdin")
@@ -2270,7 +2270,7 @@ fn coding_session_llm_example_runs_multiturn_tool_loop_and_exits() {
 
     let mut child = Command::new(bin_path())
         .arg("run")
-        .arg(workspace_file("examples/coding_session_llm.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/coding_session_llm.star"))
         .arg("--context")
         .arg(&ctx_patch)
         .arg("--events-stdin")
@@ -2411,7 +2411,7 @@ fn coding_session_llm_runs_safe_calls_in_parallel_then_gates_risky_call_for_appr
 
     let mut child = Command::new(bin_path())
         .arg("run")
-        .arg(workspace_file("examples/coding_session_llm.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/coding_session_llm.star"))
         .arg("--context")
         .arg(&input_json)
         .arg("--events-stdin")
@@ -2472,9 +2472,9 @@ fn check_validates_external_ui_view_sheet_and_rejects_invalid_views() {
     // 1. Valid view-sheet passes `starness check --ui`
     let ok = Command::new(bin_path())
         .arg("check")
-        .arg(workspace_file("examples/plan_review.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/plan_review.star"))
         .arg("--ui")
-        .arg(workspace_file("examples/plan_review.ui.json"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/plan_review.ui.json"))
         .output()
         .expect("run starness check --ui");
     let stdout = String::from_utf8_lossy(&ok.stdout);
@@ -2502,7 +2502,7 @@ fn check_validates_external_ui_view_sheet_and_rejects_invalid_views() {
     .unwrap();
     let bad = Command::new(bin_path())
         .arg("check")
-        .arg(workspace_file("examples/plan_review.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/plan_review.star"))
         .arg("--ui")
         .arg(&bad_path)
         .output()
@@ -2525,9 +2525,9 @@ fn plan_review_interactive_tui_with_ui_sheet_and_zero_config_fallback() {
     let mut child = Command::new(bin_path())
         .arg("run")
         .arg("-i")
-        .arg(workspace_file("examples/plan_review.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/plan_review.star"))
         .arg("--ui")
-        .arg(workspace_file("examples/plan_review.ui.json"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/plan_review.ui.json"))
         .arg("--trace")
         .arg("-")
         .stdin(Stdio::piped())
@@ -2570,7 +2570,7 @@ fn plan_review_interactive_tui_with_ui_sheet_and_zero_config_fallback() {
     let mut fallback = Command::new(bin_path())
         .arg("run")
         .arg("-i")
-        .arg(workspace_file("examples/plan_review.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/plan_review.star"))
         .arg("--trace")
         .arg("-")
         .stdin(Stdio::piped())
@@ -2602,9 +2602,9 @@ fn serve_exposes_active_ui_allowed_events_and_embedded_web_studio() {
 
     let mut child = Command::new(bin_path())
         .arg("serve")
-        .arg(workspace_file("examples/plan_review.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/plan_review.star"))
         .arg("--ui")
-        .arg(workspace_file("examples/plan_review.ui.json"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/plan_review.ui.json"))
         .arg("--bind")
         .arg("127.0.0.1:0")
         .stdout(std::process::Stdio::piped())
@@ -2631,10 +2631,49 @@ fn serve_exposes_active_ui_allowed_events_and_embedded_web_studio() {
         resp
     };
 
-    // 1. Embedded Web Studio at GET /ui
+    // 1. Embedded Web Studio at GET /ui + verify every referenced /ui/assets/* bundle is served
     let ui_resp = send_raw("GET /ui HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     assert!(ui_resp.starts_with("HTTP/1.1 200 OK"), "ui_resp:\n{ui_resp}");
     assert!(ui_resp.contains("Starness Studio"));
+
+    let mut checked_assets = 0usize;
+    for marker in ["src=\"/ui/assets/", "href=\"/ui/assets/"] {
+        let mut rest = ui_resp.as_str();
+        while let Some(pos) = rest.find(marker) {
+            let after = &rest[pos + marker.len()..];
+            if let Some(end) = after.find('"') {
+                let asset_path = format!("/ui/assets/{}", &after[..end]);
+                let asset_resp = send_raw(&format!(
+                    "GET {asset_path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                ));
+                assert!(
+                    asset_resp.starts_with("HTTP/1.1 200 OK"),
+                    "embedded asset `{asset_path}` failed:\n{}",
+                    &asset_resp[..asset_resp.len().min(300)]
+                );
+                if asset_path.ends_with(".js") {
+                    assert!(
+                        asset_resp.contains("application/javascript")
+                            || asset_resp.contains("text/javascript"),
+                        "wrong Content-Type for `{asset_path}`"
+                    );
+                } else if asset_path.ends_with(".css") {
+                    assert!(
+                        asset_resp.contains("text/css"),
+                        "wrong Content-Type for `{asset_path}`"
+                    );
+                }
+                checked_assets += 1;
+                rest = &after[end..];
+            } else {
+                break;
+            }
+        }
+    }
+    assert!(
+        checked_assets >= 2,
+        "expected at least JS + CSS /ui/assets/* references in index.html, found {checked_assets}"
+    );
 
     // 2. Create instance -> snapshot includes resolved external `ui` and `allowed_events`
     let create_resp = send_raw(
@@ -2709,9 +2748,9 @@ fn bluesky_radar_parallel_http_sampling_query_update_and_digest_curation() {
     // 1. Validate `bluesky_radar.star` + `bluesky_radar.ui.json` via `starness check --ui`
     let chk = Command::new(bin_path())
         .arg("check")
-        .arg(workspace_file("examples/bluesky_radar.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/bluesky_radar.star"))
         .arg("--ui")
-        .arg(workspace_file("examples/bluesky_radar.ui.json"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/bluesky_radar.ui.json"))
         .output()
         .expect("check bluesky_radar");
     assert!(
@@ -2801,9 +2840,9 @@ fn bluesky_radar_parallel_http_sampling_query_update_and_digest_curation() {
     // 3. Serve `bluesky_radar.star` + `bluesky_radar.ui.json` via `starness serve`
     let mut child = Command::new(bin_path())
         .arg("serve")
-        .arg(workspace_file("examples/bluesky_radar.star"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/bluesky_radar.star"))
         .arg("--ui")
-        .arg(workspace_file("examples/bluesky_radar.ui.json"))
+        .arg(workspace_file("bins/starness-cli/tests/fixtures/bluesky_radar.ui.json"))
         .arg("--bind")
         .arg("127.0.0.1:0")
         .stdout(std::process::Stdio::piped())
@@ -3111,4 +3150,164 @@ chart = machine(
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn coding_harness_02_decide_gate_allows_safe_bash_and_returns_stdout() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Stdio;
+
+    // 1. Mock OpenAI LLM server (turn 1 emits `bash` tool call; turn 2 verifies real stdout)
+    let llm_listener = TcpListener::bind("127.0.0.1:0").expect("bind mock llm");
+    let llm_port = llm_listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        if let Ok((mut s1, _)) = llm_listener.accept() {
+            let mut buf = [0_u8; 16384];
+            let _ = s1.read(&mut buf);
+            let f1 = serde_json::json!({
+                "id": "chatcmpl-02-1",
+                "model": "gpt-6-luna",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_02_bash_1",
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": "{\"command\":\"echo starness_02_ok\"}"
+                            }
+                        }]
+                    }
+                }]
+            });
+            let f2 = serde_json::json!({
+                "id": "chatcmpl-02-1",
+                "model": "gpt-6-luna",
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }]
+            });
+            let sse = format!("data: {f1}\n\ndata: {f2}\n\ndata: [DONE]\n\n");
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            let _ = s1.write_all(resp.as_bytes());
+        }
+
+        if let Ok((mut s2, _)) = llm_listener.accept() {
+            let mut buf = [0_u8; 16384];
+            let n2 = s2.read(&mut buf).unwrap_or(0);
+            let req2 = String::from_utf8_lossy(&buf[..n2]);
+            assert!(
+                req2.contains("call_02_bash_1") && req2.contains("starness_02_ok"),
+                "expected real bash stdout `starness_02_ok` in turn 2 LLM request:\n{req2}"
+            );
+            let f1 = serde_json::json!({
+                "id": "chatcmpl-02-2",
+                "model": "gpt-6-luna",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "content": "Bash returned starness_02_ok." },
+                    "finish_reason": "stop"
+                }]
+            });
+            let sse = format!("data: {f1}\n\ndata: [DONE]\n\n");
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            let _ = s2.write_all(resp.as_bytes());
+        }
+    });
+
+    // 2. Mock OpenAI Decisions server returning high-confidence ALLOW + non-destructive
+    let decide_listener = TcpListener::bind("127.0.0.1:0").expect("bind mock decide");
+    let decide_port = decide_listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        if let Ok((mut s, _)) = decide_listener.accept() {
+            let mut buf = [0_u8; 16384];
+            let _ = s.read(&mut buf);
+            let body = serde_json::json!({
+                "id": "dec_02_1",
+                "model": "gpt-6-luna",
+                "answers": [
+                    {
+                        "name": "action",
+                        "type": "choice",
+                        "choice": "ALLOW",
+                        "confidence": 0.97,
+                        "probabilities": [
+                            { "value": "ALLOW", "probability": 0.97 },
+                            { "value": "ASK_HUMAN", "probability": 0.02 },
+                            { "value": "DENY", "probability": 0.01 }
+                        ]
+                    },
+                    {
+                        "name": "destructive",
+                        "type": "predicate",
+                        "probability": 0.01
+                    }
+                ]
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = s.write_all(resp.as_bytes());
+        }
+    });
+
+    let ctx_patch = serde_json::json!({
+        "model": "openai::gpt-6-luna",
+        "llm_endpoint": format!("http://127.0.0.1:{llm_port}/v1"),
+        "decision_endpoint": format!("http://127.0.0.1:{decide_port}/v1/decisions"),
+    })
+    .to_string();
+
+    let mut child = Command::new(bin_path())
+        .arg("run")
+        .arg(workspace_file("examples/02_coding_harness.star"))
+        .arg("--context")
+        .arg(&ctx_patch)
+        .arg("--events-stdin")
+        .arg("--trace")
+        .arg("-")
+        .env("OPENAI_API_KEY", "sk-test-02-harness")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn 02_coding_harness");
+
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, r#"{{"type":"PROMPT","text":"echo hello"}}"#).unwrap();
+        writeln!(stdin, "sleep:500").unwrap();
+        writeln!(stdin, r#"{{"type":"EXIT"}}"#).unwrap();
+        stdin.flush().unwrap();
+    }
+
+    let out = child.wait_with_output().expect("wait 02_coding_harness");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "02_coding_harness failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Bash returned starness_02_ok."),
+        "expected LLM final reply with bash stdout in trace:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"last_decision\":\"ALLOW\""),
+        "expected @starness/decide ALLOW recorded in context:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"tool_runs\":1"),
+        "expected tool_runs == 1 in context:\n{stdout}"
+    );
 }
