@@ -1,8 +1,8 @@
 # 04 — Multi-Harness Coding + Peer Review over ACP (`@starness/agents` + `DiffReview` UI)
 #
-# Caps off the progressive harness ladder by connecting TWO independent agent harnesses over ACP:
+# Connects TWO independent coding harnesses over ACP v1:
 #   1. `gather_task`    — human submits a coding task.
-#   2. `implementing`   — Harness #1 (`implementer`) implements the task and submits a typed
+#   2. `implementing`   — Harness #1 (`implementer`) edits the repo and submits a typed
 #                         `ImplementationReport` artifact via turn-scoped MCP.
 #   3. `capturing_diff` — runs `git diff` deterministically via `@starness/exec`.
 #   4. `reviewing`      — Harness #2 (`reviewer`, read-only) inspects the diff and submits typed
@@ -32,6 +32,7 @@ load("@starness/exec", "invoke_cmd")
 
 ReviewEvent = enum("SUBMIT_TASK", "APPROVE", "REQUEST_CHANGES", "ABORT")
 
+# Typed artifact schemas enforced via turn-scoped MCP tools before an agent turn can succeed.
 ImplementationReport = record(
     summary = str,
     files_changed = field(list[str], []),
@@ -48,6 +49,7 @@ ReviewVerdict = record(
     summary = str,
 )
 
+# Immutable pipeline context shared across all states and rendered by `04_coding_review_acp.ui.json`.
 ReviewCtx = record(
     task = field(str, ""),
     attempt = field(int, 0),
@@ -75,8 +77,7 @@ S = state_space(
     "failed",
 )
 
-# --- Harness bindings (swap any slot between agy_agent, claude_agent, codex_agent, acp_agent) ---
-
+# Harness bindings (swap freely between `agy_agent`, `claude_agent`, `codex_agent`, or `acp_agent`).
 implementer = agy_agent(
     id = "implementer",
     args = ["acp", "--dangerously-skip-permissions"],
@@ -87,7 +88,140 @@ reviewer = claude_agent(
     permission_mode = "plan",
 )
 
-# --- Helpers ---
+# ── Statechart Definition ────────────────────────────────────────────────────
+# Wrapped in `build_machine()` so the pipeline reads top-down before its helpers.
+
+def build_machine() -> StateMachine:
+    return machine(
+        id = "coding_review_acp",
+        description = "Multi-harness coding and peer review over @starness/acp with DiffReview sign-off",
+        initial = S.gather_task,
+        context = ReviewCtx(),
+        states = {
+            # 1. Wait for the user to submit a coding task (or abort).
+            S.gather_task: state(
+                on = [
+                    transition(
+                        event = ReviewEvent.SUBMIT_TASK,
+                        guard = has_task_text,
+                        target = S.implementing,
+                        assign = record_task,
+                    ),
+                    transition(
+                        event = ReviewEvent.ABORT,
+                        target = S.aborted,
+                    ),
+                ],
+            ),
+            # 2. Harness #1 implements the task and must call `submit_implementation` to finish.
+            S.implementing: state(
+                invoke = invoke_agent(
+                    id = "implement_task",
+                    agent = implementer,
+                    prompt = build_impl_prompt,
+                    context = impl_context,
+                    tools = [
+                        artifact_tool(
+                            name = "submit_implementation",
+                            description = "Submit a summary of the completed code changes.",
+                            schema = ImplementationReport,
+                            mode = ArtifactMode.replace,
+                            required = True,
+                        ),
+                    ],
+                    on_done = outcome(
+                        target = S.capturing_diff,
+                        assign = record_implementation,
+                    ),
+                    on_error = outcome(
+                        target = S.failed,
+                        assign = record_error,
+                    ),
+                ),
+            ),
+            # 3. Deterministic shell step captures the exact workspace `git diff` for peer review.
+            S.capturing_diff: state(
+                invoke = invoke_cmd(
+                    id = "git_diff",
+                    cmd = ["git", "diff"],
+                    check = False,
+                    on_done = outcome(
+                        target = S.reviewing,
+                        assign = record_diff,
+                    ),
+                    on_error = outcome(
+                        target = S.failed,
+                        assign = record_error,
+                    ),
+                ),
+            ),
+            # 4. Harness #2 (read-only) reviews the diff, records `Finding`s, and submits a `ReviewVerdict`.
+            S.reviewing: state(
+                invoke = invoke_agent(
+                    id = "peer_review",
+                    agent = reviewer,
+                    prompt = "Review the diff in `<context>` for correctness, regressions, and edge cases (do not edit files). Call `add_finding` for each issue and `submit_verdict` when done.",
+                    context = review_context,
+                    tools = [
+                        artifact_tool(
+                            name = "add_finding",
+                            description = "Record one code review finding.",
+                            schema = Finding,
+                            mode = ArtifactMode.append,
+                            required = False,
+                        ),
+                        artifact_tool(
+                            name = "submit_verdict",
+                            description = "Submit your final approval verdict and summary.",
+                            schema = ReviewVerdict,
+                            mode = ArtifactMode.once,
+                            required = True,
+                        ),
+                    ],
+                    on_done = [
+                        # Rejected with attempts remaining -> automatically loop back to `implementing`.
+                        outcome(
+                            guard = review_needs_revision,
+                            target = S.implementing,
+                            assign = record_review_and_retry,
+                        ),
+                        # Approved or max attempts reached -> hand off to `human_review`.
+                        outcome(
+                            target = S.human_review,
+                            assign = record_review_for_human,
+                        ),
+                    ],
+                    on_error = outcome(
+                        target = S.failed,
+                        assign = record_error,
+                    ),
+                ),
+            ),
+            # 5. Human sign-off in `DiffReview`: approve, request another revision pass, or abort.
+            S.human_review: state(
+                on = [
+                    transition(
+                        event = ReviewEvent.APPROVE,
+                        target = S.approved,
+                    ),
+                    transition(
+                        event = ReviewEvent.REQUEST_CHANGES,
+                        target = S.implementing,
+                        assign = record_human_feedback,
+                    ),
+                    transition(
+                        event = ReviewEvent.ABORT,
+                        target = S.aborted,
+                    ),
+                ],
+            ),
+            S.approved: final_state(),
+            S.aborted: final_state(),
+            S.failed: final_state(),
+        },
+    )
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def has_task_text(_ctx: ReviewCtx, ev: dict) -> bool:
     return str(ev.get("text", "")).strip() != ""
@@ -197,124 +331,4 @@ def record_error(ctx: ReviewCtx, ev: dict) -> ReviewCtx:
         status_label = "Failed",
     )
 
-chart: StateMachine = machine(
-    id = "coding_review_acp",
-    description = "Multi-harness coding and peer review over @starness/acp with DiffReview sign-off",
-    initial = S.gather_task,
-    context = ReviewCtx(),
-    states = {
-        S.gather_task: state(
-            on = [
-                transition(
-                    event = ReviewEvent.SUBMIT_TASK,
-                    guard = has_task_text,
-                    target = S.implementing,
-                    assign = record_task,
-                ),
-                transition(
-                    event = ReviewEvent.ABORT,
-                    target = S.aborted,
-                ),
-            ],
-        ),
-        S.implementing: state(
-            invoke = invoke_agent(
-                id = "implement_task",
-                agent = implementer,
-                prompt = build_impl_prompt,
-                context = impl_context,
-                tools = [
-                    artifact_tool(
-                        name = "submit_implementation",
-                        description = "Submit a summary of the completed code changes.",
-                        schema = ImplementationReport,
-                        mode = ArtifactMode.replace,
-                        required = True,
-                    ),
-                ],
-                on_done = outcome(
-                    target = S.capturing_diff,
-                    assign = record_implementation,
-                ),
-                on_error = outcome(
-                    target = S.failed,
-                    assign = record_error,
-                ),
-            ),
-        ),
-        S.capturing_diff: state(
-            invoke = invoke_cmd(
-                id = "git_diff",
-                cmd = ["git", "diff"],
-                check = False,
-                on_done = outcome(
-                    target = S.reviewing,
-                    assign = record_diff,
-                ),
-                on_error = outcome(
-                    target = S.failed,
-                    assign = record_error,
-                ),
-            ),
-        ),
-        S.reviewing: state(
-            invoke = invoke_agent(
-                id = "peer_review",
-                agent = reviewer,
-                prompt = "Review the diff in `<context>` for correctness, regressions, and edge cases (do not edit files). Call `add_finding` for each issue and `submit_verdict` when done.",
-                context = review_context,
-                tools = [
-                    artifact_tool(
-                        name = "add_finding",
-                        description = "Record one code review finding.",
-                        schema = Finding,
-                        mode = ArtifactMode.append,
-                        required = False,
-                    ),
-                    artifact_tool(
-                        name = "submit_verdict",
-                        description = "Submit your final approval verdict and summary.",
-                        schema = ReviewVerdict,
-                        mode = ArtifactMode.once,
-                        required = True,
-                    ),
-                ],
-                on_done = [
-                    outcome(
-                        guard = review_needs_revision,
-                        target = S.implementing,
-                        assign = record_review_and_retry,
-                    ),
-                    outcome(
-                        target = S.human_review,
-                        assign = record_review_for_human,
-                    ),
-                ],
-                on_error = outcome(
-                    target = S.failed,
-                    assign = record_error,
-                ),
-            ),
-        ),
-        S.human_review: state(
-            on = [
-                transition(
-                    event = ReviewEvent.APPROVE,
-                    target = S.approved,
-                ),
-                transition(
-                    event = ReviewEvent.REQUEST_CHANGES,
-                    target = S.implementing,
-                    assign = record_human_feedback,
-                ),
-                transition(
-                    event = ReviewEvent.ABORT,
-                    target = S.aborted,
-                ),
-            ],
-        ),
-        S.approved: final_state(),
-        S.aborted: final_state(),
-        S.failed: final_state(),
-    },
-)
+chart: StateMachine = build_machine()

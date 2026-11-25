@@ -52,6 +52,7 @@ load("@starness/secrets", "secret")
 HarnessEvent = enum("PROMPT", "APPROVE", "DENY", "INTERRUPT", "EXIT")
 PermAction = enum("ALLOW", "ASK_HUMAN", "DENY")
 
+# Typed JSON Schemas for the two tools exposed to the LLM (`bash` + remote `mcp_call`).
 BashArgs = record(
     command = str,
 )
@@ -61,6 +62,7 @@ McpCallArgs = record(
     arguments = field(dict, {}),
 )
 
+# Immutable machine context shared across all states and bound by `03_coding_harness_mcp.ui.json`.
 McpHarnessCtx = record(
     model = field(str, "gpt-6-luna"),
     decision_model = field(str, "gpt-6-luna"),
@@ -99,6 +101,171 @@ Prefer read-only inspection first. When a command or MCP mutation is denied, exp
 
 MAX_OUTPUT_CHARS = 8000
 
+# ── Statechart Definition ────────────────────────────────────────────────────
+# Wrapped in `build_machine()` so the statechart reads top-down before its helpers.
+
+def build_machine() -> StateMachine:
+    return machine(
+        id = "coding_harness_mcp",
+        description = "Coding harness connected to a remote MCP server (OAuth 2.1 / Streamable HTTP)",
+        initial = S.gather_input,
+        context = McpHarnessCtx(),
+        states = {
+            # 1. Wait for the user's next prompt (text and/or dragged files) or EXIT.
+            S.gather_input: state(
+                on = [
+                    transition(
+                        event = HarnessEvent.PROMPT,
+                        guard = is_exit_prompt,
+                        target = S.done,
+                    ),
+                    transition(
+                        event = HarnessEvent.PROMPT,
+                        guard = has_prompt,
+                        target = S.working,
+                        assign = append_user_prompt,
+                    ),
+                    transition(
+                        event = HarnessEvent.EXIT,
+                        target = S.done,
+                    ),
+                ],
+            ),
+            # 2. Active agent loop: INTERRUPT / EXIT on the parent cancel any active LLM, decide, bash, or MCP call.
+            S.working: compound_state(
+                initial = S.thinking,
+                on = [
+                    transition(
+                        event = HarnessEvent.INTERRUPT,
+                        target = S.gather_input,
+                        assign = record_interrupt,
+                    ),
+                    transition(
+                        event = HarnessEvent.EXIT,
+                        target = S.done,
+                    ),
+                ],
+                states = {
+                    # 2a. Stream an LLM turn with both local `bash` and remote `mcp_call` tools.
+                    S.thinking: state(
+                        invoke = invoke_llm(
+                            id = "coding_mcp_turn",
+                            model = select_model,
+                            system = SYSTEM_PROMPT,
+                            messages = lambda ctx: ctx.messages,
+                            tools = [
+                                tool_def(
+                                    name = "bash",
+                                    description = "Execute a shell command in the local workspace.",
+                                    schema = BashArgs,
+                                ),
+                                tool_def(
+                                    name = "mcp_call",
+                                    description = "Call a tool on the connected remote MCP server (e.g. Linear `list_teams`, `list_issues`, `get_issue`, `create_issue`).",
+                                    schema = McpCallArgs,
+                                ),
+                            ],
+                            tool_choice = ToolChoice.auto,
+                            on_done = [
+                                outcome(
+                                    guard = lambda _ctx, ev: has_tool_calls(ev),
+                                    target = S.classifying_permission,
+                                    assign = queue_tool_calls,
+                                ),
+                                outcome(
+                                    target = S.gather_input,
+                                    assign = record_final_reply,
+                                ),
+                            ],
+                            on_error = outcome(
+                                target = S.failed,
+                                assign = record_error,
+                            ),
+                        ),
+                    ),
+                    # 2b. Gate both local shell commands and remote MCP calls with `@starness/decide`.
+                    S.classifying_permission: state(
+                        invoke = invoke_decision(
+                            id = "mcp_permission_gate",
+                            provider = select_decision_provider,
+                            evidence = build_permission_evidence,
+                            questions = {
+                                "action": choice(
+                                    "How should this batch of local shell and remote MCP calls be gated?",
+                                    options = {
+                                        PermAction.ALLOW: "Strictly read-only local inspection or read-only MCP queries (list_*, get_*, search_*, read_*) with no mutations.",
+                                        PermAction.ASK_HUMAN: "Modifies local files, runs git commit/push, or mutates remote state via MCP (create_*, update_*, delete_*, post_*).",
+                                        PermAction.DENY: "Destructive, dangerous, or credential-exfiltrating commands.",
+                                    },
+                                ),
+                                "destructive": noul(
+                                    "Could any action irreversibly delete data, exfiltrate secrets, or harm external systems?",
+                                    yes = "Deletes critical data, exposes credentials, or runs untrusted remote code.",
+                                    no = "Safe or reversible workspace/MCP operation.",
+                                    threshold = 0.85,
+                                ),
+                            },
+                            on_done = [
+                                outcome(
+                                    guard = decision_allows,
+                                    target = S.acting,
+                                    assign = record_decision_allow,
+                                ),
+                                outcome(
+                                    guard = decision_denies,
+                                    target = S.thinking,
+                                    assign = record_decision_deny,
+                                ),
+                                outcome(
+                                    target = S.awaiting_approval,
+                                    assign = prepare_human_approval,
+                                ),
+                            ],
+                            on_error = outcome(
+                                target = S.awaiting_approval,
+                                assign = prepare_approval_on_decide_error,
+                            ),
+                        ),
+                    ),
+                    # 2c. Human-in-the-loop pause for mutations or uncertain decisions.
+                    S.awaiting_approval: state(
+                        on = [
+                            transition(
+                                event = HarnessEvent.APPROVE,
+                                target = S.acting,
+                            ),
+                            transition(
+                                event = HarnessEvent.DENY,
+                                target = S.thinking,
+                                assign = record_human_denial,
+                            ),
+                        ],
+                    ),
+                    # 2d. Execute mixed `bash` + remote `mcp_call` batches concurrently via `invoke_all`.
+                    S.acting: state(
+                        invoke = invoke_all(
+                            id = "run_mixed_tools",
+                            items = build_mixed_batch,
+                            max_concurrency = 4,
+                            on_done = outcome(
+                                target = S.thinking,
+                                assign = record_batch_results,
+                            ),
+                            on_error = outcome(
+                                target = S.failed,
+                                assign = record_error,
+                            ),
+                        ),
+                    ),
+                },
+            ),
+            S.done: final_state(),
+            S.failed: final_state(),
+        },
+    )
+
+# ── Prompt & Model Helpers ───────────────────────────────────────────────────
+
 def truncate_text(raw: str, limit: int) -> str:
     if len(raw) <= limit:
         return raw
@@ -109,9 +276,8 @@ def truncate_text(raw: str, limit: int) -> str:
 def is_exit_prompt(_ctx: McpHarnessCtx, ev: dict) -> bool:
     return str(ev.get("text", "")).strip().lower() == "/exit"
 
-def has_prompt(ctx: McpHarnessCtx, ev: dict) -> bool:
-    txt = str(ev.get("text", "")).strip()
-    return (txt != "" or len(ev.get("files", [])) > 0) and not is_exit_prompt(ctx, ev)
+def has_prompt(_ctx: McpHarnessCtx, ev: dict) -> bool:
+    return str(ev.get("text", "")).strip() != "" or len(ev.get("files", [])) > 0
 
 def select_model(ctx: McpHarnessCtx) -> LlmModel:
     return llm_model(
@@ -155,6 +321,8 @@ def record_final_reply(ctx: McpHarnessCtx, ev: dict) -> McpHarnessCtx:
         pending_calls = [],
         approval_rows = [],
     )
+
+# ── Permission Gate Helpers (`@starness/decide`) ─────────────────────────────
 
 def describe_call(call: ToolCall) -> str:
     if call.name == "bash":
@@ -238,7 +406,7 @@ def prepare_human_approval(ctx: McpHarnessCtx, ev: dict) -> McpHarnessCtx:
         last_decision_prob = p,
     )
 
-def prepare_approval_on_decide_error(ctx: McpHarnessCtx, ev: dict) -> McpHarnessCtx:
+def prepare_approval_on_decide_error(ctx: McpHarnessCtx, _ev: dict) -> McpHarnessCtx:
     rows = []
     for call in ctx.pending_calls:
         rows.append([call.name, describe_call(call), "decide unavailable — manual review"])
@@ -264,6 +432,8 @@ def record_human_denial(ctx: McpHarnessCtx, ev: dict) -> McpHarnessCtx:
         approval_rows = [],
         tool_errors = ctx.tool_errors + len(denied_msgs),
     )
+
+# ── Mixed Parallel Batch Helpers (`invoke_all` + `exec` + `mcp`) ─────────────
 
 def build_mixed_batch(ctx: McpHarnessCtx) -> list[dict]:
     mcp_srv = mcp_http_server(
@@ -361,155 +531,4 @@ def record_interrupt(ctx: McpHarnessCtx, _ev: dict) -> McpHarnessCtx:
 def record_error(ctx: McpHarnessCtx, ev: dict) -> McpHarnessCtx:
     return update(ctx, error = str(ev.get("error", "Coding MCP harness error")))
 
-chart: StateMachine = machine(
-    id = "coding_harness_mcp",
-    description = "Coding harness connected to a remote MCP server (OAuth 2.1 / Streamable HTTP)",
-    initial = S.gather_input,
-    context = McpHarnessCtx(),
-    states = {
-        S.gather_input: state(
-            on = [
-                transition(
-                    event = HarnessEvent.PROMPT,
-                    guard = is_exit_prompt,
-                    target = S.done,
-                ),
-                transition(
-                    event = HarnessEvent.PROMPT,
-                    guard = has_prompt,
-                    target = S.working,
-                    assign = append_user_prompt,
-                ),
-                transition(
-                    event = HarnessEvent.EXIT,
-                    target = S.done,
-                ),
-            ],
-        ),
-        S.working: compound_state(
-            initial = S.thinking,
-            on = [
-                transition(
-                    event = HarnessEvent.INTERRUPT,
-                    target = S.gather_input,
-                    assign = record_interrupt,
-                ),
-                transition(
-                    event = HarnessEvent.EXIT,
-                    target = S.done,
-                ),
-            ],
-            states = {
-                S.thinking: state(
-                    invoke = invoke_llm(
-                        id = "coding_mcp_turn",
-                        model = select_model,
-                        system = SYSTEM_PROMPT,
-                        messages = lambda ctx: ctx.messages,
-                        tools = [
-                            tool_def(
-                                name = "bash",
-                                description = "Execute a shell command in the local workspace.",
-                                schema = BashArgs,
-                            ),
-                            tool_def(
-                                name = "mcp_call",
-                                description = "Call a tool on the connected remote MCP server (e.g. Linear `list_teams`, `list_issues`, `get_issue`, `create_issue`).",
-                                schema = McpCallArgs,
-                            ),
-                        ],
-                        tool_choice = ToolChoice.auto,
-                        on_done = [
-                            outcome(
-                                guard = lambda _ctx, ev: has_tool_calls(ev),
-                                target = S.classifying_permission,
-                                assign = queue_tool_calls,
-                            ),
-                            outcome(
-                                target = S.gather_input,
-                                assign = record_final_reply,
-                            ),
-                        ],
-                        on_error = outcome(
-                            target = S.failed,
-                            assign = record_error,
-                        ),
-                    ),
-                ),
-                S.classifying_permission: state(
-                    invoke = invoke_decision(
-                        id = "mcp_permission_gate",
-                        provider = select_decision_provider,
-                        evidence = build_permission_evidence,
-                        questions = {
-                            "action": choice(
-                                "How should this batch of local shell and remote MCP calls be gated?",
-                                options = {
-                                    PermAction.ALLOW: "Strictly read-only local inspection or read-only MCP queries (list_*, get_*, search_*, read_*) with no mutations.",
-                                    PermAction.ASK_HUMAN: "Modifies local files, runs git commit/push, or mutates remote state via MCP (create_*, update_*, delete_*, post_*).",
-                                    PermAction.DENY: "Destructive, dangerous, or credential-exfiltrating commands.",
-                                },
-                            ),
-                            "destructive": noul(
-                                "Could any action irreversibly delete data, exfiltrate secrets, or harm external systems?",
-                                yes = "Deletes critical data, exposes credentials, or runs untrusted remote code.",
-                                no = "Safe or reversible workspace/MCP operation.",
-                                threshold = 0.85,
-                            ),
-                        },
-                        on_done = [
-                            outcome(
-                                guard = decision_allows,
-                                target = S.acting,
-                                assign = record_decision_allow,
-                            ),
-                            outcome(
-                                guard = decision_denies,
-                                target = S.thinking,
-                                assign = record_decision_deny,
-                            ),
-                            outcome(
-                                target = S.awaiting_approval,
-                                assign = prepare_human_approval,
-                            ),
-                        ],
-                        on_error = outcome(
-                            target = S.awaiting_approval,
-                            assign = prepare_approval_on_decide_error,
-                        ),
-                    ),
-                ),
-                S.awaiting_approval: state(
-                    on = [
-                        transition(
-                            event = HarnessEvent.APPROVE,
-                            target = S.acting,
-                        ),
-                        transition(
-                            event = HarnessEvent.DENY,
-                            target = S.thinking,
-                            assign = record_human_denial,
-                        ),
-                    ],
-                ),
-                S.acting: state(
-                    invoke = invoke_all(
-                        id = "run_mixed_tools",
-                        items = build_mixed_batch,
-                        max_concurrency = 4,
-                        on_done = outcome(
-                            target = S.thinking,
-                            assign = record_batch_results,
-                        ),
-                        on_error = outcome(
-                            target = S.failed,
-                            assign = record_error,
-                        ),
-                    ),
-                ),
-            },
-        ),
-        S.done: final_state(),
-        S.failed: final_state(),
-    },
-)
+chart: StateMachine = build_machine()

@@ -2,16 +2,15 @@
 #
 # Builds on `01_chat_harness.star` by adding:
 # - `@starness/exec` (`bash` tool) + `invoke_all` bounded-concurrency parallel tool execution.
-# - `@starness/decide` (`decision-rs` / `jev`) permission classifier inside `working`:
-#     1. `thinking` invokes the LLM with the `bash` tool.
-#     2. `classifying_permission` evaluates the pending command batch with calibrated probabilities
-#        (`ALLOW` / `ASK_HUMAN` / `DENY` + `destructive` noul check):
-#          - High-confidence `ALLOW` (non-destructive) -> executes immediately in `acting`.
-#          - High-confidence `DENY` (or destructive)   -> rejects and feeds refusal back to the LLM.
-#          - `ASK_HUMAN`, low-confidence, refused, or decision error -> fail-safe pause in
-#            `awaiting_approval` so a human can `APPROVE` or `DENY` the batch.
-#     3. `acting` runs all approved tool calls concurrently via `invoke_all` with output truncation.
-# - `INTERRUPT` on `working` cancels any in-flight LLM stream, decision call, or tool batch cleanly.
+# - `@starness/decide` permission classifier inside a `working` compound state:
+#     1. `thinking`               — invokes the LLM with the `bash` tool.
+#     2. `classifying_permission` — evaluates pending commands with calibrated probabilities
+#                                   (`ALLOW` / `ASK_HUMAN` / `DENY` + `destructive` noul check):
+#          - High-confidence `ALLOW` (non-destructive) -> runs immediately in `acting`.
+#          - High-confidence `DENY` (or destructive)   -> feeds refusal back to `thinking`.
+#          - Uncertain, `ASK_HUMAN`, or decide error   -> fail-safe pause in `awaiting_approval`.
+#     3. `acting`                 — runs approved commands in parallel via `invoke_all`.
+# - `INTERRUPT` / `EXIT` on `working` cancel whichever child invoke (LLM, decide, or bash) is active.
 #
 # Try it:
 #   starness run -i examples/02_coding_harness.star --ui examples/02_coding_harness.ui.json
@@ -49,13 +48,18 @@ load(
 )
 load("@starness/secrets", "secret")
 
+# Events dispatched from the UI, CLI, or HTTP API.
 HarnessEvent = enum("PROMPT", "APPROVE", "DENY", "INTERRUPT", "EXIT")
+
+# Discrete permission verdicts returned by the `@starness/decide` classifier.
 PermAction = enum("ALLOW", "ASK_HUMAN", "DENY")
 
+# Typed JSON Schema for the `bash` tool exposed to the LLM.
 BashArgs = record(
     command = str,
 )
 
+# Immutable machine context shared across all states and bound by `02_coding_harness.ui.json`.
 CodingCtx = record(
     model = field(str, "gpt-6-luna"),
     decision_model = field(str, "gpt-6-luna"),
@@ -73,6 +77,7 @@ CodingCtx = record(
     error = field(str, ""),
 )
 
+# All states in this machine (`thinking`..`acting` live inside the `working` compound state).
 S = state_space(
     "gather_input",
     "working",
@@ -90,6 +95,171 @@ When a command is denied by the permission policy or user, explain why and offer
 
 MAX_OUTPUT_CHARS = 8000
 
+# ── Statechart Definition ────────────────────────────────────────────────────
+# Wrapped in `build_machine()` so the statechart sits at the top of the file while
+# referencing the named guards, reducers, and batch builders defined below.
+
+def build_machine() -> StateMachine:
+    return machine(
+        id = "coding_harness",
+        description = "Multi-turn coding harness with @starness/decide permission gate and invoke_all",
+        initial = S.gather_input,
+        context = CodingCtx(),
+        states = {
+            # 1. Wait for the user's next prompt (text and/or dragged files) or EXIT.
+            S.gather_input: state(
+                on = [
+                    transition(
+                        event = HarnessEvent.PROMPT,
+                        guard = is_exit_prompt,
+                        target = S.done,
+                    ),
+                    transition(
+                        event = HarnessEvent.PROMPT,
+                        guard = has_prompt,
+                        target = S.working,
+                        assign = append_user_prompt,
+                    ),
+                    transition(
+                        event = HarnessEvent.EXIT,
+                        target = S.done,
+                    ),
+                ],
+            ),
+            # 2. Active agent loop: parent compound state handles INTERRUPT/EXIT once for all substates.
+            S.working: compound_state(
+                initial = S.thinking,
+                on = [
+                    transition(
+                        event = HarnessEvent.INTERRUPT,
+                        target = S.gather_input,
+                        assign = record_interrupt,
+                    ),
+                    transition(
+                        event = HarnessEvent.EXIT,
+                        target = S.done,
+                    ),
+                ],
+                states = {
+                    # 2a. Stream an LLM turn; if it requests `bash` tool calls, gate them first.
+                    S.thinking: state(
+                        invoke = invoke_llm(
+                            id = "coding_turn",
+                            model = select_model,
+                            system = SYSTEM_PROMPT,
+                            messages = lambda ctx: ctx.messages,
+                            tools = [
+                                tool_def(
+                                    name = "bash",
+                                    description = "Execute a shell command in the workspace.",
+                                    schema = BashArgs,
+                                ),
+                            ],
+                            tool_choice = ToolChoice.auto,
+                            on_done = [
+                                outcome(
+                                    guard = lambda _ctx, ev: has_tool_calls(ev),
+                                    target = S.classifying_permission,
+                                    assign = queue_tool_calls,
+                                ),
+                                outcome(
+                                    target = S.gather_input,
+                                    assign = record_final_reply,
+                                ),
+                            ],
+                            on_error = outcome(
+                                target = S.failed,
+                                assign = record_error,
+                            ),
+                        ),
+                    ),
+                    # 2b. Fast probabilistic permission gate (`@starness/decide`) over the pending batch.
+                    S.classifying_permission: state(
+                        invoke = invoke_decision(
+                            id = "permission_gate",
+                            provider = select_decision_provider,
+                            evidence = build_permission_evidence,
+                            questions = {
+                                "action": choice(
+                                    "How should this batch of shell commands be gated?",
+                                    options = {
+                                        PermAction.ALLOW: "Strictly read-only workspace inspection (ls, cat, rg, git status/diff/log, cargo check/test) with no file writes or side effects.",
+                                        PermAction.ASK_HUMAN: "Modifies files, installs packages, runs git commit/push, or executes unfamiliar commands requiring human confirmation.",
+                                        PermAction.DENY: "Destructive, dangerous, or credential-exfiltrating commands (rm -rf /, curl | sh, dumping secrets/keys).",
+                                    },
+                                ),
+                                "destructive": noul(
+                                    "Could any command irreversibly delete data, exfiltrate credentials, or harm the host?",
+                                    yes = "Deletes critical data, exposes secrets, or executes untrusted remote scripts.",
+                                    no = "Safe or reversible workspace operation.",
+                                    threshold = 0.85,
+                                ),
+                            },
+                            on_done = [
+                                # High-confidence safe read-only batch -> execute immediately.
+                                outcome(
+                                    guard = decision_allows,
+                                    target = S.acting,
+                                    assign = record_decision_allow,
+                                ),
+                                # High-confidence destructive/denied batch -> refuse and loop back to LLM.
+                                outcome(
+                                    guard = decision_denies,
+                                    target = S.thinking,
+                                    assign = record_decision_deny,
+                                ),
+                                # Anything uncertain or ASK_HUMAN -> pause for explicit human approval.
+                                outcome(
+                                    target = S.awaiting_approval,
+                                    assign = prepare_human_approval,
+                                ),
+                            ],
+                            # Fail-safe: if the decision service is unreachable, ask the human.
+                            on_error = outcome(
+                                target = S.awaiting_approval,
+                                assign = prepare_approval_on_decide_error,
+                            ),
+                        ),
+                    ),
+                    # 2c. Human-in-the-loop pause: user inspects the command table and clicks Approve or Deny.
+                    S.awaiting_approval: state(
+                        on = [
+                            transition(
+                                event = HarnessEvent.APPROVE,
+                                target = S.acting,
+                            ),
+                            transition(
+                                event = HarnessEvent.DENY,
+                                target = S.thinking,
+                                assign = record_human_denial,
+                            ),
+                        ],
+                    ),
+                    # 2d. Execute all approved `bash` calls concurrently (bounded to 4), then return to `thinking`.
+                    S.acting: state(
+                        invoke = invoke_all(
+                            id = "run_bash_batch",
+                            items = build_exec_batch,
+                            max_concurrency = 4,
+                            on_done = outcome(
+                                target = S.thinking,
+                                assign = record_batch_results,
+                            ),
+                            on_error = outcome(
+                                target = S.failed,
+                                assign = record_error,
+                            ),
+                        ),
+                    ),
+                },
+            ),
+            S.done: final_state(),
+            S.failed: final_state(),
+        },
+    )
+
+# ── Prompt & Model Helpers ───────────────────────────────────────────────────
+
 def truncate_text(raw: str, limit: int) -> str:
     if len(raw) <= limit:
         return raw
@@ -100,9 +270,8 @@ def truncate_text(raw: str, limit: int) -> str:
 def is_exit_prompt(_ctx: CodingCtx, ev: dict) -> bool:
     return str(ev.get("text", "")).strip().lower() == "/exit"
 
-def has_prompt(ctx: CodingCtx, ev: dict) -> bool:
-    txt = str(ev.get("text", "")).strip()
-    return (txt != "" or len(ev.get("files", [])) > 0) and not is_exit_prompt(ctx, ev)
+def has_prompt(_ctx: CodingCtx, ev: dict) -> bool:
+    return str(ev.get("text", "")).strip() != "" or len(ev.get("files", [])) > 0
 
 def select_model(ctx: CodingCtx) -> LlmModel:
     return llm_model(
@@ -147,6 +316,8 @@ def record_final_reply(ctx: CodingCtx, ev: dict) -> CodingCtx:
         pending_calls = [],
         approval_rows = [],
     )
+
+# ── Permission Gate Helpers (`@starness/decide`) ─────────────────────────────
 
 def build_permission_evidence(ctx: CodingCtx) -> dict:
     commands = []
@@ -222,7 +393,7 @@ def prepare_human_approval(ctx: CodingCtx, ev: dict) -> CodingCtx:
         last_decision_prob = p,
     )
 
-def prepare_approval_on_decide_error(ctx: CodingCtx, ev: dict) -> CodingCtx:
+def prepare_approval_on_decide_error(ctx: CodingCtx, _ev: dict) -> CodingCtx:
     reason = "decide unavailable — manual review required"
     rows = []
     for call in ctx.pending_calls:
@@ -249,6 +420,8 @@ def record_human_denial(ctx: CodingCtx, ev: dict) -> CodingCtx:
         approval_rows = [],
         tool_errors = ctx.tool_errors + len(denied_msgs),
     )
+
+# ── Parallel Tool Execution Helpers (`invoke_all` + `@starness/exec`) ────────
 
 def build_exec_batch(ctx: CodingCtx) -> list[dict]:
     items = []
@@ -315,150 +488,4 @@ def record_interrupt(ctx: CodingCtx, _ev: dict) -> CodingCtx:
 def record_error(ctx: CodingCtx, ev: dict) -> CodingCtx:
     return update(ctx, error = str(ev.get("error", "Coding harness error")))
 
-chart: StateMachine = machine(
-    id = "coding_harness",
-    description = "Multi-turn coding harness with @starness/decide permission gate and invoke_all",
-    initial = S.gather_input,
-    context = CodingCtx(),
-    states = {
-        S.gather_input: state(
-            on = [
-                transition(
-                    event = HarnessEvent.PROMPT,
-                    guard = is_exit_prompt,
-                    target = S.done,
-                ),
-                transition(
-                    event = HarnessEvent.PROMPT,
-                    guard = has_prompt,
-                    target = S.working,
-                    assign = append_user_prompt,
-                ),
-                transition(
-                    event = HarnessEvent.EXIT,
-                    target = S.done,
-                ),
-            ],
-        ),
-        S.working: compound_state(
-            initial = S.thinking,
-            on = [
-                transition(
-                    event = HarnessEvent.INTERRUPT,
-                    target = S.gather_input,
-                    assign = record_interrupt,
-                ),
-                transition(
-                    event = HarnessEvent.EXIT,
-                    target = S.done,
-                ),
-            ],
-            states = {
-                S.thinking: state(
-                    invoke = invoke_llm(
-                        id = "coding_turn",
-                        model = select_model,
-                        system = SYSTEM_PROMPT,
-                        messages = lambda ctx: ctx.messages,
-                        tools = [
-                            tool_def(
-                                name = "bash",
-                                description = "Execute a shell command in the workspace.",
-                                schema = BashArgs,
-                            ),
-                        ],
-                        tool_choice = ToolChoice.auto,
-                        on_done = [
-                            outcome(
-                                guard = lambda _ctx, ev: has_tool_calls(ev),
-                                target = S.classifying_permission,
-                                assign = queue_tool_calls,
-                            ),
-                            outcome(
-                                target = S.gather_input,
-                                assign = record_final_reply,
-                            ),
-                        ],
-                        on_error = outcome(
-                            target = S.failed,
-                            assign = record_error,
-                        ),
-                    ),
-                ),
-                S.classifying_permission: state(
-                    invoke = invoke_decision(
-                        id = "permission_gate",
-                        provider = select_decision_provider,
-                        evidence = build_permission_evidence,
-                        questions = {
-                            "action": choice(
-                                "How should this batch of shell commands be gated?",
-                                options = {
-                                    PermAction.ALLOW: "Strictly read-only workspace inspection (ls, cat, rg, git status/diff/log, cargo check/test) with no file writes or side effects.",
-                                    PermAction.ASK_HUMAN: "Modifies files, installs packages, runs git commit/push, or executes unfamiliar commands requiring human confirmation.",
-                                    PermAction.DENY: "Destructive, dangerous, or credential-exfiltrating commands (rm -rf /, curl | sh, dumping secrets/keys).",
-                                },
-                            ),
-                            "destructive": noul(
-                                "Could any command irreversibly delete data, exfiltrate credentials, or harm the host?",
-                                yes = "Deletes critical data, exposes secrets, or executes untrusted remote scripts.",
-                                no = "Safe or reversible workspace operation.",
-                                threshold = 0.85,
-                            ),
-                        },
-                        on_done = [
-                            outcome(
-                                guard = decision_allows,
-                                target = S.acting,
-                                assign = record_decision_allow,
-                            ),
-                            outcome(
-                                guard = decision_denies,
-                                target = S.thinking,
-                                assign = record_decision_deny,
-                            ),
-                            outcome(
-                                target = S.awaiting_approval,
-                                assign = prepare_human_approval,
-                            ),
-                        ],
-                        on_error = outcome(
-                            target = S.awaiting_approval,
-                            assign = prepare_approval_on_decide_error,
-                        ),
-                    ),
-                ),
-                S.awaiting_approval: state(
-                    on = [
-                        transition(
-                            event = HarnessEvent.APPROVE,
-                            target = S.acting,
-                        ),
-                        transition(
-                            event = HarnessEvent.DENY,
-                            target = S.thinking,
-                            assign = record_human_denial,
-                        ),
-                    ],
-                ),
-                S.acting: state(
-                    invoke = invoke_all(
-                        id = "run_bash_batch",
-                        items = build_exec_batch,
-                        max_concurrency = 4,
-                        on_done = outcome(
-                            target = S.thinking,
-                            assign = record_batch_results,
-                        ),
-                        on_error = outcome(
-                            target = S.failed,
-                            assign = record_error,
-                        ),
-                    ),
-                ),
-            },
-        ),
-        S.done: final_state(),
-        S.failed: final_state(),
-    },
-)
+chart: StateMachine = build_machine()
