@@ -247,8 +247,12 @@ pub async fn maybe_build_oauth_manager(
     machine_id: Option<&str>,
 ) -> anyhow::Result<Option<(AuthorizationManager, Option<SecretString>)>> {
     let norm_url = normalize_mcp_url(url);
-    let has_creds =
-        keychain_get_scoped(MCP_OAUTH_KEYCHAIN_SERVICE, &norm_url, machine_id)?.is_some();
+    // On headless Linux (CI, containers, SSH) there may be no OS keyring daemon; treat an
+    // unavailable keychain as "no stored OAuth credentials" so unauthenticated MCP works.
+    let has_creds = match keychain_get_scoped(MCP_OAUTH_KEYCHAIN_SERVICE, &norm_url, machine_id) {
+        Ok(Some(_)) => true,
+        Ok(None) | Err(_) => false,
+    };
     if !has_creds {
         return Ok(None);
     }
