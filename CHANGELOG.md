@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/starness-dev/starness/compare/v0.1.0...v0.1.1) (2026-11-27)
+
+
+### Bug Fixes
+
+* **mcp,release:** handle headless Linux keyring gracefully and use macos-15 runner ([126b005](https://github.com/starness-dev/starness/commit/126b005e552e651420827bbe8c0e2180f7df25ab))
+
 ## 0.1.0 (2026-11-27)
 
 
