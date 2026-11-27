@@ -11,7 +11,9 @@ Starness lets you declare AI workflows, agents, and harnesses as **statically ty
 
 Check `command -v starness`. If missing:
 - Inside a local checkout: `cargo install --path bins/starness-cli` (or run `cargo run -q -p starness-cli -- ...`).
-- From Git: `cargo install --git https://github.com/floodfx/starness starness-cli`.
+- Homebrew: `brew install starness-dev/tap/starness`
+- Shell installer: `curl -fsSL https://github.com/starness-dev/starness/releases/latest/download/install.sh | sh`
+- From Git: `cargo install --git https://github.com/starness-dev/starness starness-cli`.
 
 ---
 

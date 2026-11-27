@@ -10,7 +10,7 @@ Use `starness run` for one-shot automation, CI jobs, or local interactive sessio
 
 ```bash
 # Run to completion and stream lossless JSONL traces to stdout
-starness run workflow.star --context '{"repo":"floodfx/starness"}' --trace -
+starness run workflow.star --context '{"repo":"starness-dev/starness"}' --trace -
 
 # Interactive / human-in-the-loop workflow (events sent line-by-line on stdin)
 starness run examples/02_coding_harness.star --events-stdin --trace session.jsonl

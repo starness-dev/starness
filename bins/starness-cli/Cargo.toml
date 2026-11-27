@@ -4,6 +4,8 @@ description = "CLI and Language Server for starness typed Starlark statecharts"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
 
 [[bin]]
 name = "starness"

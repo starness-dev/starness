@@ -10,7 +10,14 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
+repository = "https://github.com/starness-dev/starness"
+readme = "README.md"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
 
 [workspace.dependencies]
 starness-ir = { path = "crates/starness-ir" }

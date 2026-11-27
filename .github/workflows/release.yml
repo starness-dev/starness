@@ -1,0 +1,208 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional existing tag to build & publish (e.g. v0.1.0)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build:
+    needs: [release-please]
+    if: >-
+      always() && (
+        (github.event_name == 'push' && needs.release-please.outputs.release_created == 'true') ||
+        (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || needs.release-please.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p starness-cli
+
+      - name: Sign & notarize macOS binary (when Apple Developer secrets are configured)
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_BASE64 != ''
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/starness"
+          KEYCHAIN_PATH="$RUNNER_TEMP/starness-signing.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -hex 16)"
+
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN_PATH"
+
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
+          codesign --verify --verbose=2 "$BIN"
+
+          if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ] && [ -n "${APPLE_APP_PASSWORD:-}" ]; then
+            ZIP_PATH="$RUNNER_TEMP/starness-notarize.zip"
+            ditto -c -k --keepParent "$BIN" "$ZIP_PATH"
+            xcrun notarytool submit "$ZIP_PATH" \
+              --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --wait
+          fi
+
+      - name: Package tarball
+        run: |
+          mkdir -p dist
+          tar -czf "dist/starness-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" starness
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: starness-${{ matrix.target }}
+          path: dist/starness-${{ matrix.target }}.tar.gz
+
+  publish:
+    needs: [release-please, build]
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || needs.release-please.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums & attach installer
+        run: |
+          cd dist
+          sha256sum starness-*.tar.gz > checksums.sha256
+          cp ../scripts/install.sh ./install.sh
+          chmod +x ./install.sh
+          cat checksums.sha256
+
+      - name: Upload assets to GitHub Release
+        run: |
+          gh release upload "$TAG" \
+            dist/starness-*.tar.gz \
+            dist/checksums.sha256 \
+            dist/install.sh \
+            --clobber
+
+      - name: Update Homebrew tap (starness-dev/homebrew-tap)
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          SHA_MAC_ARM="$(grep 'starness-aarch64-apple-darwin.tar.gz' dist/checksums.sha256 | awk '{print $1}')"
+          SHA_MAC_X64="$(grep 'starness-x86_64-apple-darwin.tar.gz' dist/checksums.sha256 | awk '{print $1}')"
+          SHA_LIN_X64="$(grep 'starness-x86_64-unknown-linux-gnu.tar.gz' dist/checksums.sha256 | awk '{print $1}')"
+          SHA_LIN_ARM="$(grep 'starness-aarch64-unknown-linux-gnu.tar.gz' dist/checksums.sha256 | awk '{print $1}')"
+
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/starness-dev/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cat > tap/Formula/starness.rb <<EOF
+          class Starness < Formula
+            desc "Statically typechecked Starlark Harel statechart engine"
+            homepage "https://github.com/starness-dev/starness"
+            version "${VERSION}"
+            license "Apache-2.0"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/starness-dev/starness/releases/download/${TAG}/starness-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_ARM}"
+              end
+              on_intel do
+                url "https://github.com/starness-dev/starness/releases/download/${TAG}/starness-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_X64}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/starness-dev/starness/releases/download/${TAG}/starness-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LIN_ARM}"
+              end
+              on_intel do
+                url "https://github.com/starness-dev/starness/releases/download/${TAG}/starness-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LIN_X64}"
+              end
+            end
+
+            def install
+              bin.install "starness"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/starness --version")
+            end
+          end
+          EOF
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/starness.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "starness ${VERSION}"
+            git push
+          fi

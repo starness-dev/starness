@@ -172,11 +172,13 @@ stateDiagram-v2
 Install the `starness` CLI and the built-in Agent Skill so your coding agent (Antigravity, Claude Code, Codex, Cursor, etc.) can author, check, diagram, and run Starness workflows out of the box:
 
 ```bash
-# 1. Install the starness CLI
-cargo install --path bins/starness-cli
+# 1. Install the starness CLI (Homebrew, shell installer, or from source)
+brew install starness-dev/tap/starness
+# or: curl -fsSL https://github.com/starness-dev/starness/releases/latest/download/install.sh | sh
+# or: cargo install --path bins/starness-cli
 
 # 2. Install the Starness Agent Skill (skills/starness/SKILL.md)
-npx skills add floodfx/starness
+npx skills add starness-dev/starness
 ```
 
 Or copy the skill directly from this repo:
