@@ -65,7 +65,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} -p starness-cli
+        run: cargo build --release --target ${{ matrix.target }} -p starness-cli
 
       - name: Sign & notarize macOS binary (when Apple Developer secrets are configured)
         if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_BASE64 != ''
